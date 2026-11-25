@@ -25,7 +25,7 @@ TEST(HopperWarpSpecializationUtilityTest,
   auto resultInnerLoc = dyn_cast<NameLoc>(resultOuterLoc.getChildLoc());
   ASSERT_TRUE(resultInnerLoc);
   EXPECT_EQ(resultInnerLoc.getName().str(), "inner_suffix");
-  EXPECT_EQ(resultInnerLoc.getChildLoc(), fileLoc);
+  EXPECT_EQ(resultInnerLoc.getChildLoc(), Location(fileLoc));
 }
 
 } // namespace

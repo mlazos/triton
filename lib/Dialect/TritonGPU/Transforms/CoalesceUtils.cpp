@@ -193,7 +193,7 @@ bool CoalescedEncodingAnalysis::hasRelatedUnalignedVectorizedLoad(
     Operation *op, const SmallVector<unsigned> &order,
     RankedTensorType refTensorType) {
   Value ptr = getMemAccessPtr(op);
-  if (!ptr.getDefiningOp())
+  if (!ptr.getDefiningOp() || !getAMDArch(op->getParentOfType<ModuleOp>()))
     return false;
   auto matchesShape = [&refTensorType](const Value &val) {
     auto rttType = dyn_cast<RankedTensorType>(val.getType());
