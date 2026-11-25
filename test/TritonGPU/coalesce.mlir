@@ -689,3 +689,32 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
+                   ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CUDA loads share the aligned store's layout; their mask still limits the transaction width.
+  // CHECK: #[[$CUDA_WIDE:.*]] = #ttg.blocked<{sizePerThread = [8]
+  // CHECK-LABEL: @cuda_masked_load_with_aligned_store
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$CUDA_WIDE]]>
+  // CHECK: tt.store {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$CUDA_WIDE]]>
+  tt.func @cuda_masked_load_with_aligned_store(
+      %input: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %output: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %unaligned: i32,
+      %mask: tensor<1024xi1, #blocked>) {
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %offset = tt.splat %unaligned : i32 -> tensor<1024xi32, #blocked>
+    %inputIndices = arith.addi %range, %offset : tensor<1024xi32, #blocked>
+    %inputBases = tt.splat %input : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %inputPtrs = tt.addptr %inputBases, %inputIndices : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %other = arith.constant dense<0.0> : tensor<1024xf16, #blocked>
+    %loaded = tt.load %inputPtrs, %mask, %other : tensor<1024x!tt.ptr<f16>, #blocked>
+    %outputBases = tt.splat %output : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %outputPtrs = tt.addptr %outputBases, %range : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %outputPtrs, %loaded : tensor<1024x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}

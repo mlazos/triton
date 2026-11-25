@@ -7,6 +7,7 @@
 #include "triton/Tools/Sys/GetEnv.h"
 #include "triton/Version.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -47,6 +48,7 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -69,13 +71,54 @@ using namespace llvm;
 
 namespace {
 
-void enableFPContraction(llvm::Module &module) {
-  for (llvm::Function &function : module)
-    for (llvm::Instruction &instruction : llvm::instructions(function))
-      if (instruction.getOpcode() == llvm::Instruction::FAdd ||
-          instruction.getOpcode() == llvm::Instruction::FSub ||
-          instruction.getOpcode() == llvm::Instruction::FMul)
+void enableFPContraction(llvm::Module &module, bool fp64Only = false,
+                         const std::vector<std::string> &roots = {}) {
+  llvm::SetVector<llvm::Function *> functions;
+  if (roots.empty()) {
+    for (llvm::Function &function : module)
+      functions.insert(&function);
+  } else {
+    for (const std::string &name : roots)
+      if (llvm::Function *function = module.getFunction(name))
+        functions.insert(function);
+  }
+  size_t rootCount = functions.size();
+  for (size_t i = 0; i < functions.size(); ++i)
+    for (llvm::Instruction &instruction : llvm::instructions(functions[i]))
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (llvm::Function *callee = call->getCalledFunction();
+            callee && !callee->isDeclaration())
+          functions.insert(callee);
+
+  llvm::SmallVector<llvm::Function *> targets(functions.begin(),
+                                              functions.end());
+  llvm::DenseMap<llvm::Function *, llvm::Function *> clones;
+  if (!roots.empty()) {
+    // Helpers can also serve unselected functions. Keep their original
+    // arithmetic.
+    for (size_t i = rootCount; i < targets.size(); ++i) {
+      llvm::ValueToValueMapTy mapping;
+      llvm::Function *clone = llvm::CloneFunction(targets[i], mapping);
+      clone->setName(targets[i]->getName() + ".triton.contract");
+      clone->setLinkage(llvm::GlobalValue::InternalLinkage);
+      clones[targets[i]] = clone;
+      targets[i] = clone;
+    }
+  }
+  for (llvm::Function *function : targets) {
+    for (llvm::Instruction &instruction : llvm::instructions(function)) {
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+        auto replacement = clones.find(call->getCalledFunction());
+        if (replacement != clones.end())
+          call->setCalledFunction(replacement->second);
+      }
+      if ((!fp64Only || instruction.getType()->getScalarType()->isDoubleTy()) &&
+          (instruction.getOpcode() == llvm::Instruction::FAdd ||
+           instruction.getOpcode() == llvm::Instruction::FSub ||
+           instruction.getOpcode() == llvm::Instruction::FMul))
         instruction.setHasAllowContract(true);
+    }
+  }
 }
 
 struct ExpandMaskedDivRemPass : RequiredPassInfoMixin<ExpandMaskedDivRemPass> {
@@ -359,7 +402,8 @@ translateLLVMIRToASM(llvm::Module &module, const std::string &triple,
                      const std::string &proc, const std::string &features,
                      const std::vector<std::string> &flags,
                      bool enable_fp_fusion, bool isObject, bool canonicalizeGEP,
-                     bool enableFpSan, const std::string &abi, bool sched4reg) {
+                     bool enableFpSan, const std::string &abi, bool sched4reg,
+                     bool enableReflectPrecSqrt) {
   using namespace mlir;
 
   LLVMOptionSettings options;
@@ -367,6 +411,8 @@ translateLLVMIRToASM(llvm::Module &module, const std::string &triple,
   options.enablePrintAfterAllIfRequested();
   options.enableFlagsFromDisableLLVMOptEnv();
   options.setFlag("nvptx-sched4reg", sched4reg);
+  if (enableReflectPrecSqrt && Triple(triple).isNVPTX())
+    options.set("nvvm-reflect-add", "__CUDA_PREC_SQRT=1");
   // A/B: disable the post-RA machine scheduler (it can re-order the manual
   // warp-pipeline schedule). Scoped to this codegen only.
   if (triton::tools::getBoolEnv("TRITON_DISABLE_POST_MISCHED"))
@@ -795,7 +841,7 @@ void init_triton_llvm(py::module_ &m) {
          std::string features, std::vector<std::string> flags,
          bool enable_fp_fusion, bool isObject, bool canonicalizeGEP,
          bool sched4reg, bool enableFpSan, bool disableLSR,
-         const std::string &abi) -> py::object {
+         const std::string &abi, bool enableReflectPrecSqrt) -> py::object {
         std::string obj;
         {
           // when allow_threads goes out of scope, gil will be released
@@ -815,9 +861,10 @@ void init_triton_llvm(py::module_ &m) {
                 "failed to parse IR: " + error.getMessage() +
                 "lineno: " + std::to_string(error.getLineNo()));
           }
-          obj = translateLLVMIRToASM(
-              *module, triple, proc, features, flags, enable_fp_fusion,
-              isObject, canonicalizeGEP, enableFpSan, abi, sched4reg);
+          obj = translateLLVMIRToASM(*module, triple, proc, features, flags,
+                                     enable_fp_fusion, isObject,
+                                     canonicalizeGEP, enableFpSan, abi,
+                                     sched4reg, enableReflectPrecSqrt);
         }
         if (isObject)
           return py::object(py::bytes(obj.c_str(), obj.size()));
@@ -828,7 +875,8 @@ void init_triton_llvm(py::module_ &m) {
       py::arg("features"), py::arg("flags"), py::arg("enable_fp_fusion"),
       py::arg("is_object"), py::arg("canonicalize_gep"),
       py::arg("sched4reg") = false, py::arg("enable_fpsan") = false,
-      py::arg("disable_lsr") = false, py::arg("abi") = "");
+      py::arg("disable_lsr") = false, py::arg("abi") = "",
+      py::arg("enable_reflect_prec_sqrt") = false);
 
   m.def("init_targets", []() {
     static std::once_flag init_flag;
@@ -880,44 +928,76 @@ void init_triton_llvm(py::module_ &m) {
     return std::string(json);
   });
 
-  m.def("link_extern_libs", [](llvm::Module *dstMod,
-                               const std::vector<std::string> &paths) {
-    if (paths.empty())
-      return;
+  m.def(
+      "link_extern_libs",
+      [](llvm::Module *dstMod, const std::vector<std::string> &paths,
+         bool enableFpFusion, bool fp64Only,
+         const std::vector<std::string> &fpFusionRoots) {
+        if (paths.empty())
+          return;
 
-    LLVMContext &ctx = dstMod->getContext();
-    llvm::Linker linker(*dstMod);
-    for (const std::string &path : paths) {
-      llvm::SMDiagnostic err;
-      std::unique_ptr<llvm::Module> libMod = llvm::parseIRFile(path, err, ctx);
-      if (!libMod) {
-        std::string message = "Failed to parse library at " + path;
-        throw std::invalid_argument(message);
-      }
-      libMod->setTargetTriple(Triple(dstMod->getTargetTriple()));
-      libMod->setDataLayout(dstMod->getDataLayout());
+        LLVMContext &ctx = dstMod->getContext();
+        llvm::Linker linker(*dstMod);
+        std::unordered_set<std::string> unresolvedRoots;
+        if (enableFpFusion)
+          unresolvedRoots.insert(fpFusionRoots.begin(), fpFusionRoots.end());
+        for (const std::string &path : paths) {
+          llvm::SMDiagnostic err;
+          std::unique_ptr<llvm::Module> libMod =
+              llvm::parseIRFile(path, err, ctx);
+          if (!libMod) {
+            std::string message = "Failed to parse library at " + path;
+            throw std::invalid_argument(message);
+          }
+          libMod->setTargetTriple(Triple(dstMod->getTargetTriple()));
+          libMod->setDataLayout(dstMod->getDataLayout());
 
-      std::unordered_set<std::string> externalFns;
-      for (llvm::Function &fn : libMod->functions()) {
-        if (!fn.isDeclaration())
-          externalFns.insert(fn.getName().str());
-      }
+          // Preserve contraction inside the external library independently of
+          // the caller's fusion policy, before linked functions can be inlined.
+          if (enableFpFusion) {
+            if (fpFusionRoots.empty()) {
+              enableFPContraction(*libMod, fp64Only);
+            } else {
+              std::vector<std::string> neededRoots;
+              for (const std::string &name : fpFusionRoots)
+                if (llvm::Function *function = dstMod->getFunction(name);
+                    function && function->isDeclaration())
+                  neededRoots.push_back(name);
+              if (!neededRoots.empty())
+                enableFPContraction(*libMod, fp64Only, neededRoots);
+            }
+          }
 
-      if (linker.linkInModule(std::move(libMod),
-                              llvm::Linker::Flags::LinkOnlyNeeded)) {
-        std::string message = "Failed to link library at " + path;
-        throw std::invalid_argument(message);
-      }
+          std::unordered_set<std::string> externalFns;
+          for (llvm::Function &fn : libMod->functions()) {
+            if (!fn.isDeclaration()) {
+              externalFns.insert(fn.getName().str());
+              unresolvedRoots.erase(fn.getName().str());
+            }
+          }
 
-      // Mark linked-in functions as internal because backends use external
-      // linkage as a signifier of kernel functions.
-      for (llvm::Function &fn : dstMod->functions()) {
-        if (externalFns.contains(fn.getName().str())) {
-          fn.setLinkage(llvm::GlobalValue::InternalLinkage);
+          if (linker.linkInModule(std::move(libMod),
+                                  llvm::Linker::Flags::LinkOnlyNeeded)) {
+            std::string message = "Failed to link library at " + path;
+            throw std::invalid_argument(message);
+          }
+
+          // Mark linked-in functions as internal because backends use external
+          // linkage as a signifier of kernel functions.
+          for (llvm::Function &fn : dstMod->functions()) {
+            if (externalFns.contains(fn.getName().str())) {
+              fn.setLinkage(llvm::GlobalValue::InternalLinkage);
+            }
+          }
         }
-      }
-    }
-  });
+        if (!unresolvedRoots.empty())
+          throw std::invalid_argument(
+              "Unknown external-library contraction root: " +
+              *unresolvedRoots.begin());
+      },
+      py::arg("module"), py::arg("paths"), py::arg("enable_fp_fusion") = false,
+      py::arg("fp64_only") = false,
+      py::arg("fp_fusion_roots") = std::vector<std::string>{});
 }
 
 static void triton_stacktrace_signal_handler(void *) {

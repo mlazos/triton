@@ -6,7 +6,7 @@ import signal
 import subprocess
 import tempfile
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
@@ -269,12 +269,17 @@ class CUDAOptions:
         None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
     )
     enable_fp_fusion: bool = True
+    enable_libdevice_fp_fusion: bool = False
+    enable_libdevice_fp64_fusion: bool = False
+    libdevice_fp64_fusion_roots: Tuple[str, ...] = ()
     sched4reg: bool = False
     # Run LLVM SLP instead of the target-aware NVPTX vectorizer for this kernel.
     use_slp_vectorizer: bool = False
     # Disable LLVM loop strength reduction for this kernel's code generation.
     disable_lsr: bool = False
     enable_reflect_ftz: bool = True  # ftz in libdevice
+    enable_precise_libdevice: bool = False
+    enable_reflect_prec_sqrt: bool = field(init=False)
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # Blackwell cluster launcher
     launch_pdl: bool = False
@@ -319,6 +324,9 @@ class CUDAOptions:
     disable_lsr: bool = False
 
     def __post_init__(self):
+        object.__setattr__(self, "enable_reflect_prec_sqrt", self.enable_precise_libdevice)
+        if self.enable_precise_libdevice:
+            object.__setattr__(self, "enable_reflect_ftz", False)
         if self.max_occupancy is not None and (type(self.max_occupancy) is not int or self.max_occupancy <= 0):
             raise ValueError("max_occupancy must be a positive integer or None")
         default_libdir = Path(__file__).parent / "lib"
@@ -333,6 +341,7 @@ class CUDAOptions:
             extern_libs["gsan"] = str(gsan_lib)
 
         object.__setattr__(self, "extern_libs", tuple(extern_libs.items()))
+        object.__setattr__(self, "libdevice_fp64_fusion_roots", tuple(self.libdevice_fp64_fusion_roots))
         assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
@@ -424,7 +433,13 @@ class CUDABackend(BaseBackend):
             opts["sanitize_overflow"] = False
 
         args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
-        args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
+        args.update({
+            k: opts[k]
+            for k, value in CUDAOptions.__dataclass_fields__.items()
+            if value.init and k in opts and opts[k] is not None
+        })
+        if "enable_precise_libdevice" not in args and opts.get("enable_reflect_prec_sqrt") is not None:
+            args["enable_precise_libdevice"] = opts["enable_reflect_prec_sqrt"]
         args["sr_launch"] = tuple(tuple(item) for item in args.get("sr_launch", ()))
         if args.get("instrumentation_mode", ""):
             # Instrumentation can require more registers than the user-specified limit.
@@ -1471,8 +1486,14 @@ class CUDABackend(BaseBackend):
             nvidia.set_nvvm_reflect_ftz(llvm_mod)
 
         if options.extern_libs and nvidia.has_extern_deps(llvm_mod):
-            paths = [path for (name, path) in options.extern_libs]
-            llvm.link_extern_libs(llvm_mod, paths)
+            for name, path in options.extern_libs:
+                llvm.link_extern_libs(
+                    llvm_mod, [path],
+                    enable_fp_fusion=(name == "libdevice"
+                                      and (options.enable_libdevice_fp_fusion or options.enable_libdevice_fp64_fusion)),
+                    fp64_only=not options.enable_libdevice_fp_fusion,
+                    fp_fusion_roots=(options.libdevice_fp64_fusion_roots
+                                     if name == "libdevice" and not options.enable_libdevice_fp_fusion else ()))
 
         # Opt in to LLVM SLP instead of the target-aware NVPTX vectorizer.
         use_slp_vectorizer = knobs.nvidia.use_slp_vectorizer or options.use_slp_vectorizer
@@ -1522,7 +1543,7 @@ class CUDABackend(BaseBackend):
         enable_fpsan = is_enabled(opt, "fpsan")
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep,
                                     sched4reg=opt.sched4reg, enable_fpsan=enable_fpsan, disable_lsr=opt.disable_lsr,
-                                    abi="shortptr")
+                                    abi="shortptr", enable_reflect_prec_sqrt=opt.enable_precise_libdevice)
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
         assert len(names) == 1
