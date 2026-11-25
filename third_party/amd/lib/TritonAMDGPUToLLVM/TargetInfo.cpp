@@ -153,6 +153,20 @@ Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
   return ROCDL::BallotOp::create(rewriter, loc, type, cmp);
 }
 
+Value TargetInfo::rematerializeDistributedCoordinate(RewriterBase &rewriter,
+                                                     Location loc,
+                                                     Value coordinate) const {
+  auto *ctx = rewriter.getContext();
+  auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
+  auto operandAttrs = ArrayAttr::get(ctx, {});
+  auto inlineAsm = LLVM::InlineAsmOp::create(
+      rewriter, loc, coordinate.getType(), ValueRange{coordinate}, "", "=v,0",
+      /*has_side_effects=*/true,
+      /*is_align_stack=*/false, LLVM::TailCallKind::None, /*convergent=*/false,
+      asmDialect, operandAttrs);
+  return inlineAsm->getResult(0);
+}
+
 Value TargetInfo::getGlobalTimer(RewriterBase &rewriter, Location loc) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value timer;
@@ -228,13 +242,6 @@ void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
 
 void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter,
                                 Operation * /*sourceOp*/) const {
-  // Always insert a workgroup barrier before each cluster barrier. In the case
-  // when there are multiple cluster barriers, a faster warp can pass more
-  // than one cluster signal, while the slower warps have not reached the first
-  // cluster barrier, which leads to a hang. The workgroup barrier ensures
-  // warps stay in sync across cluster barriers.
-  barrier(loc, rewriter, triton::gpu::AddrSpace::None);
-
   triton::amdgpu::ClusterBarrierArriveOp::create(rewriter, loc);
   triton::amdgpu::ClusterBarrierWaitOp::create(rewriter, loc);
 }
@@ -254,10 +261,15 @@ void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              Value ctaId, Value val, Value pred) const {
+                              Value ctaId, Value val, Value pred,
+                              std::optional<Value> barrierPtr) const {
   if (ctaId) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
+  }
+  if (barrierPtr.has_value()) {
+    llvm::report_fatal_error("AMDGPU does not support barrier-based "
+                             "synchronization for remote stores");
   }
   if (isa<LLVM::LLVMPointerType>(getElementTypeOrSelf(val.getType()))) {
     Type storeTy = i64_ty;
@@ -297,6 +309,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                        isSyncedViaAsyncWait(localLoadOp);
   return mlir::LLVM::AMD::llLoad(rewriter, loc, ptr, elemTy, pred, falseVal, {},
                                  triton::CacheModifier::NONE,
+                                 triton::EvictionPolicy::NORMAL,
                                  /*isVolatile=*/false, addAliasGroup);
 }
 
@@ -305,15 +318,9 @@ Value TargetInfo::shuffleXor(RewriterBase &rewriter, Location loc, Value val,
   return LLVM::AMD::shuffleXor(loc, rewriter, val, i, getISAFamily());
 }
 
-std::pair<Value, Value> TargetInfo::shuffleUp(RewriterBase &rewriter,
-                                              Location loc, Value val,
-                                              int delta) const {
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-  Value laneId = getLaneId(rewriter, loc);
-  Value offset = b.i32_val(delta);
-  Value sourceInBounds = b.icmp_sge(laneId, offset);
-  Value index = b.select(sourceInBounds, b.sub(laneId, offset), laneId);
-  return {shuffleIdx(rewriter, loc, val, index), sourceInBounds};
+Value TargetInfo::shuffleUp(RewriterBase &rewriter, Location loc, Value val,
+                            int i) const {
+  return LLVM::AMD::shuffleUp(loc, rewriter, val, i, getISAFamily());
 }
 
 Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
@@ -421,11 +428,11 @@ static Value permuteAndReduce(RewriterBase &rewriter, Location loc,
 // threads. The output acc has the final accumulated values.
 //
 // Two special cases are supported:
-// When reduceLaneIdMask == 32:
+// When numLaneToReduce == 2 && interleave == 32:
 //   step 1: use permlane32_swap() to swap the row 2 and 3 of acc and
 //           the row 0 and 1 of the copy of acc
 //   step 2: apply reduction to the result values to get final result
-// When reduceLaneIdMask == (16 | 32):
+// When numLaneToReduce == 4 && interleave == 16:
 //   step 1: use permlane32_swap() to swap the row 2 and 3 of acc and
 //           the row 0 and 1 of the copy of acc
 //   step 2: apply reduction to the result values to get the partial result
@@ -434,13 +441,14 @@ static Value permuteAndReduce(RewriterBase &rewriter, Location loc,
 //   step 4: apply reduction to get the final results
 static bool warpReduceSwap16or32(RewriterBase &rewriter, Location loc,
                                  SmallVector<Value> &acc, triton::ReduceOp op,
-                                 unsigned reduceLaneIdMask) {
+                                 unsigned numLaneToReduce,
+                                 unsigned interleave) {
   Operation *reduxOp = op.getSingleCombiner();
   if (!reduxOp)
     return false;
 
-  bool mfma32Case = reduceLaneIdMask == 32;
-  bool mfma16Case = reduceLaneIdMask == (16 | 32);
+  bool mfma32Case = numLaneToReduce == 2 && interleave == 32;
+  bool mfma16Case = numLaneToReduce == 4 && interleave == 16;
   if (!(mfma32Case || mfma16Case))
     return false;
 
@@ -463,22 +471,10 @@ static bool warpReduceSwap16or32(RewriterBase &rewriter, Location loc,
   return true;
 }
 
-bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
-                            SmallVector<Value> &acc, triton::ReduceOp op,
-                            unsigned reduceLaneIdMask,
-                            unsigned /*broadcastLaneIdMask*/) const {
+void TargetInfo::emitDppWarpReduce(RewriterBase &rewriter, Location loc,
+                                   SmallVector<Value> &acc, Operation *reduxOp,
+                                   ArrayRef<int> rowShrSteps) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-
-  if (getISAFamily() == ISAFamily::CDNA4 &&
-      warpReduceSwap16or32(rewriter, loc, acc, op, reduceLaneIdMask))
-    return true;
-
-  if (reduceLaneIdMask != (getWarpSize() - 1))
-    return false;
-
-  Operation *reduxOp = op.getSingleCombiner();
-  if (!reduxOp)
-    return false;
 
   auto createDppReduxOpWithBoundCtrl = [&](Type valType, Value &src,
                                            uint32_t dppCtrl, int rowMask,
@@ -557,21 +553,15 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
 
     const uint32_t dppCtrlRowShr = static_cast<uint32_t>(DppCtrl::ROW_SHR0);
 
-    // row_shr:8
-    buf = createDppReduxOpWithBoundCtrl(valType, acc[i], 8 + dppCtrlRowShr,
-                                        allRows, allBanks);
-
-    // row_shr:4
-    buf = createDppReduxOpWithBoundCtrl(valType, buf, 4 + dppCtrlRowShr,
-                                        allRows, allBanks);
-
-    // row_shr:2
-    buf = createDppReduxOpWithBoundCtrl(valType, buf, 2 + dppCtrlRowShr,
-                                        allRows, allBanks);
-
-    // row_shr:1
-    buf = createDppReduxOpWithBoundCtrl(valType, buf, 1 + dppCtrlRowShr,
-                                        allRows, allBanks);
+    // Within-row lane reduction via row_shr, applied in the order given by
+    // `rowShrSteps` (count-down 8,4,2,1 for the default reduction; count-up
+    // 1,2,4,8 for an ordered inner_tree reduction -- see warpReduceInnerTree).
+    // The cross-row row_bcast steps below are grouping-preserving and identical
+    // for both orders.
+    buf = acc[i];
+    for (int step : rowShrSteps)
+      buf = createDppReduxOpWithBoundCtrl(valType, buf, step + dppCtrlRowShr,
+                                          allRows, allBanks);
 
     if (supportDppBroadcast()) {
       // row_bcast:15 row_mask:0xa
@@ -611,7 +601,57 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
 
     acc[i] = result;
   }
+}
 
+bool TargetInfo::warpReduceInnerTree(RewriterBase &rewriter, Location loc,
+                                     SmallVector<Value> &acc,
+                                     triton::ReduceOp op,
+                                     unsigned numLaneToReduce) const {
+  // The count-up DPP tree assumes the wave64 (4 rows x 16 lanes) layout and a
+  // full-warp, single-combiner reduction. When any of those does not hold, bail
+  // (return false) so the shared count-up shuffle tree performs the ordered
+  // reduction instead. This also covers non-wave64 targets (e.g. CDNA5
+  // wave32) and the permlane-swap fast paths, which do not implement the
+  // count-up order.
+  if (numLaneToReduce != getWarpSize() || getWarpSize() != 64)
+    return false;
+  Operation *reduxOp = op.getSingleCombiner();
+  if (!reduxOp)
+    return false;
+
+  // Count-up order (1,2,4,8): adjacent lanes combine first, building the same
+  // balanced, adjacency-defined tree as the shared count-up shuffle path, so
+  // the result is bitwise-identical no matter how num_warps / BLOCK_SIZE split
+  // the reduction axis. (fp add/mul is commutative, so operand order within a
+  // node does not change the bits; only the grouping does.)
+  emitDppWarpReduce(rewriter, loc, acc, reduxOp, {1, 2, 4, 8});
+  return true;
+}
+
+bool TargetInfo::warpReduce(
+    RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+    triton::ReduceOp op, unsigned numLaneToReduce, unsigned interleave,
+    std::optional<unsigned> /*broadcastLaneIdMask*/) const {
+  // A defined reduction ordering (currently only "inner_tree") requires a
+  // fixed, layout-invariant reduction tree so the result is bitwise-identical
+  // across num_warps / BLOCK_SIZE. Emit it via the dedicated count-up path; the
+  // permlane-swap fast path below does not implement that order and is only
+  // used for the default (unordered) reduction.
+  if (op.hasDefinedOrdering())
+    return warpReduceInnerTree(rewriter, loc, acc, op, numLaneToReduce);
+
+  if (getISAFamily() == ISAFamily::CDNA4 &&
+      warpReduceSwap16or32(rewriter, loc, acc, op, numLaneToReduce, interleave))
+    return true;
+  if (numLaneToReduce != getWarpSize())
+    return false;
+
+  Operation *reduxOp = op.getSingleCombiner();
+  if (!reduxOp)
+    return false;
+
+  // Default (unordered) within-warp reduction: count-down DPP order 8,4,2,1.
+  emitDppWarpReduce(rewriter, loc, acc, reduxOp, {8, 4, 2, 1});
   return true;
 }
 
@@ -771,6 +811,11 @@ unsigned TargetInfo::getReductionTreeArity(Operation *combinerOp) const {
   return 2;
 }
 
+int32_t TargetInfo::getBufferAtomicCachePolicy(bool hasUsers,
+                                               bool clusterScope) const {
+  return targetFeatures.getBufferAtomicCachePolicy(hasUsers, clusterScope);
+}
+
 std::pair<mlir::triton::gpu::LocalMemOpTile, mlir::triton::gpu::LocalMemOpTile>
 TargetInfo::getSharedLdStTiles(int32_t vecBitwidth) const {
   switch (getISAFamily()) {
@@ -778,7 +823,7 @@ TargetInfo::getSharedLdStTiles(int32_t vecBitwidth) const {
   case ISAFamily::RDNA3:
   case ISAFamily::RDNA4m:
     if (vecBitwidth == 128)
-      return {/*load tile*/ {{}, {}, {1, 2, 20}}, /*store tile*/ {}};
+      return {/*load tile*/ {{}, {}, {1, 2, 16}}, /*store tile*/ {}};
     break;
   case ISAFamily::CDNA4:
     if (vecBitwidth == 128)

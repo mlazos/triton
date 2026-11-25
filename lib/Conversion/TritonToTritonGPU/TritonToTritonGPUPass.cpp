@@ -1,8 +1,12 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -10,6 +14,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 
 namespace mlir::triton {
@@ -30,6 +35,38 @@ static void addNamedAttrs(Operation *op, DictionaryAttr dictAttrs) {
       op->setAttr(attr.getName(), attr.getValue());
 }
 
+// Ops carrying SameOperandsAndResultEncoding require every operand and result
+// to share one layout. The default lowering preserves each operand's encoding
+// as-is, which breaks verification when a producer pins a non-default register
+// layout (e.g. a `tlx.layout` on a `tmem_load`) onto only some operands. For
+// such ops, convert any operand whose encoding differs from the unified result
+// encoding; the redundant converts fold away later via layout propagation (a
+// pinned layout is an anchor and forward-propagates). No-op for ops without the
+// trait, or when the encodings already match (the common case). Kept as a free
+// helper so any conversion pattern can reuse it, not just GenericOpPattern.
+static void
+unifyOperandEncodingsForSameEncoding(Operation *op, TypeRange resultTypes,
+                                     SmallVectorImpl<Value> &operands,
+                                     ConversionPatternRewriter &rewriter) {
+  if (!op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>())
+    return;
+  Attribute enc;
+  for (Type t : resultTypes)
+    if (auto rtt = dyn_cast<RankedTensorType>(t)) {
+      enc = rtt.getEncoding();
+      break;
+    }
+  if (!enc)
+    return;
+  for (Value &v : operands) {
+    auto vTy = dyn_cast<RankedTensorType>(v.getType());
+    if (vTy && vTy.getEncoding() && vTy.getEncoding() != enc) {
+      auto dstTy = vTy.cloneWithEncoding(enc);
+      v = triton::gpu::ConvertLayoutOp::create(rewriter, v.getLoc(), dstTy, v);
+    }
+  }
+}
+
 template <class Op> struct GenericOpPattern : public OpConversionPattern<Op> {
   using OpConversionPattern<Op>::OpConversionPattern;
 
@@ -40,9 +77,9 @@ template <class Op> struct GenericOpPattern : public OpConversionPattern<Op> {
     if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
                                                       retTypes)))
       return failure();
-    rewriter.replaceOpWithNewOp<Op>(
-        op, retTypes, adaptor.getOperands(), op.getProperties(),
-        op->getDiscardableAttrDictionary().getValue());
+    SmallVector<Value> operands(adaptor.getOperands());
+    unifyOperandEncodingsForSameEncoding(op, retTypes, operands, rewriter);
+    rewriter.replaceOpWithNewOp<Op>(op, retTypes, operands, op->getAttrs());
 
     return success();
   }
@@ -145,6 +182,23 @@ struct TritonExpandDimsPattern
     Attribute _argEncoding = argType.getEncoding();
     if (!_argEncoding)
       return failure();
+    // A mixed-radix result keeps the converter's layout and the operand takes
+    // its slice, as below.
+    auto mixedRadixTy =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
+      auto sliceTy =
+          argType.cloneWithEncoding(triton::gpu::SliceEncodingAttr::get(
+              getContext(), op.getAxis(),
+              cast<triton::gpu::DistributedEncodingTrait>(
+                  mixedRadixTy.getEncoding())));
+      auto src = triton::gpu::ConvertLayoutOp::create(
+          rewriter, op.getLoc(), sliceTy, adaptor.getSrc());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::ExpandDimsOp>(
+                        op, src, adaptor.getAxis()),
+                    adaptor.getAttributes());
+      return success();
+    }
     auto argEncoding = cast<triton::gpu::BlockedEncodingAttr>(_argEncoding);
     // return shape
     auto retShape = argType.getShape().vec();
@@ -203,27 +257,74 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
     int threadsPerWarp = typeConverter->getThreadsPerWarp();
     int numCTAs = typeConverter->getNumCTAs();
     auto rank = origShape.size();
-    SmallVector<unsigned> retSizePerThread(rank, 1);
-    auto numElements = product<int64_t>(origShape);
-    if (numElements / (numWarps * threadsPerWarp) >= 4) {
-      retSizePerThread[rank - 1] = 2;
-      retSizePerThread[rank - 2] = 2;
-    }
-    if (numElements / (numWarps * threadsPerWarp) >= 16) {
-      retSizePerThread[rank - 1] = 4;
-      retSizePerThread[rank - 2] = 4;
-    }
-    retSizePerThread[rank - 1] = std::min(
-        retSizePerThread[rank - 1], static_cast<unsigned>(origShape[rank - 1]));
-    retSizePerThread[rank - 2] = std::min(
-        retSizePerThread[rank - 2], static_cast<unsigned>(origShape[rank - 2]));
-
     SmallVector<unsigned> retOrder(rank);
     for (unsigned i = 0; i < rank; ++i)
       retOrder[i] = rank - 1 - i;
-    Attribute dEncoding = triton::gpu::BlockedEncodingAttr::get(
-        getContext(), origShape, retSizePerThread, retOrder, numWarps,
-        threadsPerWarp, numCTAs);
+    // Up to 4x4 elements per thread, which the ops after the dot (a reduce,
+    // say) inherit.
+    auto getRetSizePerThread = [&]() {
+      SmallVector<unsigned> retSizePerThread(rank, 1);
+      auto numElements = product<int64_t>(origShape);
+      if (numElements / (numWarps * threadsPerWarp) >= 4) {
+        retSizePerThread[rank - 1] = 2;
+        retSizePerThread[rank - 2] = 2;
+      }
+      if (numElements / (numWarps * threadsPerWarp) >= 16) {
+        retSizePerThread[rank - 1] = 4;
+        retSizePerThread[rank - 2] = 4;
+      }
+      retSizePerThread[rank - 1] =
+          std::min(retSizePerThread[rank - 1],
+                   static_cast<unsigned>(origShape[rank - 1]));
+      retSizePerThread[rank - 2] =
+          std::min(retSizePerThread[rank - 2],
+                   static_cast<unsigned>(origShape[rank - 2]));
+      return retSizePerThread;
+    };
+    // The blocked layout of a power-of-two result.
+    auto getDotResultEncoding = [&]() -> Attribute {
+      return triton::gpu::BlockedEncodingAttr::get(
+          getContext(), origShape, getRetSizePerThread(), retOrder, numWarps,
+          threadsPerWarp, numCTAs);
+    };
+    // A dot with an operand layout the blocked layout cannot cover keeps the
+    // converter's operand layouts: only an MMA has them, and accelerate-matmul
+    // picks it. A power-of-two result (only K is uncovered) still takes the
+    // dot's blocked layout, as a power-of-two dot's does.
+    auto mixedRadixTy =
+        cast<RankedTensorType>(typeConverter->convertType(origType));
+    bool mixedRadixResult =
+        !triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding());
+    if (mixedRadixResult ||
+        !triton::gpu::isRadix2Encoding(
+            cast<RankedTensorType>(adaptor.getA().getType()).getEncoding())) {
+      RankedTensorType resTy = mixedRadixTy;
+      if (!mixedRadixResult) {
+        resTy = origType.cloneWithEncoding(getDotResultEncoding());
+      } else {
+        // Every mixed-radix result takes the dense layout: the dot's
+        // sizePerThread on the pow2 parts. The converter built one, so this
+        // cannot fail.
+        auto spt = getRetSizePerThread();
+        for (unsigned i = 0; i < rank; ++i)
+          spt[i] = std::min(spt[i], (unsigned)triton::LinearLayout::twoPartOf(
+                                        (int32_t)origShape[i]));
+        auto dense = triton::gpu::getMixedRadixEncoding(
+            getContext(), origShape, numWarps, threadsPerWarp, numCTAs, spt,
+            retOrder);
+        assert(succeeded(dense) && "converter built one");
+        resTy = origType.cloneWithEncoding(*dense);
+      }
+      Value c = triton::gpu::ConvertLayoutOp::create(rewriter, op.getLoc(),
+                                                     resTy, adaptor.getC());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
+                        op, resTy, adaptor.getA(), adaptor.getB(), c,
+                        adaptor.getInputPrecision(),
+                        adaptor.getMaxNumImpreciseAcc(), op.getTwoCtas()),
+                    adaptor.getAttributes());
+      return success();
+    }
+    Attribute dEncoding = getDotResultEncoding();
     RankedTensorType retType = origType.cloneWithEncoding(dEncoding);
     // a & b must be of smem layout
     auto aType = cast<RankedTensorType>(adaptor.getA().getType());
@@ -255,7 +356,7 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
 
     addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
                       op, retType, a, b, c, adaptor.getInputPrecision(),
-                      adaptor.getMaxNumImpreciseAcc()),
+                      adaptor.getMaxNumImpreciseAcc(), op.getTwoCtas()),
                   adaptor.getAttributes());
     return success();
   }
@@ -358,7 +459,11 @@ struct TritonBroadcastPattern
     : public OpConversionPattern<triton::BroadcastOp> {
   using OpConversionPattern::OpConversionPattern;
 
-  // This creates a tensor with the new shape but the argument's layout
+  // This creates a tensor with the new shape but the argument's layout.
+  // Upstream #11759 allows the result encoding to differ from the source; when
+  // the original result carries its own encoding (e.g. a TLX-forged
+  // no_verify_layout pin), preserve it instead of forcing the source encoding
+  // so downstream encoding-uniform consumers see the layout they expect.
   LogicalResult
   matchAndRewrite(BroadcastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -366,11 +471,58 @@ struct TritonBroadcastPattern
     auto srcEncoding = srcType.getEncoding();
     if (!srcEncoding)
       return failure();
-    Type retType = op.getType().cloneWithEncoding(srcEncoding);
-    // Type retType = this->getTypeConverter()->convertType(op.getType());
-    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
-                      op, retType, adaptor.getOperands()),
-                  adaptor.getAttributes());
+    // A mixed-radix result takes the converter's layout, and so does the
+    // operand.
+    auto mixedRadixTy =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
+      auto src = triton::gpu::ConvertLayoutOp::create(
+          rewriter, op.getLoc(),
+          srcType.cloneWithEncoding(mixedRadixTy.getEncoding()),
+          adaptor.getSrc());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, mixedRadixTy, src),
+                    adaptor.getAttributes());
+      return success();
+    }
+    auto origResultType = cast<RankedTensorType>(op.getType());
+    Attribute resultEncoding = origResultType.getEncoding();
+    // Byte-identical fast path: no result encoding or already matching.
+    if (!resultEncoding || resultEncoding == srcEncoding) {
+      Type retType = op.getType().cloneWithEncoding(srcEncoding);
+      // Type retType = this->getTypeConverter()->convertType(op.getType());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, retType, adaptor.getOperands()),
+                    adaptor.getAttributes());
+      return success();
+    }
+    // Preserve E2 on the result. Target materialization only bridges
+    // desired-vs-remapped operand types; it does not reconcile an op's operand
+    // encoding with its result encoding. Free (projection-equal) pairs stay
+    // convert-free: the broadcast itself carries the layout change and passes
+    // verification. Non-free pairs broadcast uniformly in E1, then convert the
+    // result E1->E2 at the result shape, so E2 always meets its own shape.
+    // ConvertLayoutOp accepts TLX wrapper encodings (its verifier only checks
+    // forceWarpShuffle).
+    auto retType = origResultType.cloneWithEncoding(resultEncoding);
+    auto *iface = srcEncoding.getDialect()
+                      .getRegisteredInterface<DialectInferLayoutInterface>();
+    bool isFree = false;
+    if (iface && succeeded(iface->verifyBroadcastOpEncoding(srcType, retType)))
+      isFree = true;
+    if (isFree) {
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, retType, adaptor.getOperands()),
+                    adaptor.getAttributes());
+      return success();
+    }
+    auto tmpType = origResultType.cloneWithEncoding(srcEncoding);
+    auto bcast = triton::BroadcastOp::create(rewriter, op.getLoc(), tmpType,
+                                             adaptor.getOperands());
+    addNamedAttrs(bcast, adaptor.getAttributes());
+    auto cvt = triton::gpu::ConvertLayoutOp::create(rewriter, op.getLoc(),
+                                                    retType, bcast.getResult());
+    rewriter.replaceOp(op, cvt.getResult());
     return success();
   }
 };
@@ -382,7 +534,8 @@ struct TritonReducePattern : public OpConversionPattern<triton::ReduceOp> {
   matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto newReduce = triton::ReduceOp::create(
-        rewriter, op.getLoc(), adaptor.getOperands(), adaptor.getAxis());
+        rewriter, op.getLoc(), adaptor.getOperands(), adaptor.getAxis(),
+        op.getReductionOrderingAttr());
     addNamedAttrs(newReduce, adaptor.getAttributes());
 
     auto &newCombineOp = newReduce.getCombineOp();
@@ -399,9 +552,9 @@ struct TritonScanPattern : public OpConversionPattern<triton::ScanOp> {
   LogicalResult
   matchAndRewrite(triton::ScanOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto newScan =
-        triton::ScanOp::create(rewriter, op.getLoc(), adaptor.getOperands(),
-                               adaptor.getAxis(), op.getReverse());
+    auto newScan = triton::ScanOp::create(
+        rewriter, op.getLoc(), adaptor.getOperands(), adaptor.getAxis(),
+        op.getReverse(), op.getReductionOrderingAttr());
     addNamedAttrs(newScan, adaptor.getAttributes());
 
     auto &newCombineOp = newScan.getCombineOp();
@@ -438,13 +591,96 @@ struct TritonMapElementwisePattern
   }
 };
 
+class TritonWarpSpecializePattern
+    : public OpConversionPattern<WarpSpecializeOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(WarpSpecializeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> newResultTypes;
+    for (auto type : op.getResultTypes()) {
+      Type newType = typeConverter->convertType(type);
+      if (!newType)
+        return rewriter.notifyMatchFailure(op, "not a 1:1 type conversion");
+      newResultTypes.push_back(newType);
+    }
+
+    auto newOp = WarpSpecializeOp::create(rewriter, op.getLoc(), newResultTypes,
+                                          op.getPartitionNumWarps(),
+                                          op.getPartitionRegions().size());
+
+    // Update the operands and types.
+    newOp->setOperands(adaptor.getOperands());
+
+    rewriter.inlineRegionBefore(op.getDefaultRegion(), newOp.getDefaultRegion(),
+                                newOp.getDefaultRegion().end());
+    // Retype region arguments
+    if (failed(rewriter.convertRegionTypes(&newOp.getDefaultRegion(),
+                                           *getTypeConverter()))) {
+      return rewriter.notifyMatchFailure(op, "could not convert body types");
+    }
+
+    for (auto [oldRegion, newRegion] : llvm::zip_equal(
+             op.getPartitionRegions(), newOp.getPartitionRegions())) {
+      rewriter.inlineRegionBefore(*oldRegion, *newRegion, newRegion->end());
+      // Retype region arguments
+      if (failed(rewriter.convertRegionTypes(newRegion, *getTypeConverter()))) {
+        return rewriter.notifyMatchFailure(op, "could not convert body types");
+      }
+    }
+
+    rewriter.replaceOp(op, newOp.getResults());
+    return success();
+  }
+};
+
+class TritonWarpPredicatePattern : public OpConversionPattern<WarpPredicateOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(WarpPredicateOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> resultTypes;
+    if (failed(
+            getTypeConverter()->convertTypes(op.getResultTypes(), resultTypes)))
+      return rewriter.notifyMatchFailure(op, "could not convert result types");
+
+    auto newOp = WarpPredicateOp::create(
+        rewriter, op.getLoc(), resultTypes, adaptor.getPredicate(),
+        adaptor.getInits(), op.getWaveUniformAttr());
+    rewriter.inlineRegionBefore(op.getRegion(), newOp.getRegion(),
+                                newOp.getRegion().end());
+    if (failed(rewriter.convertRegionTypes(&newOp.getRegion(),
+                                           *getTypeConverter())))
+      return rewriter.notifyMatchFailure(op, "could not convert body types");
+
+    rewriter.replaceOp(op, newOp.getResults());
+    return success();
+  }
+};
+
+struct TTNGPrefetchPattern
+    : public OpConversionPattern<triton::nvidia_gpu::PrefetchOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::PrefetchOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<triton::nvidia_gpu::PrefetchOp>(
+        op, adaptor.getPtr(), adaptor.getMask(), op.getCacheAttr());
+    return success();
+  }
+};
+
 void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns, unsigned numCTAs) {
   MLIRContext *context = patterns.getContext();
   patterns.insert< // TODO: view should have custom pattern that views the
                    // layout
       // clang-format off
-      GenericOpPattern<triton::AnnotateOp>,
       GenericOpPattern<triton::ReshapeOp>,
       GenericOpPattern<triton::BitcastOp>,
       GenericOpPattern<triton::FpToFpOp>,
@@ -471,6 +707,9 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       TritonTransPattern,
       TritonDotPattern,
       TritonMapElementwisePattern,
+      TritonWarpSpecializePattern,
+      TritonWarpPredicatePattern,
+      GenericOpPattern<PredicateYieldOp>,
       GatherScatterOpPattern<DescriptorGatherOp>,
       GatherScatterOpPattern<DescriptorScatterOp>,
       GenericOpPattern<triton::LoadOp>,
@@ -489,10 +728,197 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::DescriptorStoreOp>,
       GenericOpPattern<triton::DescriptorReduceOp>,
       // this assumes the right layout will be set later for dot scaled.
-      GenericOpPattern<triton::DotScaledOp>
-      // clang-format on
-      >(typeConverter, context);
+      GenericOpPattern<triton::DotScaledOp>,
+      GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
+      GenericOpPattern<triton::gpu::LocalStoreOp>,
+      GenericOpPattern<triton::gpu::RemoteShmemStoreOp>,
+      GenericOpPattern<triton::gpu::AsyncRemoteShmemStoreOp>,
+      GenericOpPattern<triton::gpu::LocalLoadOp>,
+      GenericOpPattern<triton::gpu::LocalGatherOp>,
+      GenericOpPattern<triton::gpu::LocalScatterOp>,
+      GenericOpPattern<triton::nvidia_gpu::TwoCTAPeerGatherOp>,
+      GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
+      GenericOpPattern<triton::nvidia_gpu::VoteBallotSyncOp>,
+      TTNGPrefetchPattern>(typeConverter, context);
 }
+
+// Whether each thread holds `count` register-consecutive elements along `axis`.
+static bool holdsConsecutiveAlongAxis(RankedTensorType type, int axis,
+                                      unsigned count) {
+  if (!isa_and_nonnull<DistributedEncodingTrait>(type.getEncoding()))
+    return false;
+  LinearLayout layout = toLinearLayout(type);
+  auto kRegister = StringAttr::get(type.getContext(), "register");
+  int needed = llvm::Log2_32(count);
+  if (layout.getInDimSizeLog2(kRegister) < needed)
+    return false;
+  for (int i = 0; i < needed; ++i) {
+    ArrayRef<int32_t> basis = layout.getBasis(kRegister, i);
+    for (int dim = 0; dim < type.getRank(); ++dim)
+      if (basis[dim] != (dim == axis ? (1 << i) : 0))
+        return false;
+  }
+  return true;
+}
+
+// The scaled FP4 conversions consume groups of 8 fp4 values held in
+// consecutive registers along the packed axis. Keep a converted operand whose
+// layout already does so (e.g. a `tlx.require_layout`); otherwise use the
+// default blocked layout with `count` elements per thread along `axis`, which
+// becomes the fastest dimension.
+static Value convertToConsecutiveAlongAxis(ConversionPatternRewriter &rewriter,
+                                           const TypeConverter &typeConverter,
+                                           Value value, int axis,
+                                           unsigned count) {
+  auto type = cast<RankedTensorType>(value.getType());
+  if (holdsConsecutiveAlongAxis(type, axis, count))
+    return value;
+  if (type.getShape()[axis] < count)
+    return {};
+  auto defaultType = dyn_cast_or_null<RankedTensorType>(typeConverter.convertType(
+      RankedTensorType::get(type.getShape(), type.getElementType())));
+  auto blocked = defaultType ? dyn_cast<BlockedEncodingAttr>(defaultType.getEncoding())
+                             : BlockedEncodingAttr();
+  if (!blocked)
+    return {};
+  SmallVector<unsigned> sizePerThread(blocked.getSizePerThread());
+  sizePerThread[axis] = std::max(sizePerThread[axis], count);
+  SmallVector<unsigned> order(blocked.getOrder());
+  llvm::erase(order, static_cast<unsigned>(axis));
+  order.insert(order.begin(), axis);
+  // Lay lanes and warps out for the widened sizePerThread: keeping the default
+  // ones would replicate each group across lanes or warps along `axis`.
+  auto encoding = BlockedEncodingAttr::get(
+      type.getContext(), type.getShape(), sizePerThread, order,
+      product<unsigned>(blocked.getWarpsPerCTA()),
+      product<unsigned>(blocked.getThreadsPerWarp()), blocked.getCGALayout());
+  return ConvertLayoutOp::create(rewriter, value.getLoc(),
+                                 type.cloneWithEncoding(encoding), value);
+}
+
+// Encodes the scale operand of a scaled FP4 conversion in the layout its
+// verifier derives from the output layout.
+template <typename Op>
+static LogicalResult
+setScaledFp4ScaleLayout(ConversionPatternRewriter &rewriter, Op newOp,
+                        Value scale) {
+  Attribute scaleEnc =
+      newOp.inferDstEncoding(1, newOp.getOutput().getType().getEncoding());
+  if (!scaleEnc)
+    return failure();
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(newOp);
+  auto scaleTy = cast<RankedTensorType>(scale.getType());
+  newOp.getScaleMutable().assign(ConvertLayoutOp::create(
+      rewriter, newOp.getLoc(), scaleTy.cloneWithEncoding(scaleEnc), scale));
+  return success();
+}
+
+struct ScaledUpcastFp4Pattern
+    : public OpConversionPattern<triton::amdgpu::ScaledUpcastFp4Op> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::ScaledUpcastFp4Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    int axis = op.getAxis();
+    // 4 packed bytes = 8 fp4 values per v_cvt_scale_pk8 group.
+    Value input = convertToConsecutiveAlongAxis(
+        rewriter, *getTypeConverter(), adaptor.getInput(), axis, 4);
+    if (!input)
+      return rewriter.notifyMatchFailure(op, "packed axis holds < 4 bytes");
+    auto resultTy = inferFp4ToFpResultType(
+        cast<RankedTensorType>(input.getType()),
+        op.getOutput().getType().getElementType(), axis, op.getLoc());
+    if (failed(resultTy))
+      return rewriter.notifyMatchFailure(op, "cannot infer result encoding");
+    auto newOp = triton::amdgpu::ScaledUpcastFp4Op::create(
+        rewriter, op.getLoc(), *resultTy, input, adaptor.getScale(), axis);
+    if (failed(setScaledFp4ScaleLayout(rewriter, newOp, adaptor.getScale())))
+      return rewriter.notifyMatchFailure(op, "cannot infer scale encoding");
+    rewriter.replaceOp(op, newOp.getOutput());
+    return success();
+  }
+};
+
+struct ScaledDowncastFp4Pattern
+    : public OpConversionPattern<triton::amdgpu::ScaledDowncastFp4Op> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::ScaledDowncastFp4Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    int axis = op.getAxis();
+    // 8 values pack into the 4 bytes of one conversion.
+    Value input = convertToConsecutiveAlongAxis(
+        rewriter, *getTypeConverter(), adaptor.getInput(), axis, 8);
+    if (!input)
+      return rewriter.notifyMatchFailure(op, "axis holds < 8 values");
+    auto resultTy = inferFpToFp4ResultType(
+        cast<RankedTensorType>(input.getType()), axis, op.getLoc());
+    if (failed(resultTy))
+      return rewriter.notifyMatchFailure(op, "cannot infer result encoding");
+    auto newOp = triton::amdgpu::ScaledDowncastFp4Op::create(
+        rewriter, op.getLoc(), *resultTy, input, adaptor.getScale(), axis);
+    if (failed(setScaledFp4ScaleLayout(rewriter, newOp, adaptor.getScale())))
+      return rewriter.notifyMatchFailure(op, "cannot infer scale encoding");
+    rewriter.replaceOp(op, newOp.getOutput());
+    return success();
+  }
+};
+
+// TLX patterns
+// NOTE: Because Proton's inputs are scalars and not tensors this conversion
+// isn't strictly necessary however you could envision a case where we pass in
+// tensors in for Triton object specific tracing operations in which case we
+// would need to fill in the OpConversionPattern
+void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
+                         RewritePatternSet &patterns,
+                         TritonGPUConversionTarget &target) {
+  MLIRContext *context = patterns.getContext();
+  target.addDynamicallyLegalOp<triton::amdgpu::AssumeUniformOp>(
+      [&typeConverter](triton::amdgpu::AssumeUniformOp op) {
+        return typeConverter.isLegal(op.getOperation());
+      });
+  patterns.add<GenericOpPattern<triton::gpu::WarpVoteOp>>(typeConverter,
+                                                          context);
+  patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
+  patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
+                                                           context);
+  patterns.add<GenericOpPattern<triton::tlx::DumpLayoutOp>>(typeConverter,
+                                                            context);
+  // AMD buffer ops emitted by TLX at TTIR level need encoding added
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadOp>>(typeConverter,
+                                                               context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferStoreOp>>(typeConverter,
+                                                                context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadToLocalOp>>(
+      typeConverter, context);
+  patterns.add<GenericOpPattern<triton::amdgpu::AssumeUniformOp>>(typeConverter,
+                                                                  context);
+  target.addDynamicallyLegalOp<triton::amdgpu::PackedDot2Op>(
+      [&typeConverter](triton::amdgpu::PackedDot2Op op) {
+        return typeConverter.isLegal(op.getOperation());
+      });
+  patterns.add<GenericOpPattern<triton::amdgpu::PackedDot2Op>>(
+      typeConverter, context);
+  target.addDynamicallyLegalOp<triton::amdgpu::ScaledDowncastFp8Op>(
+      [&typeConverter](triton::amdgpu::ScaledDowncastFp8Op op) {
+        return typeConverter.isLegal(op.getOperation());
+      });
+  patterns.add<GenericOpPattern<triton::amdgpu::ScaledDowncastFp8Op>>(
+      typeConverter, context);
+  target.addDynamicallyLegalOp<triton::amdgpu::ScaledUpcastFp4Op,
+                               triton::amdgpu::ScaledDowncastFp4Op>(
+      [&typeConverter](Operation *op) { return typeConverter.isLegal(op); });
+  patterns.add<ScaledUpcastFp4Pattern, ScaledDowncastFp4Pattern>(typeConverter,
+                                                                 context);
+  patterns.add<GenericOpPattern<triton::amdgpu::RematerializedRangeOp>>(
+      typeConverter, context);
+  patterns.add<GenericOpPattern<triton::amdgpu::RegisterClassAnchorOp>>(
+      typeConverter, context);
+}
+
 //
 // SCF patterns
 //
@@ -680,11 +1106,81 @@ void populateCFPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<CFCondBranchPattern, CFBranchPattern>(typeConverter, context);
 }
 
+// Take the body of a partition into a new `tt.func`. We can use this to run a
+// full compiler pipeline on the partition.
+static OwningOpRef<ModuleOp> takeIntoFunction(Region *partition, int numWarps) {
+  // Forward the module attributes (target, number of threads per warp, etc.)
+  // onto the container module.
+  auto wsOp = partition->getParentOfType<WarpSpecializeOp>();
+  ModuleOp mod = wsOp->getParentOfType<ModuleOp>();
+  OwningOpRef<ModuleOp> container = ModuleOp::create(mod.getLoc());
+  Block *containerBlock = container->getBody();
+
+  auto b = OpBuilder::atBlockBegin(containerBlock);
+  FunctionType funcType = b.getFunctionType(partition->getArgumentTypes(), {});
+  auto containerFunc = FuncOp::create(b, mod.getLoc(), "container", funcType);
+  containerFunc.getBody().takeBody(*partition);
+  container.get()->setAttrs(mod->getAttrs());
+  container.get()->setAttr(AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
+
+  // Replace `ttg.warp_return` with `tt.return` to make the IR valid.
+  containerFunc.walk([&](WarpReturnOp op) {
+    b.setInsertionPoint(op);
+    ReturnOp::create(b, op.getLoc());
+    op.erase();
+  });
+
+  // This should make valid IR.
+  if (failed(mlir::verify(*container)))
+    llvm::report_fatal_error("expected partition region to make valid IR");
+  return container;
+}
+
+// Take the partition body out of the container module and function.
+static void extractPartitionBody(OwningOpRef<ModuleOp> container,
+                                 Region *partition) {
+  auto containerFunc = cast<FuncOp>(container->lookupSymbol("container"));
+
+  // Rewrite the returns.
+  containerFunc.walk([](ReturnOp op) {
+    OpBuilder b(op);
+    WarpReturnOp::create(b, op.getLoc());
+    op.erase();
+  });
+
+  partition->takeBody(containerFunc.getBody());
+}
+
 class ConvertTritonToTritonGPU
     : public triton::impl::ConvertTritonToTritonGPUBase<
           ConvertTritonToTritonGPU> {
 public:
   using ConvertTritonToTritonGPUBase::ConvertTritonToTritonGPUBase;
+
+  void runOnModule(ModuleOp op, TritonGPUTypeConverter &typeConverter) {
+    MLIRContext *context = op->getContext();
+    TritonGPUConversionTarget target(*context, typeConverter);
+    // rewrite patterns
+    RewritePatternSet patterns(context);
+    // add rules
+    populateArithPatternsAndLegality(typeConverter, patterns, target);
+    populateMathPatternsAndLegality(typeConverter, patterns, target);
+    FuncArgRenamer renamer;
+    populateFunctionTypeConversions(typeConverter, renamer, patterns);
+    populateTritonPatterns(typeConverter, patterns, numCTAs);
+    populateTLXPatterns(typeConverter, patterns, target);
+    // TODO: can we use
+    //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?
+    populateSCFPatterns(typeConverter, patterns);
+    populateCFPatterns(typeConverter, patterns);
+    patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
+
+    ConversionConfig config;
+    config.allowPatternRollback = false;
+    if (failed(
+            applyPartialConversion(op, target, std::move(patterns), config)))
+      return signalPassFailure();
+  }
 
   void runOnOperation() override {
     if (target.getValue().empty()) {
@@ -696,35 +1192,41 @@ public:
 
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
-    // type converter
-    TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
-                                         numCTAs, enableSourceRemat);
-    TritonGPUConversionTarget target(*context, typeConverter);
-    // rewrite patterns
-    RewritePatternSet patterns(context);
-    // add rules
-    populateArithPatternsAndLegality(typeConverter, patterns, target);
-    populateMathPatternsAndLegality(typeConverter, patterns, target);
-    FuncArgRenamer renamer;
-    populateFunctionTypeConversions(typeConverter, renamer, patterns);
-    populateTritonPatterns(typeConverter, patterns, numCTAs);
-    // TODO: can we use
-    //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?
-    populateSCFPatterns(typeConverter, patterns);
-    populateCFPatterns(typeConverter, patterns);
-    patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
-
-    Builder b(&getContext());
+    Builder b(context);
     mod->setAttr(AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
     mod->setAttr(AttrNumThreadsPerWarp, b.getI32IntegerAttr(threadsPerWarp));
     mod->setAttr(AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
     mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
 
-    ConversionConfig config;
-    config.allowPatternRollback = false;
-    if (failed(
-            applyPartialConversion(mod, target, std::move(patterns), config)))
-      return signalPassFailure();
+    // Convert Warp specialized partition regions first as they may require different
+    // number of warps from the rest of the module.
+    mod.walk([&](WarpSpecializePartitionsOp wsPartitionsOp) {
+      for (Region &region : wsPartitionsOp->getRegions()) {
+        auto &firstBlock = region.getBlocks().front();
+        // Determine the number of warps for this region, falling back to the default if unspecified.
+        unsigned regionNumWarps =
+            triton::gpu::maybeLookupNumWarps(&firstBlock).value_or(numWarps);
+
+            // Lift the region into a function so it can be converted independently.
+        OwningOpRef<ModuleOp> container =
+            takeIntoFunction(&region, regionNumWarps);
+
+            // Create a type converter configured for this region.
+        TritonGPUTypeConverter typeConverter(
+            context, regionNumWarps, threadsPerWarp, numCTAs, enableSourceRemat);
+
+        // Run Triton->TritonGPU conversion on the lifted module.
+        runOnModule(*container, typeConverter);
+
+        // Replace the original region with the transformed result.
+        extractPartitionBody(std::move(container), &region);
+      }
+    });
+
+    // Module type converter
+    TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
+      numCTAs, enableSourceRemat);
+    runOnModule(mod, typeConverter);
   }
 };
 

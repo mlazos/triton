@@ -100,6 +100,13 @@ TEST(LLVMOptions, UnknownOptionsAreIgnored) {
   EXPECT_TRUE(boolOption.getValue());
 }
 
+TEST(LLVMOptions, MalformedValuesAreIgnored) {
+  ScopedLLVMOptions scope(Settings{{"triton-test-bool-option", "not-a-bool"},
+                                   {"triton-test-string-option", "override"}});
+  EXPECT_FALSE(boolOption.getValue());
+  EXPECT_EQ(stringOption.getValue(), "override");
+}
+
 TEST(LLVMOptions, IdenticalScopesShareTheRegistry) {
   ScopedLLVMOptions outer(Settings{{"triton-test-bool-option", "true"}});
   {

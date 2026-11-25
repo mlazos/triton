@@ -1,0 +1,459 @@
+import re
+import builtins
+import math
+
+import triton.language.core as tl
+import triton.runtime.driver as driver
+from triton._C.libtriton import amd as _amd
+
+
+def is_hip():
+    target = driver.active.get_current_target()
+    return target.backend == "hip"
+
+
+def is_amd_tdm_target(arch):
+    """True iff the AMD backend reports TDM support for ``arch``."""
+    if not isinstance(arch, str) or not arch.startswith("gfx"):
+        return False
+    return _amd.supports_tdm(arch)
+
+
+@tl.builtin
+def amd_scaled_downcast_fp8(value, scale: tl.constexpr, dtype: tl.constexpr = tl.float8e4nv, _semantic=None):
+    """Convert ``value * scale`` from FP32 to FP8 on gfx950.
+
+    ``scale`` must be a compile-time power of two from 2^-127 to 2^126. The
+    conversion instruction divides by the E8M0 scale ``1 / scale``, emitted as
+    ``amdg.scaled_downcast_fp8`` with ``scale_const = 127 - log2(scale)``, so
+    no separate FP32 multiply is needed. ``dtype`` is ``tl.float8e4nv``
+    (E4M3FN, the default) or ``tl.float8e5`` (E5M2). Rounding is
+    round-to-nearest-even; NaNs and values beyond the FP8 range convert to
+    NaN. The result keeps the input's layout.
+    """
+    options = _semantic.builder.options
+    if options.backend_name != "hip" or options.arch != "gfx950":
+        raise NotImplementedError("tlx.amd_scaled_downcast_fp8 requires gfx950")
+    value = _semantic.to_tensor(value)
+    if not value.type.is_block() or value.dtype != tl.float32:
+        raise TypeError("value must be an FP32 tensor")
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if dtype not in (tl.float8e4nv, tl.float8e5):
+        raise TypeError("dtype must be tl.float8e4nv or tl.float8e5")
+    scale = tl._unwrap_if_constexpr(scale)
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("scale must be a positive compile-time power of two")
+    mantissa, exponent = math.frexp(scale)
+    log2_scale = exponent - 1
+    # E8M0 byte 0 (2^-127) lowers to a zero divisor, and 255 is NaN.
+    if mantissa != 0.5 or not -127 <= log2_scale <= 126:
+        raise ValueError("scale must be a power of two from 2^-127 to 2^126")
+    result_ty = tl.block_type(dtype, value.type.shape)
+    handle = _semantic.builder.create_amd_scaled_downcast_fp8(value.handle, dtype.to_ir(_semantic.builder),
+                                                              127 - log2_scale)
+    return tl.tensor(handle, result_ty)
+
+
+def _scaled_fp4_axis(name, axis, rank, _semantic):
+    """Checks the target; returns the normalized axis."""
+    options = _semantic.builder.options
+    if options.backend_name != "hip" or not (options.arch == "gfx950" or options.arch.startswith("gfx1250")):
+        raise NotImplementedError(f"tlx.{name} requires gfx950 or gfx1250")
+    axis = tl._unwrap_if_constexpr(axis)
+    if not isinstance(axis, int) or not -rank <= axis < rank:
+        raise ValueError(f"tlx.{name}: axis must be a compile-time int in [-{rank}, {rank})")
+    return axis % rank
+
+
+def _scaled_fp4_scale(name, scale, shape, axis, _semantic):
+    """Checks raw E8M0 scales against the unpacked ``shape``; returns the scale and values per scale along axis."""
+    scale = _semantic.to_tensor(scale)
+    if not scale.type.is_block() or scale.dtype not in (tl.uint8, tl.int8):
+        raise TypeError(f"tlx.{name}: scale must be a uint8 tensor of raw E8M0 bytes")
+    scale_shape = list(scale.type.shape)
+    if len(scale_shape) != len(shape) or any(s != v for d, (s, v) in enumerate(zip(scale_shape, shape)) if d != axis):
+        raise ValueError(f"tlx.{name}: scale shape {scale_shape} must match {shape} except along axis")
+    if shape[axis] % scale_shape[axis]:
+        raise ValueError(f"tlx.{name}: scale extent along axis must divide {shape[axis]}")
+    return scale, shape[axis] // scale_shape[axis]
+
+
+def _scaled_fp4_operands(x, scale, _semantic):
+    """The op derives its operand layouts from the result layout, so drop layouts set at the TLX level (e.g. by
+    ``local_load(layout=...)``): the verifier rejects a scale layout without an output layout."""
+    release = _semantic.builder.create_release_layout
+    return release(x.handle, relaxed=True), release(scale.handle, relaxed=True)
+
+
+@tl.builtin
+def amd_scaled_upcast_fp4(x, scale, dtype: tl.constexpr = tl.bfloat16, axis: tl.constexpr = -1, _semantic=None):
+    """Convert packed E2M1 (FP4) values times their E8M0 scales to BF16 or F16 on gfx950 or gfx1250.
+
+    ``x`` is a uint8 tensor holding two E2M1 values per byte along ``axis`` (the even element in the low nibble); the
+    result doubles that extent. ``scale`` holds raw E8M0 bytes (value ``2^(byte - 127)``) with the result's shape
+    except along ``axis``, where each scale covers a multiple of 8 consecutive values (32 for MXFP4). The
+    conversion is exact. It lowers to ``amdg.scaled_upcast_fp4``, which applies the scale in the conversion
+    instruction: ``v_cvt_scale_pk8_{bf16,f16}_fp4`` (eight values) on gfx1250, ``v_cvt_scalef32_pk_{bf16,f16}_fp4``
+    (two values) on gfx950.
+    """
+    name = "amd_scaled_upcast_fp4"
+    x = _semantic.to_tensor(x)
+    if not x.type.is_block() or x.dtype not in (tl.uint8, tl.int8):
+        raise TypeError(f"tlx.{name}: x must be a uint8 tensor of packed E2M1 pairs")
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if dtype not in (tl.bfloat16, tl.float16):
+        raise TypeError(f"tlx.{name}: dtype must be tl.bfloat16 or tl.float16")
+    shape = list(x.type.shape)
+    axis = _scaled_fp4_axis(name, axis, len(shape), _semantic)
+    shape[axis] *= 2
+    scale, block = _scaled_fp4_scale(name, scale, shape, axis, _semantic)
+    if block % 8:
+        raise ValueError(f"tlx.{name}: each scale must cover a multiple of 8 values along axis")
+    x_handle, scale_handle = _scaled_fp4_operands(x, scale, _semantic)
+    handle = _semantic.builder.create_amd_scaled_upcast_fp4(x_handle, scale_handle, dtype.to_ir(_semantic.builder),
+                                                            axis)
+    return tl.tensor(handle, tl.block_type(dtype, shape))
+
+
+@tl.builtin
+def amd_scaled_downcast_fp4(x, scale, axis: tl.constexpr = -1, _semantic=None):
+    """Divide FP32, BF16 or F16 values by their E8M0 scales and pack them to E2M1 (FP4) on gfx950 or gfx1250.
+
+    Returns a uint8 tensor with two E2M1 values per byte along ``axis`` (the even element in the low nibble), halving
+    that extent. ``scale`` holds raw E8M0 bytes (value ``2^(byte - 127)``) with the input's shape except along
+    ``axis``, where each scale covers a multiple of 8 consecutive values (32 for MXFP4). E2M1 rounding is to nearest
+    even, saturating at 6. It lowers to ``amdg.scaled_downcast_fp4``: ``v_cvt_scalef32_pk8_fp4_*`` (eight values) on
+    gfx1250, ``v_cvt_scalef32_pk_fp4_*`` (two values) on gfx950.
+    """
+    name = "amd_scaled_downcast_fp4"
+    x = _semantic.to_tensor(x)
+    if not x.type.is_block() or x.dtype not in (tl.float32, tl.bfloat16, tl.float16):
+        raise TypeError(f"tlx.{name}: x must be an FP32, BF16 or F16 tensor")
+    shape = list(x.type.shape)
+    axis = _scaled_fp4_axis(name, axis, len(shape), _semantic)
+    scale, block = _scaled_fp4_scale(name, scale, shape, axis, _semantic)
+    if block % 8:
+        raise ValueError(f"tlx.{name}: each scale must cover a multiple of 8 values along axis")
+    x_handle, scale_handle = _scaled_fp4_operands(x, scale, _semantic)
+    handle = _semantic.builder.create_amd_scaled_downcast_fp4(x_handle, scale_handle, axis)
+    shape[axis] //= 2
+    return tl.tensor(handle, tl.block_type(tl.uint8, shape))
+
+
+def cuda_parse_arch(arch):
+    pattern = r"^sm(\d+)$"
+    match = re.fullmatch(pattern, arch)
+    if not match:
+        raise ValueError(f"TRITON_OVERRIDE_ARCH must have the form {pattern}")
+    return int(match.group(1))
+
+
+@tl.builtin
+def cluster_cta_rank(_semantic=None):
+    """
+    :return the unique CTA ID within a cluster across all dims
+    """
+    if _semantic.builder.options.backend_name == "hip":
+        options = _semantic.builder.options
+        cluster_size = (options.ctas_per_cga or (options.num_ctas, 1, 1))[0]
+        if cluster_size == 1:
+            return _semantic.to_tensor(0)
+        return tl.tensor(_semantic.builder.create_amd_cluster_cta_rank(), tl.int32)
+    return tl.tensor(_semantic.builder.create_cluster_cta_rank(), tl.int32)
+
+
+@tl.builtin
+def cluster_size_1d(_semantic=None):
+    """
+    :return the total number of CTAs in the cluster across all dimensions
+    (equal to the product of sizes of every dimension).
+    """
+    return tl.tensor(_semantic.builder.create_cluster_size_1d(), tl.int32)
+
+
+@tl.builtin
+def thread_id(axis, _semantic=None):
+    """
+    Returns the id of the current thread instance along the given :code:`axis`.
+
+    :param axis: The axis of the 3D launch grid. Must be 0, 1 or 2.
+    :type axis: int
+    """
+    axis = tl._unwrap_if_constexpr(axis)
+    if axis not in (0, 1, 2):
+        raise ValueError(f"thread_id axis must be 0, 1, or 2 but got {axis}")
+    return tl.tensor(_semantic.builder.create_thread_id(axis), tl.int32)
+
+
+@tl.builtin
+def num_warps(_semantic=None):
+    """Return the number of warps executing the current kernel."""
+    return tl.constexpr(_semantic.builder.options.num_warps)
+
+
+@tl.builtin
+def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semantic=None, _generator=None):
+    """Execute ``body`` under a per-lane execution predicate.
+
+    A scalar predicate supplies the execution bit for the current physical
+    lane. For a tensor predicate, elements owned by one lane are OR-reduced to
+    that lane's execution bit. A wavefront skips ``body`` when none of its
+    lanes are active. Active lanes receive the values returned by
+    ``body(*inits, *args)``; inactive lanes keep ``inits``. With no ``inits``,
+    the body returns nothing and is run only for its effects. The body must be an
+    ``@triton.jit`` function containing straight-line computation without
+    cross-wave synchronization. Bodies containing reductions, dots, or layout
+    shuffles must pass ``wave_uniform=True`` to declare that the predicate has
+    the same value for every lane in each wavefront. Cross-warp reductions and
+    other nested regions are rejected. The body must return exactly the same
+    number and types of tensors as ``inits``. A tensor predicate's shape must
+    match each carried tensor or a common leading shape (for example, one row
+    predicate for row-major matrices).
+
+    This operation has no cross-wave synchronization, so compilation fails if
+    the body needs a CTA barrier. NVIDIA so far supports only effects-only
+    bodies (no ``inits``) under a scalar ``wave_uniform=True`` predicate such as
+    ``tlx.warp_any(...)``, containing register math and tensor memory loads and
+    stores. Other operations, such as mbarrier arrives and waits, are not yet
+    supported in the body on NVIDIA.
+    """
+    if isinstance(inits, tl.tensor):
+        inits = (inits, )
+    elif not isinstance(inits, (builtins.tuple, builtins.list, tl.tuple)):
+        raise TypeError("warp_predicate inits must be a tensor, tuple, or list")
+    if not isinstance(args, (builtins.tuple, builtins.list, tl.tuple)):
+        args = (args, )
+
+    inits = builtins.list(inits)
+    args = builtins.list(args)
+    if not all(isinstance(value, tl.tensor) for value in inits):
+        raise TypeError("warp_predicate carried values must be tensors")
+
+    predicate = _semantic.to_tensor(predicate)
+    if predicate.dtype != tl.int1:
+        raise TypeError(f"warp_predicate predicate must have bool dtype, got {predicate.dtype}")
+    wave_uniform = tl._unwrap_if_constexpr(wave_uniform)
+    if not isinstance(wave_uniform, builtins.bool):
+        raise TypeError(f"warp_predicate wave_uniform must be a bool, got {type(wave_uniform).__name__}")
+
+    builder = _semantic.builder
+    # Moving the insertion point into the detached body block and back resets
+    # the builder location, so restore the caller's location for the body call
+    # and for the op, whose diagnostics should point at this call.
+    loc = builder.get_loc()
+    block = builder.new_block()
+    insertion_point = builder.get_insertion_point()
+    try:
+        builder.set_insertion_point_to_start(block)
+        builder.set_loc(loc)
+        body_result = _generator.call_JitFunction(body, inits + args, kwargs={})
+        if body_result is None or (isinstance(body_result, tl.constexpr) and body_result.value is None):
+            results = []
+        elif isinstance(body_result, tl.tensor):
+            results = [body_result]
+        elif isinstance(body_result, (builtins.tuple, builtins.list, tl.tuple)):
+            results = builtins.list(body_result)
+        else:
+            raise TypeError("warp_predicate body must return a tensor, tuple, or list")
+        if len(results) != len(inits):
+            raise TypeError(f"warp_predicate body returned {len(results)} values for {len(inits)} carried values")
+        for index, (init, result) in enumerate(zip(inits, results)):
+            if not isinstance(result, tl.tensor):
+                raise TypeError(f"warp_predicate result {index} is not a tensor")
+            if result.type != init.type:
+                raise TypeError(f"warp_predicate result {index} has type {result.type}, expected {init.type}")
+        builder.create_predicate_yield_op([result.handle for result in results])
+    finally:
+        builder.restore_insertion_point(insertion_point)
+        builder.set_loc(loc)
+
+    result_types = [result.type.to_ir(builder) for result in results]
+    op = builder.create_warp_predicate_op(
+        result_types,
+        predicate.handle,
+        [init.handle for init in inits],
+        wave_uniform,
+    )
+    op.get_region(0).push_back(block)
+    builder.set_insertion_point_after(op)
+    merged = [tl.tensor(op.get_result(index), result.type) for index, result in enumerate(results)]
+    return merged[0] if len(merged) == 1 else builtins.tuple(merged)
+
+
+@tl.builtin
+def async_task_replica_id(_semantic=None):
+    from triton.language.extra.tlx.compiler.code_generator import _get_region_replica_id_stack
+
+    region_replica_id_stack = _get_region_replica_id_stack()
+    assert len(region_replica_id_stack) > 0, (
+        "async_task_replica_id must be called inside an async region where the stack must be non-empty")
+    return tl.constexpr(region_replica_id_stack[-1])
+
+
+@tl.builtin
+def dtype_of(v, _semantic=None) -> tl.dtype:
+    """
+    Returns the element type of a given tensor or tensor descriptor.
+    """
+    if isinstance(v, tl.tensor):
+        dtype = v.type.element_ty
+        if dtype.is_ptr():
+            dtype = dtype.element_ty
+        return dtype
+    if isinstance(v, tl.tensor_descriptor_base):
+        return v.dtype
+    raise ValueError(f"dtype_of only works on tensors and tensor descriptors, but got {v}")
+
+
+@tl.builtin
+def size_of(dtype: tl.dtype, _semantic=None) -> tl.constexpr:
+    """
+    Returns the size of a given dtype.
+    """
+    dtype = tl._unwrap_if_constexpr(dtype)
+    assert isinstance(dtype, tl.dtype), f"size_of expects a dtype, but got {type(dtype)}"
+    return tl.constexpr(dtype.primitive_bitwidth // 8)
+
+
+@tl.builtin
+def get_fp8_format_name(dtype: tl.dtype, _semantic=None) -> tl.constexpr:
+    """
+    Returns the FP8 format name string for a given FP8 dtype.
+
+    This extracts the format identifier (e.g., "e5m2", "e4m3") from the dtype
+    for use with scaled MMA operations like async_dot_scaled.
+
+    Args:
+        dtype: An FP8 dtype (tl.float8e5m2 or tl.float8e4nv)
+
+    Returns:
+        A constexpr string with the format name ("e5m2" or "e4m3")
+
+    Raises:
+        AssertionError: If the dtype is not a supported FP8 type.
+
+    Example:
+        Q_FP8_FORMAT: tl.constexpr = tlx.get_fp8_format_name(tlx.dtype_of(desc_q))
+    """
+    dtype = tl._unwrap_if_constexpr(dtype)
+    assert isinstance(dtype, tl.dtype), f"get_fp8_format_name expects a dtype, but got {type(dtype)}"
+    if dtype == tl.float8e5:
+        return tl.constexpr("e5m2")
+    elif dtype == tl.float8e4nv:
+        return tl.constexpr("e4m3")
+    else:
+        raise AssertionError(f"get_fp8_format_name only supports tl.float8e5 (e5m2) and tl.float8e4nv (e4m3), "
+                             f"but got {dtype}")
+
+
+@tl.builtin
+def clock64(_semantic=None):
+    """
+    Returns the current backend-specific 64-bit hardware timer value.
+
+    Differences between two readings can be used for device-side timing. The
+    timer's tick frequency and scope are target-specific. The timer read is not
+    a synchronization primitive, so callers timing asynchronous or memory
+    operations must issue the appropriate waits or barriers.
+
+    Returns:
+        tl.tensor: A tensor containing the current timer value as an int64.
+
+    Example:
+        start = tlx.clock64()
+        # ... kernel code ...
+        end = tlx.clock64()
+        elapsed = end - start
+    """
+    return tl.tensor(_semantic.builder.create_clock64(), tl.int64)
+
+
+@tl.builtin
+def stoch_round(
+    src: tl.tensor,
+    dst_ty: tl.dtype,
+    rand_bits: tl.tensor,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions.
+
+    Requires Blackwell GPU (compute capability >= 100), or CDNA3/CDNA4/CDNA5 on AMD.
+
+    Semantics:
+        y = tlx.stoch_round(src, dst_ty, rand_bits)
+
+    Maps to PTX (on Blackwell):
+        cvt.rs.satfinite.{e4m3x4,e5m2x4}.f32  d, {a,b,c,d}, rbits  (for FP8)
+        cvt.rs.satfinite.{bf16x2,f16x2}.f32   d, {a,b}, rbits      (for BF16/F16)
+
+    Maps to GCN (on AMD):
+        v_cvt_sr_fp8_f32 / v_cvt_sr_bf8_f32  (for FP8, one element per seed)
+        v_cvt_sr_f16_f32 / v_cvt_sr_bf16_f32 (for F16/BF16 on CDNA4)
+        v_cvt_sr_pk_f16_f32 / v_cvt_sr_pk_bf16_f32 (for F16/BF16 on CDNA5,
+            i.e. gfx1250; packed pairs sharing one seed)
+    The fp8 encoding follows the architecture: FNUZ on CDNA3 (gfx942),
+    OCP on CDNA4 (gfx950) and CDNA5 (gfx1250).
+
+    Args:
+        src:
+            Source FP32 tensor. Shape defines output shape.
+        dst_ty:
+            Destination dtype. On CUDA: tl.float8e5, tl.float8e4nv, tl.float16,
+            or tl.bfloat16. On CDNA4/CDNA5: the same four. On CDNA3:
+            tl.float8e4b8 or tl.float8e5b16 (FNUZ fp8 only).
+        rand_bits:
+            Random bits (uint32 tensor) for entropy, must match src shape
+
+    Returns:
+        Tensor with dtype dst_ty and shape matching src.
+    """
+    if isinstance(dst_ty, tl.constexpr):
+        dst_ty = dst_ty.value
+    arch = _semantic.builder.options.arch
+    if isinstance(arch, str) and arch.startswith("gfx"):
+        # CDNA3 (gfx942) converts to FNUZ fp8 only; CDNA4 (gfx950) and CDNA5
+        # (gfx1250) convert to OCP fp8/f16/bf16. Older CDNA has no
+        # stochastic-rounding support.
+        # Strip any ":feature" suffix (e.g. "gfx942:sramecc+:xnack-") before
+        # matching the version.
+        gfx_version = arch.split(":")[0].removeprefix("gfx")
+        if gfx_version in ("950", "1250"):
+            supported_dst = [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16]
+        elif gfx_version == "942":
+            supported_dst = [tl.float8e4b8, tl.float8e5b16]
+        else:
+            raise AssertionError(f"stoch_round requires gfx942 (CDNA3, FNUZ fp8 only), gfx950 (CDNA4), or "
+                                 f"gfx1250 (CDNA5), got arch {arch}")
+    else:
+        capability = int(cuda_parse_arch(arch))
+        assert capability >= 100, (f"stoch_round requires compute capability >= 100 (Blackwell GPU), "
+                                   f"current capability: {capability}")
+        supported_dst = [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16]
+    src_ty = src.type
+    src_sca_ty = src_ty.scalar
+
+    assert src_sca_ty == tl.float32, (f"Stochastic rounding only supports fp32 source, got {src_sca_ty}. "
+                                      f"Source must be float32.")
+    assert dst_ty in supported_dst, (f"Stochastic rounding does not support destination {dst_ty} on arch {arch}. "
+                                     f"Supported types: {', '.join(str(t) for t in supported_dst)}")
+
+    rbits_ty = rand_bits.type
+    if src_ty.is_block() and rbits_ty.is_block():
+        assert src_ty.shape == rbits_ty.shape, f"rand_bits shape {rbits_ty.shape} must match src shape {src_ty.shape}"
+    elif not src_ty.is_block() and not rbits_ty.is_block():
+        pass
+    else:
+        raise ValueError(f"src and rand_bits must both be blocks or both be scalars, "
+                         f"got src_ty.is_block()={src_ty.is_block()}, rbits_ty.is_block()={rbits_ty.is_block()}")
+
+    if src_sca_ty == dst_ty:
+        return src
+    if src_ty.is_block():
+        result_ty = src_ty.with_element_ty(dst_ty)
+        dst_ir_ty = result_ty.to_ir(_semantic.builder)
+    else:
+        result_ty = dst_ty
+        dst_ir_ty = dst_ty.to_ir(_semantic.builder)
+    dst = _semantic.builder.create_cvt_rs(src.handle, dst_ir_ty, rand_bits.handle)
+    return tl.tensor(dst, result_ty)

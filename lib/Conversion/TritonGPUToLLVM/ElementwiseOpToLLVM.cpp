@@ -11,17 +11,6 @@ using namespace mlir::triton::gpu;
 
 namespace {
 
-struct AnnotateOpConversion : public ConvertOpToLLVMPattern<AnnotateOp> {
-  using ConvertOpToLLVMPattern<AnnotateOp>::ConvertOpToLLVMPattern;
-
-  LogicalResult
-  matchAndRewrite(AnnotateOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOp(op, adaptor.getSrc());
-    return success();
-  }
-};
-
 struct AddPtrOpConversion : public ConvertOpToLLVMPattern<AddPtrOp> {
   using ConvertOpToLLVMPattern<AddPtrOp>::ConvertOpToLLVMPattern;
 
@@ -437,8 +426,8 @@ struct InlineAsmOpConversion
     auto call = LLVM::InlineAsmOp::create(
         rewriter, loc, returnType, operands, op.getAsmString(),
         op.getConstraints(), !op.getPure(), false, LLVM::TailCallKind::None,
-        /*convergent=*/false,
-        LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT), ArrayAttr());
+        false, LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
+        ArrayAttr());
 
     SmallVector<Value> elements;
     if (!resultTypes.empty())
@@ -501,11 +490,9 @@ struct SelectOpConversion
     } else {
       llvmOperands = {operands[0][0], operands[0][1], operands[0][2]};
     }
-    auto attrs = splitBuilderAttributes<LLVM::SelectOp>(
-        rewriter, loc, adaptor.getAttributes().getValue());
     return {LLVM::SelectOp::create(rewriter, loc, llvmOperands[1].getType(),
-                                   llvmOperands, attrs.properties,
-                                   attrs.discardableAttrs)};
+                                   llvmOperands,
+                                   adaptor.getAttributes().getValue())};
   }
 };
 template <typename OpTy>
@@ -713,6 +700,7 @@ void mlir::triton::populateElementwiseOpToLLVMPatterns(
   POPULATE_UNARY_OP(arith::ExtSIOp, LLVM::SExtOp)
   POPULATE_UNARY_OP(arith::ExtUIOp, LLVM::ZExtOp)
   POPULATE_UNARY_OP(arith::FPToUIOp, LLVM::FPToUIOp)
+  POPULATE_UNARY_OP(arith::UIToFPOp, LLVM::UIToFPOp)
   POPULATE_UNARY_OP(arith::NegFOp, LLVM::FNegOp)
   POPULATE_UNARY_OP(math::AbsIOp, LLVM::AbsOp,
                     [](LLVM::AbsOp op) { op.setIsIntMinPoison(false); })
@@ -722,6 +710,8 @@ void mlir::triton::populateElementwiseOpToLLVMPatterns(
   POPULATE_UNARY_OP(math::Log2Op, math::Log2Op)
   POPULATE_UNARY_OP(math::CosOp, math::CosOp)
   POPULATE_UNARY_OP(math::SinOp, math::SinOp)
+  POPULATE_UNARY_OP(math::SqrtOp, math::SqrtOp)
+  POPULATE_UNARY_OP(math::RsqrtOp, math::RsqrtOp)
   POPULATE_UNARY_OP(math::ExpOp, math::ExpOp)
   POPULATE_UNARY_OP(math::Exp2Op, math::Exp2Op)
   POPULATE_UNARY_OP(math::ErfOp, math::ErfOp)
@@ -767,7 +757,6 @@ void mlir::triton::populateElementwiseOpToLLVMPatterns(
   patterns.add<MulhiUIOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<ExternElementwiseOpConversion>(typeConverter, axisInfoAnalysis,
                                               benefit);
-  patterns.add<AnnotateOpConversion>(typeConverter, benefit);
   patterns.add<ElementwiseInlineAsmOpConversion>(typeConverter, benefit);
   patterns.add<InlineAsmOpConversion>(typeConverter, benefit);
   patterns.add<AbsFOpConversion>(typeConverter, axisInfoAnalysis, benefit);

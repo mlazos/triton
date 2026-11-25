@@ -2,6 +2,7 @@ add_triton_library(TritonAMDGPUToLLVM
     AsyncUtility.cpp
     AtomicRMWOpsEmitter.cpp
     AllocateSharedMemory.cpp
+    BarrierOpConversion.cpp
     BufferOpsEmitter.cpp
     TensorPtrOpsToLLVM.cpp
     ConvertLayoutOpToLLVM.cpp
@@ -18,7 +19,6 @@ add_triton_library(TritonAMDGPUToLLVM
     LoadStoreOpToLLVM.cpp
     HistogramOpToLLVM.cpp
     Membar.cpp
-    ScheduleMembar.cpp
     TritonGPUToLLVM.cpp
     BuiltinFuncToLLVM.cpp
     Utility.cpp

@@ -1,11 +1,13 @@
-// RUN: triton-opt %s -split-input-file -tritongpu-promote-lhs-to-tmem | FileCheck --dump-input-context=50 %s
+// RUN: triton-opt %s -tritongpu-promote-lhs-to-tmem | FileCheck --dump-input-context=50 %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared_trans = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #shared_fp8 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem256 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
@@ -151,20 +153,172 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
-}
 
-// -----
-
-#src = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0], CGALayout = [[1, 0]]}>
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
-#acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[0, 0]]>
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: @promote_lhs_cta_redistribution
-  // CHECK: ttng.tc_gen5_mma
-  tt.func public @promote_lhs_cta_redistribution(%a: tensor<128x64xf16, #src>, %b: !ttg.memdesc<64x128xf16, #shared, #ttg.shared_memory>, %d: !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>) {
+  // Test: when a local_alloc is used both directly as operand A and through
+  // memdesc_trans as operand A of another gen5 MMA, skip promotion for both.
+  // The transposed path cannot be promoted to tmem, so keeping both in smem
+  // avoids a redundant tmem allocation and copy for the same data.
+  // CHECK-LABEL: @dont_promote_when_trans_used_as_lhs
+  // CHECK: %[[A:.+]] = tt.load
+  // CHECK: %[[A_SMEM:.+]] = ttg.local_alloc %[[A]]
+  // CHECK: %[[AT:.+]] = ttg.memdesc_trans %[[A_SMEM]]
+  // CHECK: ttng.tc_gen5_mma %[[A_SMEM]], %{{.+}}, %{{.+}}, {{.+}}
+  // CHECK: ttng.tc_gen5_mma %[[AT]], %{{.+}}, %{{.+}}, {{.+}}
+  tt.func public @dont_promote_when_trans_used_as_lhs(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %arg3: i32) -> tensor<128x128xf16, #blocked1> {
     %true = arith.constant true
-    %a_shared = ttg.local_alloc %a : (tensor<128x64xf16, #src>) -> !ttg.memdesc<128x64xf16, #shared, #ttg.shared_memory>
-    ttng.tc_gen5_mma %a_shared, %b, %d, %true, %true : !ttg.memdesc<128x64xf16, #shared, #ttg.shared_memory>, !ttg.memdesc<64x128xf16, #shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #acc, #ttng.tensor_memory, mutable>
+    %false = arith.constant false
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %B_multibuf = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res = scf.for %i = %c0_i32 to %arg3 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked1>)  : i32 {
+      %A = tt.load %A_ptr : tensor<128x128x!tt.ptr<f16>, #blocked1>
+      %A_sh = ttg.local_alloc %A : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %AT = ttg.memdesc_trans %A_sh {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared_trans, #ttg.shared_memory, mutable>
+      %B_sh = ttg.memdesc_index %B_multibuf[%c0_i32] : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %acc_tm = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc2_tm = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      ttng.tc_gen5_mma %AT, %B_sh, %acc2_tm, %false, %true : !ttg.memdesc<128x128xf16, #shared_trans, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_res = ttng.tmem_load %acc_tm : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1>
+      scf.yield %acc_res : tensor<128x128xf32, #blocked1>
+    }
+    ttg.local_dealloc %B_multibuf : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
+    tt.return %res_f16 : tensor<128x128xf16, #blocked1>
+  }
+
+  // Test: two separate local_allocs from the same source value, one used
+  // directly as operand A and the other transposed as operand A. The pass
+  // should skip promoting the direct one since the transposed sibling must
+  // stay in smem. This mirrors the dk/dq pattern in backward attention.
+  // CHECK-LABEL: @dont_promote_when_sibling_alloc_trans_as_lhs
+  // CHECK: %[[SRC:.+]] = arith.truncf
+  // CHECK: %[[A1:.+]] = ttg.local_alloc %[[SRC]]
+  // CHECK: %[[A2:.+]] = ttg.local_alloc %[[SRC]]
+  // CHECK: %[[A2T:.+]] = ttg.memdesc_trans %[[A2]]
+  // CHECK: ttng.tc_gen5_mma %[[A1]], %{{.+}}, %{{.+}}, {{.+}}
+  // CHECK: ttng.tc_gen5_mma %[[A2T]], %{{.+}}, %{{.+}}, {{.+}}
+  tt.func public @dont_promote_when_sibling_alloc_trans_as_lhs(%A_ptr: tensor<128x128x!tt.ptr<f32>, #blocked1>, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %arg3: i32) -> tensor<128x128xf16, #blocked1> {
+    %true = arith.constant true
+    %false = arith.constant false
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %B_multibuf = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res = scf.for %i = %c0_i32 to %arg3 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked1>)  : i32 {
+      %A_f32 = tt.load %A_ptr : tensor<128x128x!tt.ptr<f32>, #blocked1>
+      %A_f16 = arith.truncf %A_f32 : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
+      %A_sh1 = ttg.local_alloc %A_f16 : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %A_sh2 = ttg.local_alloc %A_f16 : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared_trans, #ttg.shared_memory, mutable>
+      %A_sh2T = ttg.memdesc_trans %A_sh2 {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared_trans, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %B_sh = ttg.memdesc_index %B_multibuf[%c0_i32] : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %acc_tm = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc2_tm = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      ttng.tc_gen5_mma %A_sh1, %B_sh, %acc_tm, %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      ttng.tc_gen5_mma %A_sh2T, %B_sh, %acc2_tm, %false, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_res = ttng.tmem_load %acc_tm : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1>
+      scf.yield %acc_res : tensor<128x128xf32, #blocked1>
+    }
+    ttg.local_dealloc %B_multibuf : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
+    tt.return %res_f16 : tensor<128x128xf16, #blocked1>
+  }
+
+  // Memtype-only tt.autows channel ("opndA,tmem" / "opndA,smem", no copies/id):
+  // the annotation controls only the operand-A memory space; there is no
+  // buffer.id/copies to pin, so the memory planner decides those downstream.
+  // Same IR as @promote_lhs (which promotes via heuristic); here the annotation
+  // drives the decision explicitly.
+
+  // opndA,smem SUPPRESSES promotion: operand A stays a shared-memory local_alloc.
+  // CHECK-LABEL: @promote_lhs_opnda_smem
+  // CHECK: %[[A:.+]] = tt.load
+  // CHECK: %[[A_SH:.+]] = ttg.local_alloc %[[A]]
+  // CHECK: ttng.tc_gen5_mma %[[A_SH]],
+  tt.func public @promote_lhs_opnda_smem(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %arg3: i32) -> tensor<128x128xf16, #blocked1> {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %B_multibuf = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res = scf.for %i = %c0_i32 to %arg3 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked1>)  : i32 {
+      %A = tt.load %A_ptr : tensor<128x128x!tt.ptr<f16>, #blocked1>
+      %A_sh = ttg.local_alloc %A : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %B_sh = ttg.memdesc_index %B_multibuf[%c0_i32] : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %acc_tm = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true {tt.autows = "{\22channels\22: [\22opndA,smem\22]}"} : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_res = ttng.tmem_load %acc_tm : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1>
+      scf.yield %acc_res : tensor<128x128xf32, #blocked1>
+    }
+    ttg.local_dealloc %B_multibuf : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
+    tt.return %res_f16 : tensor<128x128xf16, #blocked1>
+  }
+
+  // opndA,tmem FORCES promotion: operand A becomes a tmem_alloc (no id/copies pinned).
+  // CHECK-LABEL: @promote_lhs_opnda_tmem
+  // CHECK: %[[A:.+]] = tt.load
+  // CHECK: %[[A_TMEM:.+]] = ttng.tmem_alloc %[[A]]
+  // CHECK: ttng.tc_gen5_mma %[[A_TMEM]],
+  tt.func public @promote_lhs_opnda_tmem(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %arg3: i32) -> tensor<128x128xf16, #blocked1> {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %B_multibuf = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res = scf.for %i = %c0_i32 to %arg3 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked1>)  : i32 {
+      %A = tt.load %A_ptr : tensor<128x128x!tt.ptr<f16>, #blocked1>
+      %A_sh = ttg.local_alloc %A : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %B_sh = ttg.memdesc_index %B_multibuf[%c0_i32] : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %acc_tm = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true {tt.autows = "{\22channels\22: [\22opndA,tmem\22]}"} : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_res = ttng.tmem_load %acc_tm : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1>
+      scf.yield %acc_res : tensor<128x128xf32, #blocked1>
+    }
+    ttg.local_dealloc %B_multibuf : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
+    tt.return %res_f16 : tensor<128x128xf16, #blocked1>
+  }
+
+  // A source-less operand A has no register source to promote: decline
+  // gracefully (no tmem_alloc for A) instead of crashing on the null
+  // value.
+  // CHECK-LABEL: @promote_lhs_sourceless_declined
+  // CHECK: %[[A_SH:.+]] = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16,
+  // CHECK: ttng.tc_gen5_mma %[[A_SH]],
+  tt.func public @promote_lhs_sourceless_declined(%arg3: i32) -> tensor<128x128xf16, #blocked1> {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %B_multibuf = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res = scf.for %i = %c0_i32 to %arg3 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked1>)  : i32 {
+      %A_sh = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %B_sh = ttg.memdesc_index %B_multibuf[%c0_i32] : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %acc_tm = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_res = ttng.tmem_load %acc_tm : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1>
+      scf.yield %acc_res : tensor<128x128xf32, #blocked1>
+    }
+    ttg.local_dealloc %B_multibuf : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
+    tt.return %res_f16 : tensor<128x128xf16, #blocked1>
+  }
+  // A 256x256 fp32 accumulator fills all 512 TMEM columns, so A stays in SMEM.
+  // CHECK-LABEL: @dont_promote_lhs_tmem_full
+  // CHECK: %[[A:.+]] = arith.truncf
+  // CHECK: %[[A_SH:.+]] = ttg.local_alloc %[[A]]
+  // CHECK-NOT: ttng.tmem_alloc %{{.+}} : (tensor<256x64xf16
+  // CHECK: ttng.tc_gen5_mma %[[A_SH]],
+  tt.func public @dont_promote_lhs_tmem_full(%A_ptr: tensor<256x64x!tt.ptr<f32>, #blocked2>, %B_sh: !ttg.memdesc<64x256xf16, #shared, #ttg.shared_memory, mutable>) {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<256x256xf32, #blocked1>
+    %A = tt.load %A_ptr : tensor<256x64x!tt.ptr<f32>, #blocked2>
+    %A_f16 = arith.truncf %A : tensor<256x64xf32, #blocked2> to tensor<256x64xf16, #blocked2>
+    %A_sh = ttg.local_alloc %A_f16 : (tensor<256x64xf16, #blocked2>) -> !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>
+    %acc_tm = ttng.tmem_alloc %cst : (tensor<256x256xf32, #blocked1>) -> !ttg.memdesc<256x256xf32, #tmem256, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %true, %true : !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<64x256xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<256x256xf32, #tmem256, #ttng.tensor_memory, mutable>
     tt.return
   }
 }

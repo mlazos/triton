@@ -52,8 +52,13 @@ class _tensor_descriptor_type_base(base_type):
     def nbytes_per_cta(self) -> int:
         nbytes = self.block_type.nbytes
         if self.layout.padding in ("b6x16_p32", "b6p2x16"):
-            nbytes = nbytes // 4 * 3
+            # Dense transfer bytes (3/4 of the padded smem footprint).
+            # mbarrier.expect counts TMA transfer bytes, not smem-read
+            # bytes; consistent with getDescriptorLoadBytes.
+            nbytes = nbytes * 3 // 4
         cga_layout = self.layout.cga_layout
+        if len(cga_layout) == 0:
+            return nbytes
         num_cta_splits = 2**sum(any(x != 0 for x in basis) for basis in cga_layout)
         return nbytes // num_cta_splits
 
@@ -171,9 +176,9 @@ def _emit_alignment_check(desc, coord, fn_name: str, arg_name: str, _semantic=No
     align_bytes = 16
     if desc.layout.fp4_padded:
         align_bytes = 64
-    if desc.layout.padding in ("b6x16_p32", "b6p2x16"):
+    elif desc.layout.padding in ("b6x16_p32", "b6p2x16"):
         # FP6 tensor coordinates count logical values.
-        align_bytes = 128
+        align_bytes = min(desc.block_shape[-1], 128)
     dtype = desc.dtype
     assert dtype.primitive_bitwidth % 8 == 0, f"unexpected sub-byte dtype {dtype}"
     elem_bytes = dtype.primitive_bitwidth // 8
@@ -183,9 +188,11 @@ def _emit_alignment_check(desc, coord, fn_name: str, arg_name: str, _semantic=No
     rem = coord.__mod__(align, _semantic=_semantic)
     is_zero = rem.__eq__(0, _semantic=_semantic)
 
-    fp4_padded = "with fp4_padded=True " if desc.layout.fp4_padded else ""
+    padding = "with fp4_padded=True " if desc.layout.fp4_padded else ""
+    if desc.layout.padding in ("b6x16_p32", "b6p2x16"):
+        padding = "with fp6_padded=True "
     ttgl.device_assert(
-        is_zero, f"{fn_name} {fp4_padded}{arg_name} must be {align_bytes}-byte aligned, "
+        is_zero, f"{fn_name} {padding}{arg_name} must be {align_bytes}-byte aligned, "
         f"i.e. a multiple of {align} for dtype={dtype.codegen_name()}", _semantic=_semantic)
 
 

@@ -67,7 +67,7 @@ namespace proton::gpu {
 
 CircularStoreDataPack lowerCircularStore(CircularStoreOp op,
                                          Value segmentStruct, Value counter,
-                                         Value dynamicScopeId,
+                                         Value dynamicScopeId, Value predicate,
                                          ConversionPatternRewriter &rewriter) {
   auto loc = op.getLoc();
   auto mod = op->getParentOfType<ModuleOp>();
@@ -142,12 +142,13 @@ CircularStoreDataPack lowerCircularStore(CircularStoreOp op,
   Value isWarpMaster =
       b.icmp_eq(b.urem(curThreadId, b.i32_val(warpSize)), b.i32_val(0));
   Value isWriter;
+  Value shouldAdvance;
 
-  Value idxToStore = newIdx;
   auto granularity = segmentType.getGranularity();
   if (selectedIds.empty()) {
     if (granularity == proton::gpu::Granularity::WARP) {
       isWriter = isWarpMaster;
+      shouldAdvance = b.true_val();
     } else {
       llvm::report_fatal_error(
           "segment address specialization not implemented yet");
@@ -155,9 +156,15 @@ CircularStoreDataPack lowerCircularStore(CircularStoreOp op,
   } else {
     Value isCurWarpEnabled = b.icmp_ne(segmentBase, b.i32_val(-1));
     isWriter = b.and_(isCurWarpEnabled, isWarpMaster);
-    idxToStore = b.select(isCurWarpEnabled, newIdx, curIdx);
+    shouldAdvance = isCurWarpEnabled;
   }
 
+  if (Value userPredicate = predicate) {
+    isWriter = b.and_(isWriter, userPredicate);
+    shouldAdvance = b.and_(shouldAdvance, userPredicate);
+  }
+
+  Value idxToStore = b.select(shouldAdvance, newIdx, curIdx);
   b.store(idxToStore, indexPtr);
 
   uint32_t addrSpace =

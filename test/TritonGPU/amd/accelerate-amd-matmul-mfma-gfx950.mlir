@@ -356,3 +356,117 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// CHECK-DAG: #[[$USER:.*]] = #tlx.user_layout<#mma>
+// MFMA16-DAG: #[[$USER:.*]] = #tlx.user_layout<#mma>
+// A deferred native MFMA result must not enter blocked software decomposition.
+// In particular, no_verify<MMA> is not itself an MmaEncodingTrait, and cannot
+// be used as the parent of a dot-operand encoding.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 1], order = [1, 0]}>
+#mfma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1], instrShape = [32, 32, 64], isTransposed = true}>
+#pin = #tlx.no_verify_layout<#mfma>
+#nested_pin = #tlx.no_verify_layout<#tlx.user_layout<#mfma>>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @deferred_native_scaled_mfma(
+  // CHECK-NOT: tt.fp_to_fp
+  // CHECK-NOT: tt.dot {{.*}}
+  // CHECK: tt.dot_scaled
+  // CHECK-SAME: -> tensor<64x128xf32, #tlx.no_verify_layout<#mma>>
+  // MFMA16-LABEL: @deferred_native_scaled_mfma(
+  // MFMA16-NOT: tt.fp_to_fp
+  // MFMA16-NOT: tt.dot {{.*}}
+  // MFMA16: tt.dot_scaled
+  // MFMA16-SAME: -> tensor<64x128xf32, #tlx.no_verify_layout<#mma>>
+  tt.func public @deferred_native_scaled_mfma(
+      %a: tensor<64x64xf8E4M3FN, #blocked>,
+      %b: tensor<64x128xf8E4M3FN, #blocked>,
+      %sa: tensor<64x2xi8, #blocked>,
+      %sb: tensor<128x2xi8, #blocked>,
+      %acc: tensor<64x128xf32, #pin>) -> tensor<64x128xf32, #pin> {
+    %dot = tt.dot_scaled %a scale %sa, %b scale %sb, %acc lhs = e4m3 rhs = e4m3 {fastMath = false} : tensor<64x64xf8E4M3FN, #blocked>, tensor<64x2xi8, #blocked> * tensor<64x128xf8E4M3FN, #blocked>, tensor<128x2xi8, #blocked> -> tensor<64x128xf32, #pin>
+    tt.return %dot : tensor<64x128xf32, #pin>
+  }
+  // CHECK-LABEL: @nested_deferred_native_scaled_mfma(
+  // CHECK-NOT: tt.fp_to_fp
+  // CHECK-NOT: tt.dot {{.*}}
+  // CHECK: tt.dot_scaled
+  // CHECK-SAME: -> tensor<64x128xf32, #tlx.no_verify_layout<#[[$USER]]>>
+  // MFMA16-LABEL: @nested_deferred_native_scaled_mfma(
+  // MFMA16-NOT: tt.fp_to_fp
+  // MFMA16-NOT: tt.dot {{.*}}
+  // MFMA16: tt.dot_scaled
+  // MFMA16-SAME: -> tensor<64x128xf32, #tlx.no_verify_layout<#[[$USER]]>>
+  tt.func public @nested_deferred_native_scaled_mfma(
+      %a: tensor<64x64xf8E4M3FN, #blocked>,
+      %b: tensor<64x128xf8E4M3FN, #blocked>,
+      %sa: tensor<64x2xi8, #blocked>,
+      %sb: tensor<128x2xi8, #blocked>,
+      %acc: tensor<64x128xf32, #nested_pin>) -> tensor<64x128xf32, #nested_pin> {
+    %dot = tt.dot_scaled %a scale %sa, %b scale %sb, %acc lhs = e4m3 rhs = e4m3 {fastMath = false} : tensor<64x64xf8E4M3FN, #blocked>, tensor<64x2xi8, #blocked> * tensor<64x128xf8E4M3FN, #blocked>, tensor<128x2xi8, #blocked> -> tensor<64x128xf32, #nested_pin>
+    tt.return %dot : tensor<64x128xf32, #nested_pin>
+  }
+}
+
+// -----
+
+// Manual K=96 blocked FP6 (TLX native kernel feeds per-segment packed bytes
+// in a K=128 tile): stays a native scaled dot instead of decomposing, and
+// keeps the explicit packed-operand marker.
+// CHECK-LABEL: mfma_dot_scaled_fp6_native_k96
+// CHECK-NOT: tt.fp_to_fp
+// CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false}
+// CHECK-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
+// CHECK-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
+// CHECK-NOT: tt.dot {{.*}}xbf16
+// MFMA16-LABEL: mfma_dot_scaled_fp6_native_k96
+// MFMA16-NOT: tt.fp_to_fp
+// MFMA16: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false}
+// MFMA16-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
+// MFMA16-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_dot_scaled_fp6_native_k96(
+      %arg0: tensor<128x128xi8, #blocked>,
+      %arg1: tensor<128x128xi8, #blocked>,
+      %arg2: tensor<128x4xi8, #blocked1>,
+      %arg3: tensor<128x4xi8, #blocked1>,
+      %arg4: tensor<128x128x!tt.ptr<f32>, #blocked>
+      ) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false} : tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> * tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> -> tensor<128x128xf32, #blocked>
+    tt.store %arg4, %1 : tensor<128x128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// BF16-default tile (256x256x64) FP6 also stays native at the
+// default instruction size (forced-16 has no K=64 scaled shape and
+// decomposes, as before).
+// CHECK-LABEL: mfma_dot_scaled_fp6_native_k64
+// CHECK-NOT: tt.fp_to_fp
+// CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false}
+// CHECK-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
+// CHECK-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
+// MFMA16-LABEL: mfma_dot_scaled_fp6_native_k64
+// MFMA16: tt.dot {{.*}} : tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = {{.*}}, kWidth = 8}>> * tensor<64x256xbf16, #ttg.dot_op<{opIdx = 1, parent = {{.*}}, kWidth = 8}>> -> tensor<256x256xf32, {{.*}}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_dot_scaled_fp6_native_k64(
+      %arg0: tensor<256x64xi8, #blocked>,
+      %arg1: tensor<64x256xi8, #blocked>,
+      %arg2: tensor<256x2xi8, #blocked1>,
+      %arg3: tensor<256x2xi8, #blocked1>,
+      %arg4: tensor<256x256x!tt.ptr<f32>, #blocked>
+      ) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<256x256xf32, #blocked>
+    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false} : tensor<256x64xi8, #blocked>, tensor<256x2xi8, #blocked1> * tensor<64x256xi8, #blocked>, tensor<256x2xi8, #blocked1> -> tensor<256x256xf32, #blocked>
+    tt.store %arg4, %1 : tensor<256x256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}

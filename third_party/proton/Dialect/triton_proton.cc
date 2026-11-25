@@ -11,9 +11,11 @@
 #include "mlir/Pass/PassManager.h"
 #include "passes.h"
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#include <optional>
 
 namespace py = nanobind;
 using namespace mlir::triton;
@@ -72,13 +74,17 @@ void init_triton_proton(py::module_ &m) {
   });
 
   // Proton operations
-  m.def("create_proton_record",
-        [](TritonOpBuilder &opBuilder, bool isStart,
-           const std::string &name) -> void {
-          auto nameAttr = mlir::StringAttr::get(opBuilder.getContext(),
-                                                llvm::StringRef(name));
-          opBuilder.create<proton::RecordOp>(isStart, nameAttr);
-        });
+  m.def(
+      "create_proton_record",
+      [](TritonOpBuilder &opBuilder, bool isStart, const std::string &name,
+         std::optional<mlir::Value> predicate) -> void {
+        auto nameAttr = mlir::StringAttr::get(opBuilder.getContext(),
+                                              llvm::StringRef(name));
+        opBuilder.create<proton::RecordOp>(isStart, nameAttr,
+                                           predicate.value_or(mlir::Value{}));
+      },
+      py::arg("opBuilder"), py::arg("isStart"), py::arg("name"),
+      py::arg("predicate").none() = py::none());
 
   m.def(
       "create_proton_allocate_event",
@@ -120,6 +126,8 @@ void init_triton_proton(py::module_ &m) {
                      proton::gpu::createAllocateProtonSharedMemoryPass);
   ADD_PASS_WRAPPER_0("add_schedule_buffer_store",
                      proton::gpu::createScheduleBufferStorePass);
+  ADD_PASS_WRAPPER_0("add_mpp_store_barrier_info",
+                     proton::gpu::createMppStoreBarrierInfoPass);
   ADD_PASS_WRAPPER_0("add_sched_barriers",
                      proton::gpu::createAddSchedBarriersPass);
 }

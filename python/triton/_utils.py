@@ -12,18 +12,20 @@ TRITON_MAX_TENSOR_NUMEL = 1048576
 
 
 def fp6_logical_shape(shape):
-    if shape[-1] % 96:
-        raise ValueError("packed FP6 rows must contain a multiple of 96 bytes")
+    if shape[-1] % 48:
+        raise ValueError("packed FP6 rows must contain a multiple of 48 bytes")
     return [*shape[:-1], shape[-1] // 3 * 4]
 
 
 def validate_fp6_box(width, inner, outer_strides, padding, *, host=False):
-    if width != 128 or padding != "zero":
-        raise ValueError("FP6 requires zero padding and a 128-value box")
+    widths = (64, 128) if host else (128, )
+    if width not in widths or padding != "zero":
+        raise ValueError("FP6 requires zero padding and a 128-value box or a 64-value host store box")
     if (host or isinstance(inner, int)) and inner % width:
         raise ValueError("FP6 inner extent must be a multiple of the box width")
-    if any((host or isinstance(s, int)) and s % 32 for s in outer_strides):
-        raise ValueError("FP6 outer byte strides must be multiples of 32")
+    alignment = width // 4
+    if any((host or isinstance(s, int)) and s % alignment for s in outer_strides):
+        raise ValueError(f"FP6 outer byte strides must be multiples of {alignment}")
 
 
 def get_iterable_path(iterable: IterableType, path: ObjPath) -> Any:
@@ -38,23 +40,9 @@ def set_iterable_path(iterable: IterableType, path: tuple[int, ...], val: Any):
     prev._setitem(path[-1], val)
 
 
-def is_iterable(x):
-    from .language import core
-    return isinstance(x, (list, tuple, core.tuple, core.tuple_type))
-
-
-def apply_with_path(value: Any, fn: Callable[[ObjPath, Any], None], _path=None) -> None:
-    if _path is None:
-        _path = ()
-
-    if is_iterable(value):
-        for idx, item in enumerate(value):
-            apply_with_path(item, fn, _path=(*_path, idx))
-    else:
-        fn(_path, value)
-
-
 def find_paths_if(iterable: Union[IterableType, Any], pred: Callable[[ObjPath, Any], bool]) -> list[ObjPath]:
+    from .language import core
+    is_iterable: Callable[[Any], bool] = lambda x: isinstance(x, (list, tuple, core.tuple, core.tuple_type))
     # We need to use dict so that ordering is maintained, while set doesn't guarantee order
     ret: dict[ObjPath, None] = {}
 
@@ -76,11 +64,13 @@ def is_power_of_two(x):
 
 
 def validate_block_shape(shape: List[int]):
+    from . import knobs
+    allow_npot = knobs.language.allow_npot
     numel = 1
     for i, d in enumerate(shape):
         if not isinstance(d, int):
             raise TypeError(f"Shape element {i} must have type `constexpr[int]`, got `constexpr[{type(d)}]")
-        if not is_power_of_two(d):
+        if not allow_npot and not is_power_of_two(d):
             raise ValueError(f"Shape element {i} must be a power of 2")
         numel *= d
 

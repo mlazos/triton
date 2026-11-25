@@ -11,12 +11,12 @@ from triton.tools.triton_to_gluon_translator.translator import convert_triton_to
 from triton.tools.triton_to_gluon_translator.target import TranslatorTarget
 from triton._internal_testing import (
     is_blackwell,
-    is_hopper_or_newer,
     is_cuda,
+    is_hip_cdna3_or_newer,
     is_hip_cdna4,
     is_hip_cdna5,
-    is_hip_cdna3_or_newer,
     is_hip_rdna,
+    is_hopper_or_newer,
 )
 from triton.language.target_info import current_target
 

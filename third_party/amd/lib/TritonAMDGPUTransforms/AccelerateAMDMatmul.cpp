@@ -1,6 +1,8 @@
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
+#include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -13,9 +15,14 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
 #include "triton/Dialect/TritonGPU/Transforms/LayoutPropagationUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -28,12 +35,18 @@ using ::mlir::LLVM::AMD::scaleDotElemTypeToMLIRType;
 
 namespace mlir {
 
+// BlockedToMFMA issues a dot at the size the target dot-legality query admits.
+static int getNpotMfmaNonKDim(tt::DotOpInterface dot, int mfmaVersion,
+                              int nonKDim, int numWarps);
+
 namespace {
 using triton::amdgpu::ISAFamily;
+using triton::amdgpu::kWmmaRestrictedInstsFeature;
 using triton::amdgpu::TargetFeatures;
 
 constexpr char AttrDecomposedDotScaledSource[] =
     "amdg.decomposed_dot_scaled_source";
+constexpr char AttrAMDWmmaTilesPerWarp[] = "amdg.wmma_tiles_per_warp";
 
 int getMfmaVersion(ISAFamily isaFamily) {
   switch (isaFamily) {
@@ -63,6 +76,18 @@ int getWmmaVersion(ISAFamily isaFamily) {
   }
 
   return 0;
+}
+
+// Logical K count of a scaled-dot operand along its packed dim: fp4
+// packs 2 values per byte; fp6 shapes already count logical values
+// (groups of 16 values / 12 bytes, asserted as a precondition -- the
+// IR verifier guarantees it for verified ops).
+static int64_t getScaledDotLogicalK(ScaleDotElemType elemType, int64_t k) {
+  if (elemType == ScaleDotElemType::E2M1)
+    return k * 2;
+  if (isMXFP6ScaleType(elemType))
+    assert(k % 16 == 0);
+  return k;
 }
 
 static bool hasAsymmetricMfmaBroadcastOperand(unsigned mDim, unsigned nDim) {
@@ -169,13 +194,79 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
   return ret;
 }
 
-// Chooses an MFMA instruction for a dot op with the given result shape, A/B
-// element types, and K size. If enforcedNonKDim is not zero, it overrides the
-// default logic to choose an MFMA with matching M/N dims.
+// Warps are pow2, so an NPOT dim's odd part is a register digit. A plan that
+// splits an odd part across warps is redone on the pow2 parts.
+SmallVector<unsigned, 3>
+planNpotMfmaWarps(Operation *dotOp, ArrayRef<int64_t> shape, int numWarps,
+                  std::pair<int64_t, int64_t> instrShape) {
+  SmallVector<unsigned, 3> warps =
+      planWarps(dotOp, shape, numWarps, instrShape);
+  SmallVector<unsigned, 2> instr = {static_cast<unsigned>(instrShape.first),
+                                    static_cast<unsigned>(instrShape.second)};
+  if (shape.size() != 2 || llvm::all_of(shape, llvm::isPowerOf2_64) ||
+      !getWarpPlacementUnsupportedReason(shape, warps, instr))
+    return warps;
+  SmallVector<int64_t, 2> pow2Parts = {shape[0] & -shape[0],
+                                       shape[1] & -shape[1]};
+  return planWarps(dotOp, pow2Parts, numWarps, instrShape);
+}
+
+LogicalResult validateWmmaTilesPerWarp(tt::DotScaledOp dotOp) {
+  Attribute rawAttr = dotOp->getAttr(AttrAMDWmmaTilesPerWarp);
+  if (!rawAttr)
+    return success();
+
+  auto attr = dyn_cast<DenseI32ArrayAttr>(rawAttr);
+  if (!attr)
+    return dotOp.emitOpError()
+           << AttrAMDWmmaTilesPerWarp << " must be an array<i32> attribute";
+
+  auto resultType = dotOp.getType();
+  unsigned rank = resultType.getRank();
+  ArrayRef<int32_t> requested = attr.asArrayRef();
+  if (requested.size() != rank)
+    return dotOp.emitOpError()
+           << AttrAMDWmmaTilesPerWarp << " must have " << rank << " entries";
+  if (rank != 2)
+    return dotOp.emitOpError()
+           << AttrAMDWmmaTilesPerWarp << " currently requires a rank-2 dot";
+
+  constexpr unsigned mDim = 16;
+  constexpr unsigned nDim = 16;
+  auto cgaLayout = ttg::getCGALayout(resultType.getEncoding());
+  auto shapePerCTA =
+      ttg::getShapePerCTA(cgaLayout.getCTASplitNum(), resultType.getShape());
+  auto warpsPerTile =
+      planWarps(dotOp, shapePerCTA, ttg::lookupNumWarps(dotOp), {mDim, nDim});
+  SmallVector<unsigned> instrPerDim = {mDim, nDim};
+  for (auto [dim, tiles] : llvm::enumerate(requested)) {
+    if (tiles <= 0)
+      return dotOp.emitOpError()
+             << AttrAMDWmmaTilesPerWarp << " entries must be positive";
+    if (!llvm::isPowerOf2_32(static_cast<uint32_t>(tiles)))
+      return dotOp.emitOpError()
+             << AttrAMDWmmaTilesPerWarp << " entries must be powers of two";
+    uint64_t requiredExtent = static_cast<uint64_t>(instrPerDim[dim]) *
+                              warpsPerTile[dim] * static_cast<uint64_t>(tiles);
+    if (static_cast<uint64_t>(shapePerCTA[dim]) < requiredExtent)
+      return dotOp.emitOpError()
+             << AttrAMDWmmaTilesPerWarp << " requires extent " << requiredExtent
+             << " in dimension " << dim
+             << ", which exceeds the result tile shape";
+  }
+  return success();
+}
+
+// Chooses a proper MFMA instruction that can used to compute the given dot op.
+// If enforcedNonKDim is not zero, it will be used to overwrite the default
+// logic to choose a MFMA with matching M/N dim.
+// A failure leaves its remark text in `reason` instead of emitting it, so the
+// target dot-legality query can ask without diagnostics.
 FailureOr<MfmaIntrinsic>
 chooseMfmaInstruction(Location loc, int mfmaVersion, ArrayRef<int64_t> retShape,
                       Type aElemType, Type bElemType, int64_t inputKSize,
-                      int enforcedNonKDim, bool withScale, bool allowXF32) {
+                      int enforcedNonKDim, bool withScale, bool allowXF32,
+                      std::string &reason) {
   int64_t M = retShape[retShape.size() - 2];
   int64_t N = retShape[retShape.size() - 1];
 
@@ -211,17 +302,17 @@ chooseMfmaInstruction(Location loc, int mfmaVersion, ArrayRef<int64_t> retShape,
 
   // Fallback to FMA if the M/N dim is not supported by MFMA.
   if (failed(mfmaInstr)) {
-    InFlightDiagnostic remark =
-        emitRemark(loc) << "Unable to select MFMA intrinsic for the request: "
-                        << "version=" << mfmaVersion << ", result-shape=(" << M
-                        << "x" << N << "), selected-tiles=(" << mDim << "x"
-                        << nDim << "), inputKSize=" << inputKSize
-                        << ", aElemType=" << aElemType
-                        << ", bElemType=" << bElemType
-                        << ", withScale=" << (withScale ? "true" : "false")
-                        << ", allowXF32=" << (allowXF32 ? "true" : "false");
+    Diagnostic diag(loc, DiagnosticSeverity::Remark);
+    diag << "Unable to select MFMA intrinsic for the request: "
+         << "version=" << mfmaVersion << ", result-shape=(" << M << "x" << N
+         << "), selected-tiles=(" << mDim << "x" << nDim
+         << "), inputKSize=" << inputKSize << ", aElemType=" << aElemType
+         << ", bElemType=" << bElemType
+         << ", withScale=" << (withScale ? "true" : "false")
+         << ", allowXF32=" << (allowXF32 ? "true" : "false");
     if (enforcedNonKDim != 0)
-      remark << ", enforcedNonKDim=" << enforcedNonKDim;
+      diag << ", enforcedNonKDim=" << enforcedNonKDim;
+    reason = diag.str();
     return failure();
   }
 
@@ -231,15 +322,59 @@ chooseMfmaInstruction(Location loc, int mfmaVersion, ArrayRef<int64_t> retShape,
   // If inputKSize % kDim != 0 (including the case where inputKSize < kDim),
   // this layout will introduce data duplication.
   if (inputKSize % kDim != 0) {
-    emitRemark(loc)
-        << "Unable to select MFMA intrinsic '" << mfmaInstr->name
-        << "' as MFMA intrinsic k-dimension size kDim=" << kDim
-        << ", which is not a multiple of tile k-dimension size inputKSize="
-        << inputKSize
-        << ". Using this intrinsic would introduce data duplication.";
+    Diagnostic diag(loc, DiagnosticSeverity::Remark);
+    diag << "Unable to select MFMA intrinsic '" << mfmaInstr->name
+         << "' as MFMA intrinsic k-dimension size kDim=" << kDim
+         << ", which is not a multiple of tile k-dimension size inputKSize="
+         << inputKSize
+         << ". Using this intrinsic would introduce data duplication.";
+    reason = diag.str();
     return failure();
   }
   return mfmaInstr;
+}
+
+// An NPOT dim takes its pow2-padded dim's MFMA and only trims it. The target
+// dot-legality query, which also asks for the dot_scaled an f8f6f4 form
+// becomes, allows it where that MFMA tiles the dim or zeroes a K tail.
+FailureOr<MfmaIntrinsic> chooseMfmaInstruction(tt::DotOpInterface dot,
+                                               int mfmaVersion, int nonKDim,
+                                               bool withScale,
+                                               std::string &reason) {
+  auto aType = cast<RankedTensorType>(dot.getA().getType());
+  auto dType = cast<RankedTensorType>(dot.getD().getType());
+  auto tf32 = dyn_cast<tt::DotOp>(dot.getOperation());
+  bool allowXF32 = tf32 && tf32.getInputPrecision() == InputPrecision::TF32 &&
+                   mfmaVersion == 3;
+  return chooseMfmaInstruction(
+      dot.getLoc(), mfmaVersion, ttg::getNpotPow2AllocShape(dType.getShape()),
+      aType.getElementType(),
+      cast<RankedTensorType>(dot.getB().getType()).getElementType(),
+      llvm::PowerOf2Ceil(aType.getShape().back()), nonKDim, withScale,
+      allowXF32, reason);
+}
+
+FailureOr<MfmaIntrinsic> chooseMfmaInstruction(tt::DotScaledOp dot,
+                                               int mfmaVersion, int nonKDim,
+                                               std::string &reason) {
+  auto ctx = dot.getContext();
+  int64_t inputKDim = dot.getA().getType().getShape().back();
+  if (dot.getAElemType() == ScaleDotElemType::E2M1 && dot.getLhsKPack()) {
+    // Since two fp4 are packed into int8, to get the correct K dim size, we
+    // need to multiply it by 2.
+    inputKDim *= 2;
+  }
+  if (isMXFP6ScaleType(dot.getAElemType()) && dot.getLhsKPack() &&
+      inputKDim % 16 != 0) {
+    // fp6 shapes count logical values (dense global storage).
+    return failure();
+  }
+  Type aElemType = scaleDotElemTypeToMLIRType(ctx, dot.getAElemType());
+  Type bElemType = scaleDotElemTypeToMLIRType(ctx, dot.getBElemType());
+  return chooseMfmaInstruction(
+      dot.getLoc(), mfmaVersion, dot.getC().getType().getShape(), aElemType,
+      bElemType, llvm::PowerOf2Ceil(inputKDim), nonKDim, /*withScale=*/true,
+      /*allowXF32=*/false, reason);
 }
 
 // Chooses a WMMA instruction for the given dot op. The dot operands may need
@@ -393,8 +528,7 @@ Value convertAndCastTensor(PatternRewriter &rewriter, Value value,
   } else {
     if (oldElemType.isF16() && newElemType.isF32())
       castedTensor =
-          arith::ExtFOp::create(rewriter, loc, castedType, convertedTensor,
-                                arith::FastMathFlagsAttr{});
+          arith::ExtFOp::create(rewriter, loc, castedType, convertedTensor);
     else if (oldElemType.isF32() && newElemType.isF16())
       castedTensor =
           arith::TruncFOp::create(rewriter, loc, castedType, convertedTensor);
@@ -453,6 +587,10 @@ SmallVector<unsigned, 2> deduceTilesPerWarpForScale(
     // assume vec=4 for constant scale
     if (isa_and_nonnull<arith::ConstantOp, triton::SplatOp>(scaleDef))
       return 4;
+    // invertAndCompose below takes radix-2 layouts only; an NPOT scale K's
+    // layout has an odd register digit.
+    if (!layout.isRadix2())
+      return 1;
     // Infer source layout used for global load using the current scale layout.
     auto loadLayoutPair = ttg::inferSourceLoadLayout(layout, scaleDef);
     if (!loadLayoutPair)
@@ -516,6 +654,34 @@ SmallVector<unsigned, 2> deduceTilesPerWarpForScale(
   return chosen;
 }
 
+// A blocked result, or the mixed-radix one the converter gives an NPOT M or N.
+bool isMfmaResultCandidate(RankedTensorType type) {
+  Attribute enc = type.getEncoding();
+  return isa_and_nonnull<ttg::BlockedEncodingAttr>(enc) ||
+         (isa_and_nonnull<ttg::LinearEncodingAttr>(enc) &&
+          !ttg::isRadix2Encoding(enc));
+}
+
+// What BlockedToMFMA builds for a dot. The target dot-legality query asks for
+// it too, so both see the same MFMA and operand layouts.
+struct MfmaDotPlan {
+  MfmaIntrinsic instr;
+  bool withScale;
+  ttg::AMDMfmaEncodingAttr enc;
+  Type accType;
+  unsigned kWidth;
+
+  ttg::DotOperandEncodingAttr getOperandEncoding(unsigned opIdx) const {
+    Type operandType = opIdx == 0 ? instr.aElementType : instr.bElementType;
+    unsigned operandKWidth =
+        withScale && !isa<Float6E2M3FNType, Float6E3M2FNType>(operandType)
+            ? kWidth / 2
+            : kWidth;
+    return ttg::DotOperandEncodingAttr::get(enc.getContext(), opIdx, enc,
+                                            operandKWidth);
+  }
+};
+
 class BlockedToMFMA : public OpRewritePattern<tt::DotOp> {
   int mfmaVersion;
   int nonKDim;
@@ -527,19 +693,17 @@ public:
       : OpRewritePattern(context, benefit), mfmaVersion(mfmaVersion),
         nonKDim(nonKDim), kPack(kPack) {}
 
-  LogicalResult matchAndRewrite(tt::DotOp dotOp,
-                                PatternRewriter &rewriter) const override {
+  // Only `rewriting` takes the decomposed-scale markers, which a legality
+  // query must leave in place. The chooser's remarks go to `remarks`.
+  static FailureOr<MfmaDotPlan>
+  getPlan(tt::DotOpInterface dotOp, int mfmaVersion, int nonKDim, int numWarps,
+          int kPack, ttg::CGAEncodingAttr CGALayout, bool rewriting,
+          SmallVectorImpl<std::string> &remarks) {
     using TensorValue = TypedValue<RankedTensorType>;
-    RankedTensorType oldRetType = dotOp.getType();
-    if (!isa_and_nonnull<BlockedEncodingAttr>(oldRetType.getEncoding()))
-      return rewriter.notifyMatchFailure(
-          dotOp, "expected blocked encoding result tensor");
-
-    auto CGALayout = ttg::getCGALayout(oldRetType.getEncoding());
+    auto oldRetType = cast<RankedTensorType>(dotOp.getD().getType());
 
     // get MFMA encoding for the given number of warps
     auto retShape = oldRetType.getShape();
-    int numWarps = ttg::lookupNumWarps(dotOp);
 
     // operands
     Value a = dotOp.getA();
@@ -553,42 +717,44 @@ public:
     Type bElemType = oldBType.getElementType();
     bool withScale =
         mfmaVersion == 4 && isF8F6F4(aElemType) && isF8F6F4(bElemType);
-    bool allowXF32 =
-        dotOp.getInputPrecision() == InputPrecision::TF32 && mfmaVersion == 3;
 
     // If mfmaVersion == 4 and both inputs are of F8F6F4 types, we will try to
     // use the V_MFMA_*_F8F6F4 instructions since it has higher FLOPs per cycle.
     // If we can't find a proper instruction, we will fall back to select from
     // normal mfma instructions.
-    FailureOr<MfmaIntrinsic> mfmaInstr = failure();
-    if (withScale)
-      mfmaInstr = chooseMfmaInstruction(dotOp.getLoc(), mfmaVersion, retShape,
-                                        aElemType, bElemType, inputKSize,
-                                        nonKDim, /*withScale=*/true, allowXF32);
+    std::string reason;
+    FailureOr<MfmaIntrinsic> mfmaInstr =
+        chooseMfmaInstruction(dotOp, mfmaVersion, nonKDim, withScale, reason);
     if (failed(mfmaInstr)) {
+      remarks.push_back(reason);
+      if (!withScale) {
+        return failure();
+      }
+      mfmaInstr =
+          chooseMfmaInstruction(dotOp, mfmaVersion, nonKDim, false, reason);
+      if (failed(mfmaInstr)) {
+        remarks.push_back(reason);
+        return failure();
+      }
+
       withScale = false;
-      mfmaInstr = chooseMfmaInstruction(
-          dotOp.getLoc(), mfmaVersion, retShape, aElemType, bElemType,
-          inputKSize, nonKDim, /*withScale=*/false, allowXF32);
     }
-    if (failed(mfmaInstr))
-      return rewriter.notifyMatchFailure(
-          dotOp, "Unable to choose MFMA intrinsic for dot operation.");
 
     auto mDim = mfmaInstr->mDim;
     auto nDim = mfmaInstr->nDim;
     auto kDim = mfmaInstr->kDim;
     auto kBase = mfmaInstr->kBase;
 
-    auto warpsPerTile = planWarps(dotOp, retShape, numWarps, {mDim, nDim});
+    auto warpsPerTile =
+        planNpotMfmaWarps(dotOp, retShape, numWarps, {mDim, nDim});
 
     Type mfmaAccType;
     if (oldRetType.getElementType().isIntOrIndex())
-      mfmaAccType = rewriter.getIntegerType(32);
+      mfmaAccType = IntegerType::get(ctx, 32);
     else if (oldRetType.getElementType().isF64())
-      mfmaAccType = rewriter.getF64Type();
+      mfmaAccType = Float64Type::get(ctx);
     else
-      mfmaAccType = rewriter.getF32Type();
+      mfmaAccType = Float32Type::get(ctx);
 
     // Use transposed mfma layout to enable larger vectorization for global
     // store instructions. We can not support transposed mfma 4x64 as it
@@ -600,8 +766,8 @@ public:
     unsigned rank = oldRetType.getRank();
     SmallVector<unsigned, 2> tilesPerWarp{1, 1};
     if (mDim == nDim && (mDim == 32 || mDim == 16)) {
-      Value scaleA = findScaleAsDecompositionSource(a);
-      Value scaleB = findScaleAsDecompositionSource(b);
+      Value scaleA = rewriting ? findScaleAsDecompositionSource(a) : Value();
+      Value scaleB = rewriting ? findScaleAsDecompositionSource(b) : Value();
       // For decomposed scaled dots, pack warps along the free (non-scaled)
       // dimension to keep scale values warp-local. Cap at tile extent to
       // avoid overflow (e.g. 8 warps, 128-wide tile -> [2,4] not [1,8]).
@@ -650,10 +816,6 @@ public:
         isTransposed, CGALayout, tilesPerWarp,
         mfmaAccType.getIntOrFloatBitWidth());
 
-    // convert accumulator
-    auto oldAcc = dotOp.getC();
-    auto newAcc = convertAndCastTensor(rewriter, oldAcc, mfmaEnc, mfmaAccType);
-
     // Here is a brief explanation of kWidth, kBase, and kDim
     // 1. kWidth: the number of **consecutive** elements each thread loads from
     //    shared memory in preparation for mfma instructions. In theory, each
@@ -699,7 +861,10 @@ public:
     // operand through hardware broadcast before advancing to the next kBase
     // group, but DotOperandEncodingAttr stores one kWidth for both operands.
     auto isDotChainTail = isChainDotTail(dotOp);
-    unsigned packedKWidth = kWidth * kPack;
+    // An NPOT K keeps kBase-wide operands, whose K tile the target dot-legality
+    // query checks.
+    unsigned packedKWidth =
+        kWidth * (llvm::isPowerOf2_64(inputKSize) ? kPack : 1);
     auto packedOperandShape = mfmaEnc.getInstrShapeForOperand(packedKWidth, 0);
     if (!hasAsymmetricMfmaBroadcastOperand(mDim, nDim) && !isDotChainTail &&
         inputKSize >= packedOperandShape[1])
@@ -712,30 +877,78 @@ public:
     if (is16BitElemTy && isDotChainTail) {
       kWidth = 4;
     }
+    return MfmaDotPlan{*mfmaInstr, withScale, mfmaEnc, mfmaAccType, kWidth};
+  }
 
-    assert(!withScale || kWidth == 32);
-    unsigned operandKWidth = withScale ? kWidth / 2 : kWidth;
-    auto newAEncoding =
-        ttg::DotOperandEncodingAttr::get(ctx, 0, mfmaEnc, operandKWidth);
-    auto newBEncoding =
-        ttg::DotOperandEncodingAttr::get(ctx, 1, mfmaEnc, operandKWidth);
-    a = convertAndCastTensor(rewriter, a, newAEncoding,
-                             mfmaInstr->aElementType);
-    b = convertAndCastTensor(rewriter, b, newBEncoding,
-                             mfmaInstr->bElementType);
+  LogicalResult matchAndRewrite(tt::DotOp dotOp,
+                                PatternRewriter &rewriter) const override {
+    RankedTensorType oldRetType = dotOp.getType();
+    if (!isMfmaResultCandidate(oldRetType))
+      return rewriter.notifyMatchFailure(
+          dotOp, "expected blocked encoding result tensor");
+
+    SmallVector<std::string> remarks;
+    int numWarps = ttg::lookupNumWarps(dotOp);
+    FailureOr<MfmaDotPlan> plan =
+        getPlan(dotOp, mfmaVersion,
+                getNpotMfmaNonKDim(dotOp, mfmaVersion, nonKDim, numWarps),
+                numWarps, kPack, ttg::getCGALayout(oldRetType.getEncoding()),
+                /*rewriting=*/true, remarks);
+    for (const std::string &remark : remarks)
+      mlir::emitRemark(dotOp.getLoc()) << remark;
+    if (failed(plan))
+      return rewriter.notifyMatchFailure(
+          dotOp, "Unable to choose MFMA intrinsic for dot operation.");
+    const MfmaIntrinsic *mfmaInstr = &plan->instr;
+    bool withScale = plan->withScale;
+    unsigned kWidth = plan->kWidth;
+    Value a = dotOp.getA();
+    Value b = dotOp.getB();
+    Type aElemType = dotOp.getA().getType().getElementType();
+    Type bElemType = dotOp.getB().getType().getElementType();
+
+    // convert accumulator
+    auto oldAcc = dotOp.getC();
+    auto newAcc =
+        convertAndCastTensor(rewriter, oldAcc, plan->enc, plan->accType);
 
     // If a scaled mfma instruction is chosen, we rewrite the DotOp to a
     // DotScaledOp.
     Value newDot;
-    if (withScale)
+    if (withScale) {
+      // If a scaled mfma instruction is chosen, we will rewrite the DotOp to a
+      // DotScaledOp.
+      assert(kWidth == 32);
+      auto newAEncoding = plan->getOperandEncoding(0);
+      auto newBEncoding = plan->getOperandEncoding(1);
+
+      a = convertAndCastTensor(rewriter, a, newAEncoding,
+                               mfmaInstr->aElementType);
+      b = convertAndCastTensor(rewriter, b, newBEncoding,
+                               mfmaInstr->bElementType);
       newDot = triton::DotScaledOp::create(
           rewriter, dotOp.getLoc(), newAcc.getType(), a, b, newAcc, Value(),
           Value(), mlirTypeToScaledElemType(aElemType),
           mlirTypeToScaledElemType(bElemType), /*fastMath=*/false);
-    else
+    } else {
+      auto newAEncoding = plan->getOperandEncoding(0);
+      auto newBEncoding = plan->getOperandEncoding(1);
+      a = convertAndCastTensor(rewriter, a, newAEncoding,
+                               mfmaInstr->aElementType);
+      b = convertAndCastTensor(rewriter, b, newBEncoding,
+                               mfmaInstr->bElementType);
       newDot = tt::DotOp::create(rewriter, dotOp.getLoc(), newAcc.getType(), a,
                                  b, newAcc, dotOp.getInputPrecision(),
                                  dotOp.getMaxNumImpreciseAcc());
+    }
+
+    // Keep the accumulator register-class request (`amdg.cd_regclass`, see
+    // DotOpToLLVM/MFMA.cpp) on the re-created dot. Gluon emits the TTGIR dot
+    // directly and never gets here, but a `tt.dot` that comes from TTIR (TLX /
+    // triton.jit) is rebuilt by this pattern without its discardable
+    // attributes, which would silently drop the request.
+    if (Attribute cdRegClass = dotOp->getAttr("amdg.cd_regclass"))
+      newDot.getDefiningOp()->setAttr("amdg.cd_regclass", cdRegClass);
 
     Value dotOutput =
         convertAndCastTensor(rewriter, newDot, oldRetType.getEncoding(),
@@ -758,24 +971,102 @@ public:
 
   LogicalResult matchAndRewrite(tt::DotScaledOp dotOp,
                                 PatternRewriter &rewriter) const override {
-    if (isa_and_nonnull<ttg::AMDWmmaEncodingAttr>(
-            dotOp.getResult().getType().getEncoding()))
-      return failure();
+    // MFMA-layout FP6 dots match no blocked pattern and crash in
+    // lowering; decompose to a BF16/F16 dot via scaleArg + retargeting.
+    // WMMA-layout FP6 dots are intentionally not decomposed here: the
+    // retarget below is MFMA-specific, so they fail cleanly with
+    // "fp6 decompose only supports MFMA result layouts" instead. That
+    // is the supported set stated in one place, alongside the native
+    // gate below and the guard in DotOpToLLVM/MFMA.cpp.
+    bool isFp6 = isMXFP6ScaleType(dotOp.getAElemType()) ||
+                 isMXFP6ScaleType(dotOp.getBElemType());
+    if (isFp6 && !isa_and_nonnull<ttg::BlockedEncodingAttr>(
+                     dotOp.getType().getEncoding())) {
+      // A K=64/128 FP6 dot lowers natively (one 16x16x128 step, or
+      // one/two 32x32x64 steps); wider or NPOT FP6 decomposes. This
+      // is the native FP6 set at this point in the stack, so a
+      // 32x32x64 dot arrives natively here rather than decomposing.
+      if (auto mfmaEnc = dyn_cast<ttg::AMDMfmaEncodingAttr>(
+              dotOp.getType().getEncoding())) {
+        ArrayRef<unsigned> instr = mfmaEnc.getInstrShape();
+        // K is A's last dim and B's first dim; validate whichever
+        // operand(s) are FP6, not just A.
+        bool aNative = !isMXFP6ScaleType(dotOp.getAElemType()) ||
+                       dotOp.getA().getType().getShape().back() == 128 ||
+                       dotOp.getA().getType().getShape().back() == 64;
+        bool bNative = !isMXFP6ScaleType(dotOp.getBElemType()) ||
+                       dotOp.getB().getType().getShape().front() == 128 ||
+                       dotOp.getB().getType().getShape().front() == 64;
+        bool instrNative =
+            (instr[0] == 16 && instr[1] == 16 && instr[2] == 128) ||
+            (instr[0] == 32 && instr[1] == 32 && instr[2] == 64) ||
+            instr[2] == 64;
+        if (instrNative && aNative && bNative)
+          return rewriter.notifyMatchFailure(
+              dotOp, "fp6 K=64/128 MFMA layout uses native ScaledMFMA");
+      }
+      if ((isMXFP6ScaleType(dotOp.getAElemType()) && !dotOp.getLhsKPack()) ||
+          (isMXFP6ScaleType(dotOp.getBElemType()) && !dotOp.getRhsKPack()))
+        return rewriter.notifyMatchFailure(dotOp, "NYI: fp6 without K-packing");
+      auto computeType =
+          getComputeType(dotOp.getAElemType(), dotOp.getBElemType(), rewriter);
+      auto scaledAOr = scaleArg(rewriter, dotOp, 0, computeType);
+      if (failed(scaledAOr))
+        return rewriter.notifyMatchFailure(dotOp, "failed to scale lhs");
+      auto scaledBOr = scaleArg(rewriter, dotOp, 1, computeType);
+      if (failed(scaledBOr))
+        return rewriter.notifyMatchFailure(dotOp, "failed to scale rhs");
+      // The shared cvtDotOperand omits kWidth, which an MFMA/WMMA
+      // parent requires; the decomposed operands are 16-bit, so each
+      // thread chunk holds 8 elements (the 16-byte MFMA operand step).
+      // The scaled layout's K (64/128 for f8f6f4) has no 16-bit MFMA
+      // intrinsic, so retarget the dot at the 16-bit shape with the
+      // same M/N: 16x16x32 or 32x32x16, both with kBase 8.
+      auto *ctx = dotOp.getContext();
+      auto mfmaEnc =
+          dyn_cast<ttg::AMDMfmaEncodingAttr>(dotOp.getType().getEncoding());
+      if (!mfmaEnc)
+        return rewriter.notifyMatchFailure(
+            dotOp, "fp6 decompose only supports MFMA result layouts");
+      auto instr = mfmaEnc.getInstrShape();
+      unsigned dotK = instr[0] == 32 ? 16 : 32;
+      auto dotEnc = ttg::AMDMfmaEncodingAttr::get(
+          ctx, mfmaEnc.getVersion(), mfmaEnc.getWarpsPerCTA(),
+          {instr[0], instr[1], dotK}, mfmaEnc.getIsTransposed(),
+          mfmaEnc.getCGALayout(), mfmaEnc.getTilesPerWarp(),
+          dotOp.getType().getElementType().getIntOrFloatBitWidth());
+      auto toDotOperand = [&](int opIdx, TensorValue v) {
+        auto enc = ttg::DotOperandEncodingAttr::get(ctx, opIdx, dotEnc, 8);
+        auto ty = v.getType().cloneWithEncoding(enc);
+        return ttg::ConvertLayoutOp::create(rewriter, dotOp.getLoc(), ty, v)
+            .getResult();
+      };
+      auto scaledA = toDotOperand(0, *scaledAOr);
+      auto scaledB = toDotOperand(1, *scaledBOr);
+      auto dotAccTy = dotOp.getC().getType().cloneWithEncoding(dotEnc);
+      auto dotAcc = ttg::ConvertLayoutOp::create(rewriter, dotOp.getLoc(),
+                                                 dotAccTy, dotOp.getC());
+      auto newDot =
+          tt::DotOp::create(rewriter, dotOp.getLoc(), scaledA, scaledB, dotAcc);
+      rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(dotOp, dotOp.getType(),
+                                                        newDot);
+      return success();
+    }
     dotOp.emitRemark() << "Decomposing scaled dot operation into regular dot "
                           "operation with explicit scaling.";
     return ttg::DecomposeScaledBlocked::matchAndRewrite(dotOp, rewriter);
   }
 
-  RankedTensorType getScaledUpcastResultType(RankedTensorType vType,
-                                             FloatType computeType,
-                                             int32_t kDim, bool isFp4,
-                                             Location loc) const {
+  FailureOr<RankedTensorType>
+  getScaledUpcastResultType(RankedTensorType vType, FloatType computeType,
+                            int32_t kDim, bool isFp4, Location loc) const {
     if (!isFp4)
       return vType.clone(computeType);
 
     auto resultType = mlir::triton::gpu::inferFp4ToFpResultType(
         vType, computeType, kDim, loc);
-    assert(succeeded(resultType));
+    if (failed(resultType))
+      return failure();
     return *resultType;
   }
 
@@ -794,8 +1085,9 @@ public:
         blocked.getWarpsPerCTA(), order, ttg::getCGALayout(blocked));
   }
 
-  TensorValue scaleArg(PatternRewriter &rewriter, triton::DotScaledOp dotOp,
-                       int opIdx, FloatType computeType) const override {
+  FailureOr<TensorValue> scaleArg(PatternRewriter &rewriter,
+                                  triton::DotScaledOp dotOp, int opIdx,
+                                  FloatType computeType) const override {
     TensorValue v = (opIdx == 0) ? dotOp.getA() : dotOp.getB();
     TensorValue scale = (opIdx == 0) ? dotOp.getAScale() : dotOp.getBScale();
     ScaleDotElemType elemType =
@@ -805,6 +1097,13 @@ public:
     if (elemType == ScaleDotElemType::BF16 ||
         elemType == ScaleDotElemType::FP16)
       return v;
+
+    // 1.5) fp6 has no fused ScaledUpcast op; use the common gather-based
+    // upcast from the base class.
+    if (isMXFP6ScaleType(elemType)) {
+      return ttg::DecomposeScaledBlocked::scaleArg(rewriter, dotOp, opIdx,
+                                                   computeType);
+    }
 
     // 2) If it's non-scaled F8F4, we reuse the common path
     if (!scale) {
@@ -823,8 +1122,11 @@ public:
 
     Attribute inputEncoding = getPackedScaledUpcastEncoding(
         vType, kDim, isFp4 ? groupSize / 2 : groupSize);
-    RankedTensorType resultType = getScaledUpcastResultType(
+    auto resultTypeOr = getScaledUpcastResultType(
         vType.cloneWithEncoding(inputEncoding), computeType, kDim, isFp4, loc);
+    if (failed(resultTypeOr))
+      return failure();
+    RankedTensorType resultType = *resultTypeOr;
     v = cast<TensorValue>(convertAndCastTensor(rewriter, v, inputEncoding,
                                                vType.getElementType()));
 
@@ -844,14 +1146,20 @@ public:
       }
 
       auto newScaleType = resultType.clone(scale.getType().getElementType());
-      reshapeScale = broadcastScale(rewriter, dotOp, scale, kDim,
-                                    newScaleType.getEncoding());
+      auto reshapeScaleOr = broadcastScale(rewriter, dotOp, scale, kDim,
+                                           newScaleType.getEncoding());
+      if (failed(reshapeScaleOr))
+        return failure();
+      reshapeScale = *reshapeScaleOr;
     } else {
       // This is an exponent carrier; restore NaNs after the native upcast.
       FloatType bf16Type = rewriter.getBF16Type();
-      reshapeScale = extendAndBroadcastScale(rewriter, dotOp, scale, bf16Type,
-                                             resultType.clone(bf16Type), opIdx,
-                                             /*handleNan=*/false);
+      auto reshapeScaleOr = extendAndBroadcastScale(
+          rewriter, dotOp, scale, bf16Type, resultType.clone(bf16Type), opIdx,
+          /*handleNan=*/false);
+      if (failed(reshapeScaleOr))
+        return failure();
+      reshapeScale = *reshapeScaleOr;
     }
 
     // Upcast with scale
@@ -899,6 +1207,35 @@ createLocalLoadPackedTransposed(OpBuilder &builder, Location loc,
                                                              dstType, tmp);
 }
 
+// Why ScaledBlockedToScaledMFMAF8F6F4 leaves `dot` to the decompose upcast at
+// any shape, or std::nullopt.
+static std::optional<StringRef>
+getNativeScaledMfmaUnsupportedReason(tt::DotScaledOp dot, int mfmaVersion,
+                                     int numWarps) {
+  if (mfmaVersion != 4)
+    return StringRef("F8F6F4 scaled dot is only natively supported on gfx950");
+  auto supportsTypes = [](ScaleDotElemType elemType) {
+    return elemType == ScaleDotElemType::E2M1 || isMXFP6ScaleType(elemType) ||
+           elemType == ScaleDotElemType::E4M3 ||
+           elemType == ScaleDotElemType::E5M2;
+  };
+  if (!supportsTypes(dot.getAElemType()) || !supportsTypes(dot.getBElemType()))
+    return StringRef("NYI: unsupported mx type");
+  // A K=64/128 tile of unpacked FP6 codes lowers natively; other K
+  // still uses the decompose upcast.
+  if (isMXFP6ScaleType(dot.getAElemType()) ||
+      isMXFP6ScaleType(dot.getBElemType())) {
+    if (!dot->hasAttr(triton::amdgpu::kFp6PackedAttrName))
+      return StringRef("dense fp6 uses decompose upcast");
+    int64_t tileK = dot.getA().getType().getShape().back();
+    if (tileK != 128 && tileK != 64)
+      return StringRef("fp6 uses decompose upcast");
+  }
+  if (numWarps == 1)
+    return StringRef("num_warps==1 is not supported");
+  return std::nullopt;
+}
+
 class ScaledBlockedToScaledMFMAF8F6F4 final
     : public OpRewritePattern<triton::DotScaledOp> {
   int mfmaVersion;
@@ -910,14 +1247,60 @@ public:
       : OpRewritePattern(context, benefit), mfmaVersion(mfmaVersion),
         nonKDim(nonKDim) {}
 
+  // The scaled MFMA and layouts this pattern builds. The target dot-legality
+  // query asks for them too; the chooser's remarks go to `remarks`.
+  static FailureOr<MfmaDotPlan> getPlan(triton::DotScaledOp dotOp,
+                                        int mfmaVersion, int nonKDim,
+                                        int numWarps,
+                                        ttg::CGAEncodingAttr cgaLayout,
+                                        SmallVectorImpl<std::string> &remarks) {
+    RankedTensorType oldRetType = dotOp.getType();
+    auto oldShape = oldRetType.getShape();
+
+    // Choose a suitable Scaled MFMA instruction for this scaled dot op.
+    std::string reason;
+    FailureOr<MfmaIntrinsic> mfmaInstr =
+        chooseMfmaInstruction(dotOp, mfmaVersion, nonKDim, reason);
+    if (failed(mfmaInstr)) {
+      if (!reason.empty())
+        remarks.push_back(reason);
+      return failure();
+    }
+
+    auto mDim = mfmaInstr->mDim;
+    auto nDim = mfmaInstr->nDim;
+    auto kDim = mfmaInstr->kDim;
+    assert(mDim == nDim);
+
+    auto warpsPerTile = planWarps(dotOp, oldShape, numWarps, {mDim, nDim});
+
+    // The pad pass asks before layouts exist, when the scale loads have no
+    // order to vectorize against.
+    SmallVector<unsigned, 2> tilesPerWarp{1, 1};
+    if (oldRetType.getEncoding())
+      tilesPerWarp =
+          deduceTilesPerWarpForScale(dotOp.getAScale(), dotOp.getBScale(), mDim,
+                                     oldShape[0], oldShape[1], warpsPerTile);
+    LLVM_DEBUG(llvm::dbgs() << "chosen tilesPerWarp: [" << tilesPerWarp[0]
+                            << ", " << tilesPerWarp[1] << "]\n");
+
+    // Always use transposed mfma layout. This enables larger vectorization
+    // for global store instructions.
+    auto elementBitWidth = oldRetType.getElementType().getIntOrFloatBitWidth();
+    auto mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
+        dotOp.getContext(), mfmaVersion, warpsPerTile, {mDim, nDim, kDim},
+        /*isTransposed=*/true, cgaLayout, tilesPerWarp, elementBitWidth);
+    return MfmaDotPlan{*mfmaInstr, /*withScale=*/true, mfmaEnc,
+                       oldRetType.getElementType(), mfmaInstr->kBase};
+  }
+
   LogicalResult matchAndRewrite(triton::DotScaledOp dotOp,
                                 PatternRewriter &rewriter) const override {
     using TensorValue = TypedValue<RankedTensorType>;
 
-    if (mfmaVersion != 4) {
-      return rewriter.notifyMatchFailure(
-          dotOp, "F8F6F4 scaled dot is only natively supported on gfx950");
-    }
+    if (std::optional<StringRef> reason = getNativeScaledMfmaUnsupportedReason(
+            dotOp, mfmaVersion, ttg::lookupNumWarps(dotOp)))
+      return rewriter.notifyMatchFailure(dotOp, *reason);
 
     RankedTensorType oldRetType = dotOp.getType();
     if (!isa_and_nonnull<BlockedEncodingAttr>(oldRetType.getEncoding()))
@@ -936,62 +1319,29 @@ public:
 
     ScaleDotElemType aElemType = dotOp.getAElemType();
     ScaleDotElemType bElemType = dotOp.getBElemType();
-    auto supportsTypes = [](ScaleDotElemType elemType) {
-      return elemType == ScaleDotElemType::E2M1 ||
-             elemType == ScaleDotElemType::E4M3 ||
-             elemType == ScaleDotElemType::E5M2;
-    };
-
-    if (!supportsTypes(aElemType) || !supportsTypes(bElemType)) {
-      return rewriter.notifyMatchFailure(dotOp, "NYI: mxfp6");
-    }
 
     bool bothScalesAbsent = !aScale && !bScale;
 
     MLIRContext *ctx = dotOp.getContext();
 
-    ttg::CGAEncodingAttr cgaLayout =
-        ttg::getCGALayout(oldRetType.getEncoding());
-    unsigned numWarps = ttg::lookupNumWarps(dotOp);
-    if (numWarps == 1)
-      return rewriter.notifyMatchFailure(dotOp,
-                                         "num_warps==1 is not supported");
-
-    // Choose a suitable Scaled MFMA instruction for this scaled dot op.
-    int64_t inputKSize = a.getType().getShape().back();
-    // Two fp4 values are packed into one int8, so double the K size.
-    if (aElemType == ScaleDotElemType::E2M1 && dotOp.getLhsKPack())
-      inputKSize *= 2;
-    FailureOr<MfmaIntrinsic> mfmaInstr = chooseMfmaInstruction(
-        dotOp.getLoc(), mfmaVersion, oldShape,
-        scaleDotElemTypeToMLIRType(ctx, aElemType),
-        scaleDotElemTypeToMLIRType(ctx, bElemType), inputKSize, nonKDim,
-        /*withScale=*/true, /*allowXF32=*/false);
-    if (failed(mfmaInstr)) {
+    SmallVector<std::string> remarks;
+    FailureOr<MfmaDotPlan> plan =
+        getPlan(dotOp, mfmaVersion, nonKDim, ttg::lookupNumWarps(dotOp),
+                ttg::getCGALayout(oldRetType.getEncoding()), remarks);
+    for (const std::string &remark : remarks)
+      mlir::emitRemark(dotOp.getLoc()) << remark;
+    if (failed(plan)) {
       return rewriter.notifyMatchFailure(dotOp,
                                          "Unable to choose preferable MFMA "
                                          "intrinsic for scaled dot operation.");
     }
-
-    auto mDim = mfmaInstr->mDim;
-    auto nDim = mfmaInstr->nDim;
-    auto kDim = mfmaInstr->kDim;
-    auto kBase = mfmaInstr->kBase;
-    assert(mDim == nDim);
-
-    auto warpsPerTile = planWarps(dotOp, oldShape, numWarps, {mDim, nDim});
-
-    SmallVector<unsigned, 2> tilesPerWarp = deduceTilesPerWarpForScale(
-        aScale, bScale, mDim, oldShape[0], oldShape[1], warpsPerTile);
-    LLVM_DEBUG(llvm::dbgs() << "chosen tilesPerWarp: [" << tilesPerWarp[0]
-                            << ", " << tilesPerWarp[1] << "]\n");
-
-    // Always use transposed mfma layout. This enables larger vectorization
-    // for global store instructions.
-    auto elementBitWidth = oldRetType.getElementType().getIntOrFloatBitWidth();
-    mlir::Attribute mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
-        ctx, mfmaVersion, warpsPerTile, {mDim, nDim, kDim},
-        /*isTransposed=*/true, cgaLayout, tilesPerWarp, elementBitWidth);
+    unsigned mDim = plan->instr.mDim;
+    unsigned kBase = plan->instr.kBase;
+    ttg::AMDMfmaEncodingAttr mfmaEnc = plan->enc;
+    SmallVector<unsigned> warpsPerTile =
+        llvm::to_vector(mfmaEnc.getWarpsPerCTA());
+    SmallVector<unsigned> tilesPerWarp =
+        llvm::to_vector(mfmaEnc.getTilesPerWarp());
 
     auto newRetType =
         RankedTensorType::get(oldShape, oldRetType.getElementType(), mfmaEnc);
@@ -1012,8 +1362,7 @@ public:
                                   unsigned opIdx) -> TensorValue {
       auto vType = v.getType();
 
-      auto newEnc =
-          DotOperandEncodingAttr::get(ctx, opIdx, mfmaEnc, kWidth / 2);
+      auto newEnc = plan->getOperandEncoding(opIdx);
 
       bool kPacked = opIdx == 0 ? dotOp.getLhsKPack() : dotOp.getRhsKPack();
       if (!kPacked) {
@@ -1043,8 +1392,8 @@ public:
         int64_t nonKDim = idx == 0 ? valShape[0] : valShape[1];
         int64_t k = idx == 0 ? valShape[1] : valShape[0];
         ScaleDotElemType &elemType = idx == 0 ? aElemType : bElemType;
-        int packSize = elemType == ScaleDotElemType::E2M1 ? 2 : 1;
-        shape = {nonKDim, k * packSize / 32};
+        int64_t logicalK = getScaledDotLogicalK(elemType, k);
+        shape = {nonKDim, logicalK / 32};
       } else {
         shape = llvm::to_vector(scale.getType().getShape());
       }
@@ -1074,6 +1423,9 @@ public:
     auto newDot = triton::DotScaledOp::create(
         rewriter, dotOp.getLoc(), newRetType, a, b, newAcc, newAScale,
         newBScale, aElemType, bElemType, dotOp.getFastMath());
+    if (dotOp->hasAttr(triton::amdgpu::kFp6PackedAttrName))
+      newDot->setAttr(triton::amdgpu::kFp6PackedAttrName,
+                      rewriter.getUnitAttr());
 
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(dotOp, oldRetType,
                                                       newDot);
@@ -1085,11 +1437,14 @@ public:
 class ScaledBlockedToScaledWMMAF8F6F4 final
     : public OpRewritePattern<triton::DotScaledOp> {
   int wmmaVersion;
+  SmallVector<StringRef> unsupportedFeatures;
 
 public:
   ScaledBlockedToScaledWMMAF8F6F4(MLIRContext *context, int wmmaVersion,
+                                  ArrayRef<StringRef> unsupportedFeatures,
                                   PatternBenefit benefit = 1)
-      : OpRewritePattern(context, benefit), wmmaVersion(wmmaVersion) {}
+      : OpRewritePattern(context, benefit), wmmaVersion(wmmaVersion),
+        unsupportedFeatures(unsupportedFeatures) {}
 
   LogicalResult matchAndRewrite(triton::DotScaledOp dotOp,
                                 PatternRewriter &rewriter) const override {
@@ -1098,6 +1453,11 @@ public:
     if (wmmaVersion != 3) {
       return rewriter.notifyMatchFailure(
           dotOp, "F8F6F4 scaled dot is only natively supported on CDNA5");
+    }
+    if (llvm::is_contained(unsupportedFeatures, kWmmaRestrictedInstsFeature)) {
+      return rewriter.notifyMatchFailure(
+          dotOp, "scaled wmma instructions are not supported on this "
+                 "architecture");
     }
 
     RankedTensorType oldRetType = dotOp.getType();
@@ -1119,13 +1479,20 @@ public:
     ScaleDotElemType aElemType = dotOp.getAElemType();
     ScaleDotElemType bElemType = dotOp.getBElemType();
     auto supportsTypes = [](ScaleDotElemType elemType) {
-      return elemType == ScaleDotElemType::E2M1 ||
+      return elemType == ScaleDotElemType::E2M1 || isMXFP6ScaleType(elemType) ||
              elemType == ScaleDotElemType::E4M3 ||
              elemType == ScaleDotElemType::E5M2;
     };
 
     if (!supportsTypes(aElemType) || !supportsTypes(bElemType)) {
       return rewriter.notifyMatchFailure(dotOp, "Not supported yet mxfp type");
+    }
+
+    // fp6 (groups of 16 values per 12 bytes) cannot tile the WMMA K
+    // dimension today; route it to the decompose (upcast) path instead
+    // of the native instruction.
+    if (isMXFP6ScaleType(aElemType) || isMXFP6ScaleType(bElemType)) {
+      return rewriter.notifyMatchFailure(dotOp, "fp6 uses decompose upcast");
     }
 
     unsigned scaleFactor = dotOp.deduceScaleFactor();
@@ -1138,14 +1505,24 @@ public:
     auto oldShapePerCTA =
         ttg::getShapePerCTA(cgaLayout.getCTASplitNum(), oldShape);
 
-    constexpr unsigned mDim = 16;
+    bool useFp4Wmma = aElemType == ScaleDotElemType::E2M1 &&
+                      bElemType == ScaleDotElemType::E2M1 &&
+                      oldShapePerCTA[0] % 32 == 0;
+    unsigned mDim = useFp4Wmma ? 32 : 16;
     constexpr unsigned nDim = 16;
     constexpr unsigned kDim = 128;
 
     auto warpsPerTile =
         planWarps(dotOp, oldShapePerCTA, numWarps, {mDim, nDim});
-    // TODO: Select tilesPerWarp in Triton
     SmallVector<unsigned> tilesPerWarp(rank, 1u);
+    if (auto attr =
+            dotOp->getAttrOfType<DenseI32ArrayAttr>(AttrAMDWmmaTilesPerWarp)) {
+      ArrayRef<int32_t> requested = attr.asArrayRef();
+      tilesPerWarp.clear();
+      llvm::transform(
+          requested, std::back_inserter(tilesPerWarp),
+          [](int32_t tiles) { return static_cast<unsigned>(tiles); });
+    }
 
     auto ctaLayout =
         ttg::chooseWmmaCTALinearLayout(ctx, rank, warpsPerTile, tilesPerWarp);
@@ -1166,7 +1543,11 @@ public:
 
     auto convertInputLayout = [&](TensorValue v, unsigned opIdx,
                                   bool isFp4) -> TensorValue {
-      auto parent = isFp4 ? wmmaPackedEnc : wmmaEnc;
+      // fp6 never reaches here: the pattern returns notifyMatchFailure
+      // for fp6 above so it takes the decompose (upcast) path.
+      ttg::AMDWmmaEncodingAttr parent = wmmaEnc;
+      if (isFp4)
+        parent = wmmaPackedEnc;
       auto vType = v.getType();
       auto newEnc = DotOperandEncodingAttr::get(ctx, opIdx, parent, 16);
       bool kPacked = opIdx == 0 ? dotOp.getLhsKPack() : dotOp.getRhsKPack();
@@ -1219,8 +1600,8 @@ public:
         int64_t nonKDim = idx == 0 ? valShape[0] : valShape[1];
         int64_t k = idx == 0 ? valShape[1] : valShape[0];
         ScaleDotElemType &elemType = idx == 0 ? aElemType : bElemType;
-        int packSize = elemType == ScaleDotElemType::E2M1 ? 2 : 1;
-        shape = {nonKDim, k * packSize / scaleFactor};
+        int64_t logicalK = getScaledDotLogicalK(elemType, k);
+        shape = {nonKDim, logicalK / scaleFactor};
         std::tie(scaleType, scaleValue) = getDefaultScaleTypeValue(idx);
       } else {
         scaleType = scale.getType().getElementType();
@@ -1276,8 +1657,7 @@ static Value promoteOperand(OpBuilder &builder, Location loc, Value operand,
                             Type promotedType) {
   Type tensorPromotedType = cast<RankedTensorType>(operand.getType())
                                 .cloneWith(std::nullopt, promotedType);
-  return triton::FpToFpOp::create(builder, loc, tensorPromotedType, operand,
-                                  RoundingModeAttr{});
+  return triton::FpToFpOp::create(builder, loc, tensorPromotedType, operand);
 }
 
 // Promote operands of dot op if the existing combination is not natively
@@ -1623,6 +2003,203 @@ public:
 #define GEN_PASS_DEF_TRITONAMDGPUACCELERATEMATMUL
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
+// Why the MFMA pattern can't issue NPOT `dot` exactly at `nonKDim`: kDim must
+// divide K unless f8f6f4 zeroes the tail, warps sit on pow2 parts loading no
+// more than padded's (or match them if `keepPaddedWarps`), operands are exact.
+static std::optional<std::string>
+getNpotMfmaUnsupportedReason(tt::DotOpInterface dot, int mfmaVersion,
+                             int nonKDim, int numWarps,
+                             bool keepPaddedWarps = false) {
+  auto aType = cast<RankedTensorType>(dot.getA().getType());
+  auto bType = cast<RankedTensorType>(dot.getB().getType());
+  ArrayRef<int64_t> shape =
+      cast<RankedTensorType>(dot.getD().getType()).getShape();
+  int64_t k = aType.getShape().back();
+  if (shape.size() != 2)
+    return std::string("NPOT dot is not yet supported on MFMA for a 3-D dot");
+  if (ttg::lookupNumCTAs(dot) != 1)
+    return std::string("NPOT dot is not yet supported on MFMA without one CTA");
+  bool withScale = mfmaVersion == 4 && isF8F6F4(aType.getElementType()) &&
+                   isF8F6F4(bType.getElementType());
+  // BlockedToMFMA rewrites an f8f6f4 tt.dot to a dot_scaled without scales.
+  auto mx = dyn_cast<tt::DotScaledOp>(dot.getOperation());
+  if (mx && withScale && !mx.getAScale() && !mx.getBScale() &&
+      isa<ttg::AMDMfmaEncodingAttr>(mx.getType().getEncoding()))
+    mx = nullptr;
+  if (mx) {
+    if (std::optional<StringRef> reason =
+            getNativeScaledMfmaUnsupportedReason(mx, mfmaVersion, numWarps))
+      return ("NPOT dot_scaled is not yet supported on MFMA: " + *reason).str();
+    if (!mx.getLhsKPack() || !mx.getRhsKPack())
+      return std::string("NPOT dot_scaled is not yet supported on MFMA with an "
+                         "operand packed along M or N");
+    // The scaled MFMA pattern takes a blocked result only, and an NPOT M or N
+    // gets a mixed-radix one.
+    if (!llvm::all_of(shape, llvm::isPowerOf2_64))
+      return std::string(
+          "NPOT dot_scaled is not yet supported on MFMA at an NPOT M or N");
+    k = getScaledDotLogicalK(mx.getAElemType(), k);
+  }
+  // The chooser's remarks belong to the pattern, which emits them. An NPOT K
+  // keeps kBase-wide operands whatever kPack is.
+  MLIRContext *ctx = dot.getContext();
+  auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(ctx, 2);
+  SmallVector<std::string> remarks;
+  FailureOr<MfmaDotPlan> plan =
+      mx ? ScaledBlockedToScaledMFMAF8F6F4::getPlan(
+               mx, mfmaVersion, nonKDim, numWarps, cgaLayout, remarks)
+         : BlockedToMFMA::getPlan(dot, mfmaVersion, nonKDim, numWarps,
+                                  /*kPack=*/1, cgaLayout, /*rewriting=*/false,
+                                  remarks);
+  if (failed(plan))
+    return llvm::formatv("NPOT dot is not yet supported on {2}: "
+                         "matrix_instr_nonkdim {0} selects no MFMA for K {1}",
+                         nonKDim, k, mx ? "decompose" : "FMA")
+        .str();
+  const MfmaIntrinsic &instr = plan->instr;
+  if (k % instr.kDim != 0 && !plan->withScale)
+    return llvm::formatv(
+               "NPOT dot is not yet supported on MFMA: the pow2-padded "
+               "K's MFMA ({0}, kDim {1}) doesn't divide K={2}",
+               instr.name, instr.kDim, k)
+        .str();
+  if (!llvm::all_of(shape, llvm::isPowerOf2_64)) {
+    ArrayRef<unsigned> tiles = plan->enc.getTilesPerWarp();
+    if (tiles[0] != 1 || tiles[1] != 1)
+      return llvm::formatv("NPOT dot is not yet supported on MFMA with "
+                           "{0}x{1} tiles per warp",
+                           tiles[0], tiles[1])
+          .str();
+    ArrayRef<unsigned> warps = plan->enc.getWarpsPerCTA();
+    SmallVector<int64_t> padShape = ttg::getNpotPow2AllocShape(shape);
+    SmallVector<unsigned, 3> padWarps =
+        planWarps(dot, padShape, numWarps, {instr.mDim, instr.nDim});
+    auto span = [](ArrayRef<int64_t> s, ArrayRef<unsigned> w) {
+      return s[0] / w[0] + s[1] / w[1];
+    };
+    if (keepPaddedWarps && warps != ArrayRef<unsigned>(padWarps))
+      return llvm::formatv("NPOT dot is not yet supported on MFMA with warps "
+                           "{0}x{1}, where padded places them {2}x{3}",
+                           warps[0], warps[1], padWarps[0], padWarps[1])
+          .str();
+    if (span(shape, warps) > span(padShape, padWarps))
+      return llvm::formatv("NPOT dot is not yet supported on MFMA with warps "
+                           "{0}x{1}: each loads {2} A rows plus B columns, "
+                           "padded's {3}x{4} load {5}",
+                           warps[0], warps[1], span(shape, warps), padWarps[0],
+                           padWarps[1], span(padShape, padWarps))
+          .str();
+    if (std::optional<std::string> reason = getWarpPlacementUnsupportedReason(
+            shape, warps, {instr.mDim, instr.nDim}))
+      return reason;
+  }
+  for (auto [opIdx, operand] :
+       llvm::enumerate(dot->getOperands().take_front(2))) {
+    auto type = cast<RankedTensorType>(operand.getType());
+    auto enc = plan->getOperandEncoding(opIdx);
+    if (!llvm::all_of(type.getShape(), llvm::isPowerOf2_64) &&
+        !ttg::hasExactNpotLayout(type.cloneWithEncoding(enc)))
+      return llvm::formatv("NPOT dot is not yet supported on {0}: operand {1} "
+                           "has no exact layout",
+                           instr.name, opIdx)
+          .str();
+  }
+  return std::nullopt;
+}
+
+// An unset size whose pow2 default can't tile an NPOT M or N takes the first
+// size the query admits, so no dot pads that a smaller MFMA tiles. Padded's
+// warps are tried first, so a dot they admit keeps its size.
+static int getNpotMfmaNonKDim(tt::DotOpInterface dot, int mfmaVersion,
+                              int nonKDim, int numWarps) {
+  if (nonKDim != 0 || !tt::tools::isNpotAllowed() ||
+      llvm::all_of(cast<RankedTensorType>(dot.getD().getType()).getShape(),
+                   llvm::isPowerOf2_64))
+    return nonKDim;
+  for (bool keepPaddedWarps : {true, false})
+    for (int size : {0, 32, 16})
+      if (!getNpotMfmaUnsupportedReason(dot, mfmaVersion, size, numWarps,
+                                        keepPaddedWarps))
+        return size;
+  return nonKDim;
+}
+
+// Why exact `dot` loses a direct-to-LDS copy of an A or B load that the pow2
+// tile keeps, in the layouts Coalesce and the pipeliner give each. A pad whose
+// pipelined buffers overflow LDS would not compile, so it stays exact.
+static std::optional<std::string> getNpotDirectToLdsSlowReason(
+    tt::DotOp dot, ArrayRef<tt::NpotDotOperandAccess> operands, int mfmaVersion,
+    int nonKDim, int numWarps, int threadsPerWarp, StringRef arch) {
+  MLIRContext *ctx = dot.getContext();
+  SmallVector<std::string> remarks;
+  FailureOr<MfmaDotPlan> plan = BlockedToMFMA::getPlan(
+      dot, mfmaVersion, getNpotMfmaNonKDim(dot, mfmaVersion, nonKDim, numWarps),
+      numWarps,
+      /*kPack=*/1, ttg::CGAEncodingAttr::get1CTALayout(ctx, 2),
+      /*rewriting=*/false, remarks);
+  if (failed(plan))
+    return std::nullopt;
+  TargetFeatures targetFeatures(arch);
+  triton::AMD::TargetInfo targetInfo(arch);
+  std::optional<std::string> slow;
+  int64_t paddedBytes = 0;
+  for (auto [opIdx, access] : llvm::enumerate(operands)) {
+    Value operand = dot->getOperand(opIdx);
+    auto load = operand.getDefiningOp<tt::LoadOp>();
+    if (!load)
+      continue;
+    auto type = cast<RankedTensorType>(operand.getType());
+    ArrayRef<int64_t> shape = type.getShape();
+    unsigned bits = type.getElementTypeBitWidth();
+    auto sharedEnc = [&](RankedTensorType tensorTy) {
+      auto ty = cast<ttg::TensorOrMemDesc>(tensorTy);
+      return getDotOperandSharedEncoding(
+          targetFeatures, ty,
+          getLoadSharedOrder(ty, targetInfo, /*useAsyncCopy=*/true),
+          plan->getOperandEncoding(opIdx), /*canUseAsyncCopy=*/true);
+    };
+    auto padShape = llvm::map_to_vector(
+        shape, [](int64_t size) { return int64_t(llvm::PowerOf2Ceil(size)); });
+    SmallVector<unsigned> sizePerThread(shape.size(), 1);
+    sizePerThread[access.order[0]] = access.vector;
+    auto padded = ttg::BlockedEncodingAttr::get(
+        ctx, padShape, sizePerThread, access.order, numWarps, threadsPerWarp,
+        /*numCTAs=*/1);
+    ttg::SharedEncodingTrait padShared = sharedEnc(
+        RankedTensorType::get(padShape, type.getElementType(), padded));
+    int64_t elems = std::max(access.asyncStages, 1u) *
+                    ttg::getAllocationElems(padShared, padShape);
+    if (auto paddedEnc = ttg::getPaddedEncoding(padShared))
+      elems = paddedEnc.getPaddedSize({elems});
+    paddedBytes += elems * bits / 8;
+    if (slow || !access.asyncStages || llvm::all_of(shape, llvm::isPowerOf2_64))
+      continue;
+    FailureOr<ttg::LinearEncodingAttr> exact = ttg::getMixedRadixEncoding(
+        ctx, shape, numWarps, threadsPerWarp, /*numCTAs=*/1,
+        ttg::getMixedRadixVector(ctx, shape, access.vector, access.order,
+                                 numWarps, threadsPerWarp),
+        access.order);
+    if (failed(exact))
+      continue;
+    unsigned vector = std::max(128u / bits, 1u);
+    std::optional<std::string> reason =
+        LLVM::AMD::getNpotDirectToLdsUnsupportedReason(
+            targetInfo, exact->getLinearLayout(), bits,
+            sharedEnc(type.cloneWithEncoding(*exact)), shape, vector);
+    auto ptrType = cast<RankedTensorType>(load.getPtr().getType());
+    auto padPtrType =
+        RankedTensorType::get(padShape, ptrType.getElementType(), padded);
+    if (reason &&
+        canLoadDirectToLdsInPipeline(padPtrType, padShared, targetInfo))
+      slow = llvm::formatv("NPOT dot pads: {0} loses direct-to-LDS loads: {1}",
+                           opIdx ? "B" : "A", *reason)
+                 .str();
+  }
+  if (paddedBytes > targetFeatures.getSharedMemorySize())
+    return std::nullopt;
+  return slow;
+}
+
 struct TritonAMDGPUAccelerateMatmulPass
     : impl::TritonAMDGPUAccelerateMatmulBase<TritonAMDGPUAccelerateMatmulPass> {
   using Base::Base;
@@ -1634,14 +2211,66 @@ struct TritonAMDGPUAccelerateMatmulPass
     RewritePatternSet mfmaPatterns(context);
     TargetFeatures targetFeatures{llvm::StringRef(gfxArch)};
     auto isaFamily = targetFeatures.getISAFamily();
-    int mfmaVersion = getMfmaVersion(isaFamily);
     int wmmaVersion = getWmmaVersion(isaFamily);
+    if (isaFamily == ISAFamily::CDNA5) {
+      WalkResult validation = m.walk([&](tt::DotScaledOp dotOp) {
+        return failed(validateWmmaTilesPerWarp(dotOp)) ? WalkResult::interrupt()
+                                                       : WalkResult::advance();
+      });
+      if (validation.wasInterrupted()) {
+        signalPassFailure();
+        return;
+      }
+    }
+    // The target dot-legality query accepted each NPOT dot at the pad pass's
+    // matrix-instruction-size; a hand-built pipeline may run this at another.
+    int mfmaVersion = getMfmaVersion(isaFamily);
+    auto isNpot = [](Value v) {
+      return !llvm::all_of(cast<RankedTensorType>(v.getType()).getShape(),
+                           llvm::isPowerOf2_64);
+    };
+    WalkResult npot = m.walk([&](tt::DotOp dot) {
+      if (mfmaVersion == 0 || !isMfmaResultCandidate(dot.getType()) ||
+          (!isNpot(dot.getA()) && !isNpot(dot.getB())))
+        return WalkResult::advance();
+      int numWarps = ttg::lookupNumWarps(dot);
+      std::optional<std::string> reason = getNpotMfmaUnsupportedReason(
+          dot, mfmaVersion,
+          getNpotMfmaNonKDim(dot, mfmaVersion, matrixInstructionSize, numWarps),
+          numWarps);
+      if (!reason)
+        return WalkResult::advance();
+      dot.emitError(*reason);
+      return WalkResult::interrupt();
+    });
+    if (npot.wasInterrupted()) {
+      signalPassFailure();
+      return;
+    }
+    // The decompose upcast reads one FP6 code per byte, so a packed dot that
+    // the native pattern rejects would silently compute garbage.
+    WalkResult packedFp6 = m.walk([&](tt::DotScaledOp dot) {
+      if (!dot->hasAttr(triton::amdgpu::kFp6PackedAttrName))
+        return WalkResult::advance();
+      std::optional<StringRef> reason = getNativeScaledMfmaUnsupportedReason(
+          dot, mfmaVersion, ttg::lookupNumWarps(dot));
+      if (!reason)
+        return WalkResult::advance();
+      dot.emitError() << "amdg.fp6_packed dot cannot use the native scaled "
+                         "MFMA path: "
+                      << *reason;
+      return WalkResult::interrupt();
+    });
+    if (packedFp6.wasInterrupted()) {
+      signalPassFailure();
+      return;
+    }
     ArrayRef<StringRef> unsupportedWmmaFeatures =
         targetFeatures.getUnsupportedWmmaFeatures();
     switch (isaFamily) {
     case ISAFamily::CDNA5:
-      mfmaPatterns.add<ScaledBlockedToScaledWMMAF8F6F4>(context, wmmaVersion,
-                                                        /*benefit=*/4);
+      mfmaPatterns.add<ScaledBlockedToScaledWMMAF8F6F4>(
+          context, wmmaVersion, unsupportedWmmaFeatures, /*benefit=*/4);
       mfmaPatterns.add<DecomposeAMDScaledBlocked>(context, targetFeatures,
                                                   /*benefit=*/3);
       mfmaPatterns.add<BlockedToWMMA>(context, wmmaVersion,
@@ -1680,5 +2309,131 @@ struct TritonAMDGPUAccelerateMatmulPass
     decomposeMixedModeDotOp(m);
   }
 };
+
+namespace {
+struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
+  using NpotTargetLegality::NpotTargetLegality;
+  StringRef getTargetPrefix() const override { return "hip"; }
+  std::optional<std::string>
+  getDotUnsupportedReason(Operation *op, const tt::LinearLayout &,
+                          StringRef target, int numWarps,
+                          int nonKDim) const override {
+    int mfmaVersion =
+        getMfmaVersion(TargetFeatures(target.split(':').second).getISAFamily());
+    if (!isa<tt::DotOp, tt::DotScaledOp>(op) || mfmaVersion == 0)
+      return ("NPOT dot is not yet supported on " + target).str();
+    auto dot = cast<tt::DotOpInterface>(op);
+    return getNpotMfmaUnsupportedReason(
+        dot, mfmaVersion,
+        getNpotMfmaNonKDim(dot, mfmaVersion, nonKDim, numWarps), numWarps);
+  }
+  std::optional<std::string>
+  getDotSlowReason(Operation *op, ArrayRef<tt::NpotDotOperandAccess> operands,
+                   int numWarps, int threadsPerWarp, int nonKDim,
+                   StringRef target) const override {
+    if (std::optional<std::string> reason =
+            getBSlowReason(op, operands[1].order, operands[1].vector, numWarps,
+                           threadsPerWarp))
+      return reason;
+    auto dot = dyn_cast<tt::DotOp>(op);
+    StringRef arch = target.split(':').second;
+    int mfmaVersion = getMfmaVersion(TargetFeatures(arch).getISAFamily());
+    if (!dot || mfmaVersion == 0)
+      return std::nullopt;
+    return getNpotDirectToLdsSlowReason(dot, operands, mfmaVersion, nonKDim,
+                                        numWarps, threadsPerWarp, arch);
+  }
+  static std::optional<std::string>
+  getBSlowReason(Operation *op, ArrayRef<unsigned> bOrder, unsigned bVector,
+                 int numWarps, int threadsPerWarp) {
+    auto bType =
+        cast<RankedTensorType>(cast<tt::DotOpInterface>(op).getB().getType());
+    ArrayRef<int64_t> shape = bType.getShape();
+    unsigned rank = shape.size();
+    if (bOrder[0] != rank - 1)
+      return std::nullopt;
+    if (!llvm::isPowerOf2_64(shape[rank - 1]))
+      return std::string("NPOT dot pads: N's odd digit sits inside B's "
+                         "contiguous LDS offset, so neither ds_read_tr nor "
+                         "direct-to-LDS can vectorize B");
+    if (llvm::isPowerOf2_64(shape[rank - 2]))
+      return std::nullopt;
+    // N-major B is transposed in registers before LDS; each thread writes its
+    // binary run of K rows as one vector, and the odd digit splits the run.
+    MLIRContext *ctx = op->getContext();
+    FailureOr<ttg::LinearEncodingAttr> exact = ttg::getMixedRadixEncoding(
+        ctx, shape, numWarps, threadsPerWarp, /*numCTAs=*/1,
+        ttg::getMixedRadixVector(ctx, shape, bVector, bOrder, numWarps,
+                                 threadsPerWarp),
+        bOrder);
+    if (failed(exact))
+      return std::nullopt;
+    auto paddedShape = llvm::map_to_vector(
+        shape, [](int64_t size) { return int64_t(llvm::PowerOf2Ceil(size)); });
+    SmallVector<unsigned> sizePerThread(rank, 1);
+    sizePerThread[bOrder[0]] = bVector;
+    auto padded =
+        ttg::BlockedEncodingAttr::get(ctx, paddedShape, sizePerThread, bOrder,
+                                      numWarps, threadsPerWarp, /*numCTAs=*/1);
+    auto kReg = StringAttr::get(ctx, "register");
+    StringAttr kDim = tt::standardOutDimNames(ctx, rank)[rank - 2];
+    unsigned bits = bType.getElementTypeBitWidth();
+    auto kRunBits = [&](const tt::LinearLayout &layout) {
+      unsigned run = bits;
+      for (int32_t pos = 0; pos < layout.getNumLeadingRadix2Digits(kReg); ++pos)
+        if (layout.getBasis(kReg, pos, kDim) != 0)
+          run *= 2;
+      return std::min(run, 128u);
+    };
+    unsigned exactRun = kRunBits(exact->getLinearLayout());
+    if (exactRun == 128 || kRunBits(padded.toLinearLayout(paddedShape)) < 128)
+      return std::nullopt;
+    return llvm::formatv("NPOT dot pads: N-major B is transposed to LDS in "
+                         "{0}-bit K runs, padded in ds_write_b128",
+                         exactRun)
+        .str();
+  }
+  std::optional<std::string>
+  getAsyncCopyUnsupportedReason(Operation *copy, const tt::LinearLayout &layout,
+                                StringRef target) const override {
+    ttg::MemDescType dstTy;
+    if (auto asyncCopy = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(copy))
+      dstTy = asyncCopy.getResult().getType();
+    else if (auto bufferLoad =
+                 dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(copy))
+      dstTy = bufferLoad.getDest().getType();
+    else if (auto load = dyn_cast<tt::LoadOp>(copy)) {
+      // A load to pipeline copies into the encoding the pipeliner picks.
+      auto ty = cast<RankedTensorType>(load.getType());
+      dstTy = ttg::MemDescType::get(
+          ty.getShape(), ty.getElementType(), tt::getSharedEncoding(load),
+          ttg::SharedMemorySpaceAttr::get(load.getContext()));
+    } else
+      return ("NPOT async copy is not yet supported on " + target).str();
+    triton::AMD::TargetInfo targetInfo(target.split(':').second);
+    unsigned elemBitWidth = dstTy.getElementTypeBitWidth();
+    unsigned vectorSize = std::max(128u / elemBitWidth, 1u);
+    if (std::optional<std::string> reason =
+            LLVM::AMD::getNpotDirectToLdsUnsupportedReason(
+                targetInfo, layout, elemBitWidth, dstTy.getEncoding(),
+                dstTy.getAllocShape(), vectorSize))
+      return ("NPOT async copy is not supported on " + target + ": " + *reason)
+          .str();
+    return std::nullopt;
+  }
+  std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *, const tt::LinearLayout &,
+                                 StringRef target) const override {
+    return ("NPOT tensor descriptor is not yet supported on " + target).str();
+  }
+};
+} // namespace
+
+void triton::amdgpu::registerNpotTargetLegality(DialectRegistry &registry) {
+  registry.addExtension(
+      +[](MLIRContext *, triton::amdgpu::TritonAMDGPUDialect *dialect) {
+        dialect->addInterfaces<AmdNpotTargetLegality>();
+      });
+}
 
 } // namespace mlir

@@ -9,6 +9,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "third_party/amd/lib/TritonAMDGPUTransforms/Utility.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"

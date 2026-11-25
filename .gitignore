@@ -31,6 +31,7 @@ python/triton/backends/*
 python/triton/language/extra/*
 !python/triton/language/extra/__init__.py
 !python/triton/language/extra/libdevice.py
+!python/triton/language/extra/subtile_ops.py
 
 # Tools extras
 python/triton/tools/extra
@@ -38,11 +39,11 @@ python/triton/tools/extra
 # Proton
 python/triton/profiler
 
+# Pytest
+pytest.ini
+
 # Instrumentation
 python/triton/instrumentation
-
-# MLIR Plugin
-python/triton/plugins
 
 # Python caches
 __pycache__/
@@ -66,24 +67,22 @@ cmake-build-*
 cuobjdump
 nvdisasm
 ptxas
+third_party/nvidia/backend/bin
+third_party/tlx/language/tlx/inductor/bin
 
 # Third-party include
 third_party/nvidia/backend/include
 third_party/nvidia/backend/lib/cupti
 third_party/nvidia/backend/lib/cupti-blackwell
 third_party/nvidia/backend/lib/gsan.ll
-third_party/nvidia/backend/lib/gsan-profile.ll
 third_party/amd/backend/lib/libtriton_amd_codegen.dylib
 third_party/amd/backend/lib/libtriton_amd_codegen.so
 third_party/amd/backend/lib/triton_amd_codegen.dll
 
 # Docs
 docs/_build/
-docs/_generated/
-docs/gluon/api/generated/
 docs/python-api/generated/
 docs/dialects/
-docs/getting-started/examples
 docs/getting-started/tutorials
 docs/sg_execution_times.rst
 !python/tutorials/*.py
@@ -95,7 +94,14 @@ docs/sg_execution_times.rst
 /compile_commands.json
 .vscode
 .vs
-.cursor
+
+# TLX op library. `ops` is symlinked in from third_party/tlx/ops after pip
+# install. The package initializer and optional PyTorch adapter are real
+# committed files; the latter remains lazy so importing Triton does not pull in
+# torch.
+python/triton/tlx/*
+!python/triton/tlx/__init__.py
+!python/triton/tlx/pytorch.py
 
 # Vim
 *.swp
@@ -103,4 +109,13 @@ docs/sg_execution_times.rst
 # macOS
 .DS_Store
 
-AGENTS.override.md
+# claude
+.claude/*
+!.claude/knowledge/
+!.claude/debug_helper/
+!.claude/reviewers/
+!.claude/rules/
+!.claude/skills/
+
+# plugins
+python/triton/plugins/

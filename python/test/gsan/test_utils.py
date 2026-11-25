@@ -5,6 +5,8 @@ from triton._internal_testing import is_cuda
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._utils import uint8_cuda_tensor_from_ptr
 
+pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
+
 
 @pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 def test_uint8_cuda_tensor_from_ptr_delete_tensor(shadow_granularity):

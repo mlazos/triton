@@ -104,10 +104,13 @@ public:
   // makes the reshape a "nop", i.e. the same GPU threads contain the same
   // elements as before the reshape using legacy layouts.  This is not always
   // possible (in which case we fallback to using LinearLayouts)
+  // If allowReorder is set, an existing value in dstEnc is preferred when it
+  // still yields a non-expensive view.
   // In the future we'll always use LinearLayouts
   virtual LogicalResult
   inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
                          ArrayRef<int64_t> dstShape, Attribute &dstEnc,
+                         bool allowReorder,
                          std::optional<Location> loc) const = 0;
 
   // Check if two layouts are structurally the same, even if their names are
@@ -162,6 +165,84 @@ public:
                       function_ref<InFlightDiagnostic()> emitError) const = 0;
 };
 
+// The order and per-thread vector Coalesce gives an NPOT dot operand's load,
+// and the stages the target's pipeliner copies it to shared memory in (0 when
+// it is not copied async).
+struct NpotDotOperandAccess {
+  SmallVector<unsigned> order;
+  unsigned vector;
+  unsigned asyncStages;
+};
+
+// Implemented by the dialect of a target's MMA ops. The pad pass and the
+// target's lowering ask the one whose prefix matches ttg.target.
+class NpotTargetLegality : public DialectInterface::Base<NpotTargetLegality> {
+public:
+  NpotTargetLegality(Dialect *dialect) : Base(dialect) {}
+
+  // The ttg.target prefix, e.g. "cuda" or "hip".
+  virtual StringRef getTargetPrefix() const = 0;
+
+  // Why `dot` can't be exact on `target` with `numWarps` warps, or
+  // std::nullopt. `layout` is the mixed-radix layout of the dot's first NPOT
+  // operand; `nonKDim` is the MMA M/N size the target's dot pass enforces, 0
+  // if none.
+  virtual std::optional<std::string>
+  getDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                          StringRef target, int numWarps,
+                          int nonKDim) const = 0;
+
+  // Why an exact `dot` is slower than padded on `target` when its A and B are
+  // accessed as `operands` say, or std::nullopt. `nonKDim` is as above.
+  virtual std::optional<std::string>
+  getDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
+                   int numWarps, int threadsPerWarp, int nonKDim,
+                   StringRef target) const {
+    return std::nullopt;
+  }
+
+  // Why a global-to-shared async `copy` of mixed-radix `layout` can't lower on
+  // `target`, or std::nullopt.
+  virtual std::optional<std::string>
+  getAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout,
+                                StringRef target) const = 0;
+
+  // Why tensor descriptor `op` can't move its tile, of mixed-radix `layout`, on
+  // `target`, or std::nullopt.
+  virtual std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                 StringRef target) const = 0;
+};
+
+// The ttg.target of `op`'s module, or "" if it has none.
+StringRef getModuleTarget(Operation *op);
+
+// Why the NpotTargetLegality matching `target` rejects `layout` at `nonKDim`,
+// or std::nullopt; without one the dot isn't supported.
+std::optional<std::string>
+getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                            StringRef target, int numWarps, int nonKDim);
+
+// The same for the target's cost of an exact `dot` (see getDotSlowReason).
+std::optional<std::string>
+getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
+                     int numWarps, int threadsPerWarp, int nonKDim,
+                     StringRef target);
+
+// The same for a global-to-shared async `copy` of mixed-radix `layout`.
+std::optional<std::string>
+getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout);
+
+// Whether store `op` takes getMixedRadixVector's predicated vector: unless its
+// value is computed elementwise from a tt.load (also through control flow),
+// whose layout a wider store would have to convert from.
+bool npotStoreTakesPredicatedVector(Operation *op);
+
+// The same for a tensor descriptor op on `target`.
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target);
+
 // Descriptor gather and scatter have restrictions on the tile sizes.
 LogicalResult verifyGatherScatterResultType(Operation *op,
                                             ShapedType resultType,
@@ -172,6 +253,12 @@ LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
 LogicalResult verifyDescriptorLoadStoreOp(Operation *op,
                                           TensorDescInterface desc,
                                           ShapedType tensor);
+
+// True for the MXFP6 scale element types (OCP FP6 e2m3/e3m2), which share
+// the dense-packed K contract in the scaled-dot verifiers.
+inline bool isMXFP6ScaleType(ScaleDotElemType type) {
+  return type == ScaleDotElemType::E2M3 || type == ScaleDotElemType::E3M2;
+}
 
 LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
                                 std::optional<ArrayRef<int64_t>> lhsScaleShape,

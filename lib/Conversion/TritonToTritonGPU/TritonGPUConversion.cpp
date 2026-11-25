@@ -6,9 +6,12 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 using namespace mlir;
 using namespace mlir::triton::gpu;
@@ -31,6 +34,11 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
     if (tensorType.getEncoding())
       return tensorType;
     ArrayRef<int64_t> shape = tensorType.getShape();
+    if (auto mixedRadix =
+            getMixedRadixEncoding(this->context, shape, this->numWarps,
+                                  this->threadsPerWarp, this->numCTAs);
+        succeeded(mixedRadix))
+      return tensorType.cloneWithEncoding(*mixedRadix);
     triton::gpu::BlockedEncodingAttr encoding =
         getDefaultBlockedEncoding(this->context, shape, this->numWarps,
                                   this->threadsPerWarp, this->numCTAs);
@@ -53,9 +61,8 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
   // NOTE: only for remapped values.
   addTargetMaterialization([](OpBuilder &builder, RankedTensorType tensorType,
                               ValueRange inputs, Location loc) {
-    auto cast = triton::gpu::ConvertLayoutOp::create(
-        builder, loc, tensorType, inputs,
-        triton::gpu::ConvertLayoutOp::Properties{});
+    auto cast =
+        triton::gpu::ConvertLayoutOp::create(builder, loc, tensorType, inputs);
     return cast.getResult();
   });
 }
@@ -80,15 +87,77 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
 
   // We have requirements for the data layouts
   addDynamicallyLegalOp<triton::DotOp>([](triton::DotOp dotOp) -> bool {
+    // A mixed-radix dot's operands wait for accelerate-matmul.
+    Attribute dEncoding = dotOp.getType().getEncoding();
     Attribute aEncoding =
         cast<RankedTensorType>(dotOp.getA().getType()).getEncoding();
     Attribute bEncoding =
         cast<RankedTensorType>(dotOp.getB().getType()).getEncoding();
-    if (aEncoding && isa<triton::gpu::DotOperandEncodingAttr>(aEncoding) &&
-        bEncoding && isa<triton::gpu::DotOperandEncodingAttr>(bEncoding))
+    if ((dEncoding && !triton::gpu::isRadix2Encoding(dEncoding)) ||
+        (aEncoding && !triton::gpu::isRadix2Encoding(aEncoding)))
+      return true;
+    if (aEncoding && bEncoding &&
+        isa<triton::gpu::DotOperandEncodingAttr>(
+            triton::tlx::getEffectiveEncoding(aEncoding)) &&
+        isa<triton::gpu::DotOperandEncodingAttr>(
+            triton::tlx::getEffectiveEncoding(bEncoding)))
       return true;
     return false;
   });
+
+  addDynamicallyLegalOp<WarpSpecializeOp>([&](WarpSpecializeOp wsOp) -> bool {
+    bool hasLegalRegions = true;
+    hasLegalRegions =
+        hasLegalRegions && typeConverter.isLegal(&wsOp.getDefaultRegion());
+    for (auto *region : wsOp.getPartitionRegions()) {
+      hasLegalRegions = hasLegalRegions && typeConverter.isLegal(region);
+    }
+    if (hasLegalRegions && typeConverter.isLegal(wsOp)) {
+      return true;
+    }
+    return false;
+  });
+
+  addDynamicallyLegalOp<WarpPredicateOp>([&](WarpPredicateOp op) -> bool {
+    return typeConverter.isLegal(&op.getRegion()) && typeConverter.isLegal(op);
+  });
+  addDynamicallyLegalOp<PredicateYieldOp>(
+      [&](PredicateYieldOp op) -> bool { return typeConverter.isLegal(op); });
+
+  addDynamicallyLegalOp<
+      triton::gpu::AsyncCopyGlobalToLocalOp, triton::gpu::LocalLoadOp,
+      triton::gpu::LocalStoreOp, triton::gpu::RemoteShmemStoreOp,
+      triton::gpu::LocalGatherOp, triton::gpu::LocalScatterOp,
+      triton::gpu::AsyncRemoteShmemStoreOp, triton::nvidia_gpu::PrefetchOp,
+      triton::nvidia_gpu::TwoCTAPeerGatherOp,
+      triton::nvidia_gpu::WarpGroupDotWaitOp,
+      triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
+      triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
+      triton::tlx::DumpLayoutOp, triton::gpu::WarpVoteOp,
+      triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
+      triton::amdgpu::BufferLoadToLocalOp,
+      triton::amdgpu::RematerializedRangeOp,
+      triton::amdgpu::RegisterClassAnchorOp>([&](Operation *op) -> bool {
+    // make sure every RankedTensorType operand has encoding
+    for (auto operandType : op->getOperandTypes()) {
+      if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
+        if (rankedTensorType.getEncoding() == nullptr) {
+          return false;
+        }
+      }
+    }
+
+    // make sure result type has encoding if it is RankedTensorType
+    for (auto resultType : op->getResultTypes()) {
+      if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
+        if (rankedTensorType.getEncoding() == nullptr) {
+          return false;
+        }
+      }
+    }
+    return true;
+  });
+
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
     auto check = [](auto types) {
       return llvm::all_of(types, [](auto type) {

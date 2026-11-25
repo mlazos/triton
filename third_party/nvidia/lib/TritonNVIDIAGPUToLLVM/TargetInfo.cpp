@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/NVPTXAddrSpace.h"
 #include <limits>
 
 using namespace mlir;
@@ -104,6 +105,7 @@ matchReduxKind(triton::ReduceOp op, int computeCapability,
   Operation *reduceOp = op.getSingleCombiner();
   if (!reduceOp)
     return std::nullopt;
+  // redux.f32 is an sm_100-family feature; sm_120 lacks it.
   if (computeCapability / 10 == 10 && reduceOp->getResultTypes()[0].isF32()) {
     if (isa<arith::MinimumFOp, arith::MaximumFOp>(reduceOp))
       useNanQualifier = true;
@@ -348,7 +350,8 @@ void TargetInfo::storeRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              Value ctaId, Value val, Value pred) const {
+                              Value ctaId, Value val, Value pred,
+                              std::optional<Value> barrierPtr) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
@@ -356,7 +359,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
   if (!isa<VectorType>(val.getType())) {
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, {val}, rewriter),
-                 pred);
+                 pred, barrierPtr);
     return;
   }
 
@@ -374,7 +377,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
       v = b.zext(int_ty(8), b.bitcast(v, int_ty(elemBitwidth)));
     }
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, vals, rewriter),
-                 pred);
+                 pred, barrierPtr);
     return;
   }
 
@@ -388,7 +391,29 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
       }
     }
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, vals, rewriter),
-                 pred);
+                 pred, barrierPtr);
+    return;
+  }
+
+  // st.async.mbarrier::complete_tx::bytes does not accept b8/b16 element
+  // types, including vector forms such as v2.b16. Pack sub-32-bit values into
+  // b32 units before selecting the PTX instruction. Unlike ordinary DSMEM
+  // stores, this applies even when the original vector has four or fewer
+  // elements.
+  if (barrierPtr.has_value() && elemBitwidth < 32) {
+    int elemsPerPack = 32 / elemBitwidth;
+    assert(vec % elemsPerPack == 0 &&
+           "async DSMEM store must contain whole b32 units");
+    SmallVector<Value> oldVals = unpackLLVector(loc, val, rewriter);
+    SmallVector<Value> newVals;
+    for (int i = 0; i < vec / elemsPerPack; ++i) {
+      Value packed = packLLVector(
+          loc, ArrayRef(oldVals).slice(i * elemsPerPack, elemsPerPack),
+          rewriter);
+      newVals.push_back(b.bitcast(packed, i32_ty));
+    }
+    storeDShared(rewriter, loc, ptr, ctaId,
+                 packLLVector(loc, newVals, rewriter), pred, barrierPtr);
     return;
   }
 
@@ -409,7 +434,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
       newVals.push_back(b.bitcast(v, i32_ty));
     }
     storeDShared(rewriter, loc, ptr, ctaId,
-                 packLLVector(loc, newVals, rewriter), pred);
+                 packLLVector(loc, newVals, rewriter), pred, barrierPtr);
     return;
   }
 
@@ -425,7 +450,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
       storeDShared(
           rewriter, loc, newPtr, ctaId,
           packLLVector(loc, ArrayRef(vals).slice(i * maxVec, maxVec), rewriter),
-          pred);
+          pred, barrierPtr);
     }
     return;
   }
@@ -441,14 +466,25 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     ptr = mapa(rewriter, loc, ptr, ctaId);
   }
 
+  // Map barrier to remote address space if needed
+  Value mappedBarrier;
+  if (barrierPtr.has_value()) {
+    assert(ctaId && "barrier without ctaId");
+    mappedBarrier = mapa(rewriter, loc, barrierPtr.value(), ctaId);
+  }
+
   PTXBuilder builder;
-  auto st = builder.create("st")
-                ->o(ctaId ? "shared::cluster" : "shared::cta")
-                .v(vec, /*predicate=*/vec > 1)
-                .b(elemBitwidth);
+  auto st = builder.create<>("st")
+                ->o("async", barrierPtr.has_value())
+                .o("shared::cluster", static_cast<bool>(ctaId))
+                .o("shared", !ctaId)
+                .o("mbarrier::complete_tx::bytes", barrierPtr.has_value());
+
+  st.v(vec, /*predicate=*/vec > 1).b(elemBitwidth);
+
   auto *ptrOpr = builder.newAddrOperand(ptr, "r");
 
-  if (isConstantTruePred(pred)) {
+  if (isConstantTruePred(pred) && !barrierPtr && !useExplicitSharedStore()) {
     b.store(val, ptr, /*align=*/vec * elemBitwidth / 8);
   } else {
     PTXBuilder::Operand *valOpr;
@@ -462,14 +498,54 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     } else {
       valOpr = builder.newOperand(val, constraint);
     }
-    st(ptrOpr, valOpr).predicate(pred, "b");
+
+    // Build the explicit store, adding barrier and predicate operands when
+    // needed.
+    if (barrierPtr.has_value()) {
+      auto *barrierOpr = builder.newAddrOperand(mappedBarrier, "r");
+      st(ptrOpr, valOpr, barrierOpr).predicate(pred, "b");
+    } else if (!isConstantTruePred(pred)) {
+      st(ptrOpr, valOpr).predicate(pred, "b");
+    } else {
+      st(ptrOpr, valOpr);
+    }
     builder.launch(rewriter, loc, void_ty(ctx));
   }
 }
 
+bool TargetInfo::useExplicitSharedStore() const {
+  // Use explicit shared stores for PTX 8.5-8.9 to avoid a ptxas
+  // miscompilation; other PTX versions keep the LLVM store path.
+  return ptxVersion >= 85 && ptxVersion < 90;
+}
+
+void TargetInfo::copyBulkSharedToRemoteShared(RewriterBase &rewriter,
+                                              Location loc, Value srcPtr,
+                                              Value dstPtr, Value barrierPtr,
+                                              Value ctaId, Value size) const {
+  auto *ctx = rewriter.getContext();
+  // Elect one thread across all warps to issue the bulk copy.
+  Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
+  // Map dst and barrier to the remote CTA's address space via mapa.
+  Value remoteDstPtr = mapa(rewriter, loc, dstPtr, ctaId);
+  Value remoteMbarPtr = mapa(rewriter, loc, barrierPtr, ctaId);
+
+  PTXBuilder ptxBuilder;
+  auto &bulkCopy = *ptxBuilder.create<>(
+      "@$0 cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::"
+      "bytes [$1], [$2], $3, [$4];");
+  bulkCopy({ptxBuilder.newOperand(pred, "b"),
+            ptxBuilder.newOperand(remoteDstPtr, "r"),
+            ptxBuilder.newOperand(srcPtr, "r"),
+            ptxBuilder.newOperand(size, "r"),
+            ptxBuilder.newOperand(remoteMbarPtr, "r")},
+           /*onlyAttachMLIRArgs=*/true);
+  ptxBuilder.launch(rewriter, loc, void_ty(ctx));
+}
+
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                               Value ctaId, Type loadTy, Value pred,
-                              Operation *) const {
+                              Operation *localLoadOp) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
@@ -563,7 +639,8 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
   PTXBuilder builder;
   auto ld = builder.create("ld")
-                ->o(ctaId ? "shared::cluster" : "shared::cta")
+                ->o("shared::cluster", static_cast<bool>(ctaId))
+                .o("shared", !ctaId)
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);
 
@@ -602,10 +679,9 @@ Value TargetInfo::shuffleXor(RewriterBase &rewriter, Location loc, Value val,
   return LLVM::NVIDIA::shuffleXor(loc, rewriter, val, i);
 }
 
-std::pair<Value, Value> TargetInfo::shuffleUp(RewriterBase &rewriter,
-                                              Location loc, Value val,
-                                              int delta) const {
-  return LLVM::NVIDIA::shuffleUp(loc, rewriter, val, delta);
+Value TargetInfo::shuffleUp(RewriterBase &rewriter, Location loc, Value val,
+                            int i) const {
+  return LLVM::NVIDIA::shuffleUp(loc, rewriter, val, i);
 }
 
 Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
@@ -769,6 +845,40 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
   return true;
 }
 
+bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
+                            SmallVector<Value> &acc, triton::ReduceOp op,
+                            unsigned numLaneToReduce, unsigned interleave,
+                            std::optional<unsigned> broadcastLaneIdMask) const {
+
+  constexpr unsigned kWarpSize = 32;
+  unsigned fullMask = kWarpSize - 1;
+  // Full-warp reductions are provably broadcast-free. Ignore `interleave`,
+  // as beta does today, and any broadcast layout info.
+  unsigned reduceLaneIdMask;
+  if (numLaneToReduce == kWarpSize) {
+    reduceLaneIdMask = fullMask;
+  } else {
+    // Map beta's (numLaneToReduce, interleave) pair onto the contiguous
+    // lane-ID run it denotes. Anything else cannot lower to redux.
+    if (numLaneToReduce == 0 || !llvm::isPowerOf2_32(numLaneToReduce) ||
+        numLaneToReduce >= kWarpSize || interleave == 0 ||
+        !llvm::isPowerOf2_32(interleave))
+      return false;
+    unsigned numBits = llvm::Log2_32(numLaneToReduce);
+    unsigned firstBit = llvm::Log2_32(interleave);
+    if (firstBit + numBits > llvm::Log2_32(kWarpSize))
+      return false;
+    reduceLaneIdMask = ((1u << numBits) - 1) << firstBit;
+  }
+  bool partialWarp = reduceLaneIdMask != fullMask;
+  // Callers without layout knowledge (the map path) pass no broadcast mask;
+  // keep today's shuffle fallback for their partial warps.
+  if (partialWarp && !broadcastLaneIdMask.has_value())
+    return false;
+  return warpReduce(rewriter, loc, acc, op, reduceLaneIdMask,
+                    broadcastLaneIdMask.value_or(0));
+}
+
 unsigned TargetInfo::getReductionTreeArity(Operation *combinerOp) const {
   int computeCapability = getComputeCapability();
   Type resultType = combinerOp->getResult(0).getType();
@@ -894,6 +1004,11 @@ int TargetInfo::getAddressSpace(Attribute addressSpace) const {
   if (isa<triton::gpu::SharedMemorySpaceAttr,
           triton::nvidia_gpu::TensorMemorySpaceAttr>(addressSpace)) {
     spaceId = 3;
+  } else if (isa<triton::nvidia_gpu::SharedClusterMemorySpaceAttr>(
+                 addressSpace)) {
+    // NVPTX backend defines 7 for Shared Cluster memory space:
+    // https://llvm.org/docs/NVPTXUsage.html#address-spaces
+    spaceId = 7;
   } else {
     llvm::report_fatal_error(
         "Only support SharedMemorySpace, TensorMemorySpace for now");

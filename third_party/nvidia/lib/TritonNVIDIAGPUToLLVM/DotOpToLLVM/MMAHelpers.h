@@ -38,34 +38,48 @@ struct MemDescOperand {
   std::optional<int> offset;
 };
 
+// `tlx.less_reg_mma`, propagated to the module by the TLX Fixup pass from
+// `tlx.async_tasks(less_reg_mma=True)`. See `DotOpMmaSmemLoader::smemLoad`.
+inline bool hasLessRegMMA(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  return mod && mod->hasAttr("tlx.less_reg_mma");
+}
+
 // Abstract class to calculate the address of a shared or tensor memory slice.
 class DotOpMmaMemLoader {
 public:
   virtual ~DotOpMmaMemLoader() = default;
   // Given the starting coordinates of the logical tensor (i.e. reps *
   // ctaTileSize), return the associated memory descriptor for SMEM / TMEM.
-  virtual MemDescOperand memLoad(int a, int b,
-                                 ConversionPatternRewriter &rewriter,
-                                 Location loc, int kSize = 0) const = 0;
+  virtual FailureOr<MemDescOperand> memLoad(int a, int b,
+                                            ConversionPatternRewriter &rewriter,
+                                            Location loc,
+                                            int kSize = 0) const = 0;
 };
 
 class DotOpMmaSmemLoader : public DotOpMmaMemLoader {
 public:
   DotOpMmaSmemLoader() = default;
 
-  DotOpMmaSmemLoader(MMASMEMDescriptor desc, Value baseb128, LinearLayout llInv)
-      : desc(desc), baseb128(baseb128), ll(std::move(llInv)) {}
+  DotOpMmaSmemLoader(MMASMEMDescriptor desc, Value baseSrcb128,
+                     LinearLayout llInv, bool lessRegMMA, bool isFp6 = false,
+                     bool fp6Trans = false)
+      : desc(desc), baseSrcb128(baseSrcb128), ll(std::move(llInv)),
+        lessRegMMA(lessRegMMA), isFp6(isFp6), fp6Trans(fp6Trans) {}
 
   static FailureOr<DotOpMmaSmemLoader>
   build(Location loc, RewriterBase &rewriter, gpu::MemDescType memTy,
         Value smemBase, ArrayRef<unsigned> instrShape, unsigned MNdim,
-        int mmaVersion, bool isFp4 = false,
-        std::optional<RankedTensorType> mmaTy = std::nullopt) {
+        int mmaVersion, bool lessRegMMA, bool isFp4 = false,
+        std::optional<RankedTensorType> mmaTy = std::nullopt,
+        bool isFp6 = false) {
     auto ctx = memTy.getContext();
     auto kOffset = str_attr("offset");
     // Keep the allocation layout so descriptor tiling can handle subviews.
     auto ll = toLinearLayoutIgnoringPadding(memTy);
     unsigned bitwidth = memTy.getElementTypeBitWidth();
+    if (isFp4 && isFp6)
+      return failure();
     if (isFp4) {
       auto dims = to_vector(ll.getOutDimNames());
       auto trans = ll.getBasis(kOffset, 0, dims[0]) == 1;
@@ -73,15 +87,18 @@ public:
                .transposeOuts(dims);
       bitwidth /= 2;
     }
+    // For fp6 the layout stays in packed bytes; the K extent and coordinates
+    // are converted to bytes in the overload below.
     return build(loc, rewriter, ll.pseudoinvert(), bitwidth, smemBase,
-                 instrShape, MNdim, mmaVersion, mmaTy);
+                 instrShape, MNdim, mmaVersion, lessRegMMA, mmaTy, isFp6);
   }
 
   static FailureOr<DotOpMmaSmemLoader>
   build(Location loc, RewriterBase &rewriter, const LinearLayout &ll,
         int bitwidth, Value smemBase, ArrayRef<unsigned> instrShape,
-        unsigned MNdim, int mmaVersion,
-        std::optional<RankedTensorType> mmaTy = std::nullopt) {
+        unsigned MNdim, int mmaVersion, bool lessRegMMA,
+        std::optional<RankedTensorType> mmaTy = std::nullopt,
+        bool isFp6 = false) {
     // ll is a map from two dimensions (dim0, dim1) or (row, col) into offsets
     // and blocks
     auto ctx = rewriter.getContext();
@@ -95,6 +112,21 @@ public:
     assert(mmaTy.has_value() == (mmaVersion == 3));
     assert(MNdim < 2);
     assert(instrShape.size() == 2);
+    // fp6 packs groups of 16 values per 12 bytes. The layout is in packed
+    // bytes, so express the K extent of the instruction shape in bytes as well.
+    // The K entry is at index 1 for operand A ([M, K]) and 0 for B ([K, N]).
+    SmallVector<unsigned> instrShapeBytes(instrShape.begin(), instrShape.end());
+    bool fp6Trans = false;
+    if (isFp6) {
+      unsigned kIdx = 1 - MNdim;
+      if (instrShape[kIdx] % 4 != 0)
+        return failure();
+      instrShapeBytes[kIdx] = instrShape[kIdx] * 3 / 4;
+      // Detect the packed (K) dim the same way the fp4 path does: it is the
+      // contiguous dim.
+      auto dims = to_vector(ll.getInDimNames());
+      fp6Trans = ll.getBasis(dims[0], 0, kOffset) == 1;
+    }
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
     // Due to having a 16B alignment, we can compute the offsets in 128b
@@ -103,13 +135,25 @@ public:
     smemBase = b.ptrtoint(i32_ty, smemBase);
     Value baseSrcb128 = b.lshr(smemBase, b.i32_val(4));
 
-    if (mmaVersion == 3) {
+    if (mmaVersion == 3 && !ll.isRadix2()) {
+      auto warpGroupOffsetb128 = getMixedRadixWarpGroupOffsetb128(
+          loc, rewriter, ll, bitwidth, *mmaTy, MNdim);
+      if (failed(warpGroupOffsetb128))
+        return failure();
+      baseSrcb128 = b.add(baseSrcb128, *warpGroupOffsetb128);
+    } else if (mmaVersion == 3) {
       auto mmaLl = gpu::toLinearLayout(mmaTy.value());
       auto outDims = to_vector(mmaLl.getOutDimNames());
       auto kWarp = str_attr("warp");
       // Map from warps into the MN dimension
-      auto mmaWarps = mmaLl.sublayout({kWarp}, {outDims[MNdim]}) *
-                      LinearLayout::identity1D(1, kWarp, outDims[1 - MNdim]);
+      auto mmaWarps = mmaLl.sublayout({kWarp}, {outDims[MNdim]});
+      // A mixed-radix layout's warps sit on its binary part, inside the pow2
+      // alloc shape.
+      if (!mmaWarps.isRadix2())
+        mmaWarps = LinearLayout(
+            mmaWarps.getBases(),
+            {{outDims[MNdim], ll.getInDimSize(outDims[MNdim])}}, false);
+      mmaWarps *= LinearLayout::identity1D(1, kWarp, outDims[1 - MNdim]);
       // Map from warps to offsets in bitwidth elements
       auto warpToOffset = mmaWarps.compose(ll);
       // Map from warps to offsets in 128b elements
@@ -134,23 +178,42 @@ public:
     }
 
     // Padding may supply unused result columns, but not reduction elements.
+    // (instrShapeBytes matches instrShape except for fp6, where the layout's
+    // K extent is in packed bytes.)
     auto dims = to_vector(ll.getInDimNames());
-    if (instrShape[1 - MNdim] > ll.getInDimSize(dims[1 - MNdim]))
+    if (instrShapeBytes[1 - MNdim] > ll.getInDimSize(dims[1 - MNdim]))
       return mlir::emitError(loc,
                              "MMA instruction exceeds the logical K dimension");
 
-    auto desc = getDescriptor(loc, ll, instrShape, bitwidth, MNdim, mmaVersion);
+    auto descLL =
+        nvidia_gpu::getNvmmaDescriptorLayout(ll, bitwidth, instrShapeBytes);
+    if (!descLL)
+      return failure();
+    auto desc = getDescriptor(loc, *descLL, instrShapeBytes, bitwidth, MNdim,
+                              mmaVersion);
     if (failed(desc))
       return failure();
 
-    Value baseb128 = b.and_(baseSrcb128, b.i32_val(0x7FFF));
-    return DotOpMmaSmemLoader{*desc, baseb128, ll};
+    return DotOpMmaSmemLoader{*desc,      baseSrcb128, ll,
+                              lessRegMMA, isFp6,       fp6Trans};
   }
 
-  Value smemLoad(int a, int b, ConversionPatternRewriter &rewriter,
-                 Location loc, int kSize = 0) const {
+  FailureOr<Value> smemLoad(int a, int b, ConversionPatternRewriter &rewriter,
+                            Location loc, int kSize = 0) const {
     auto *ctx = loc.getContext();
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
+    if (isFp6) {
+      // The layout is in packed bytes (groups of 16 values per 12
+      // bytes); convert the logical K coordinate. The packed dim is
+      // dims[0] iff fp6Trans.
+      int &kCoord = fp6Trans ? a : b;
+      if (kCoord % 4 != 0)
+        return mlir::emitError(loc)
+               << "fp6 smem K coordinate " << kCoord
+               << " is not a multiple of 4, so it cannot be converted to "
+               << "packed bytes (x3/4)";
+      kCoord = kCoord * 3 / 4;
+    }
     auto dims = to_vector(ll.getInDimNames());
     assert(to_vector(ll.getOutDimNames()) ==
            llvm::to_vector(
@@ -164,6 +227,7 @@ public:
     // Take the next 0/1/2/3 bits after the 128b tile
     uint32_t mask = (desc.swizzlingByteWidth >> 4) - 1;
     currDesc.matrixBaseOffset = (smemByteOffsetb8 / 128) & mask;
+    currDesc.baseAddress = 0;
     // Packed FP4 K96 may straddle a 128-byte swizzle sector. SM103 can
     // address the second chunk through an absolute leading dimension.
     // The caller selects this only for K-major, 128-byte-swizzled operands
@@ -175,32 +239,130 @@ public:
       currDesc.leadDimensionBaseOffset = 0;
     }
     int32_t smemByteOffsetb128 = smemByteOffsetb8 >> 4;
-    uint64_t descBits = std::bit_cast<uint64_t>(currDesc) + smemByteOffsetb128;
-    // Add the base address to the descriptor
-    Value low = tb.add(tb.i32_val(uint32_t(descBits)), baseb128);
+
+    // Compute the base address at runtime to prevent LLVM from folding the
+    // per-tile offset into a unique 64-bit constant. This produces a short
+    // dependency chain (add→and→zext→add) that helps hide WGMMA latency.
+    Value fullAddrb128;
+    if (lessRegMMA) {
+      // NOTE: intentionally use inline PTX with *side-effecting* here to
+      // compute an address. This hack is to prevent LLVM CSE which could
+      // cause two distant MMA sharing the same SMEM operand which would have
+      // a very long live range and cause register spill when there're many mma
+      // instructions. This way each MMA computes its own operand.
+      // Opt-in via `tlx.async_tasks(less_reg_mma=True)`: it costs one extra
+      // add per MMA operand, so it only pays off in MMA-heavy tasks that
+      // actually spill.
+      // TODO: do it for TMEM operand too?
+      PTXBuilder ptxBuilder;
+      auto &addInstr = *ptxBuilder.create("add.s32");
+      auto *addOut = ptxBuilder.newOperand("=r");
+      auto *addLhs = ptxBuilder.newOperand(baseSrcb128, "r");
+      auto *addRhs = ptxBuilder.newOperand(tb.i32_val(smemByteOffsetb128), "r");
+      addInstr(addOut, addLhs, addRhs);
+      fullAddrb128 =
+          ptxBuilder.launch(rewriter, loc, i32_ty, /*hasSideEffect=*/true);
+    } else {
+      fullAddrb128 = tb.add(baseSrcb128, tb.i32_val(smemByteOffsetb128));
+    }
+    Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x7FFF));
+    // Split the descriptor add into independent 32-bit low/high words so
+    // no 64-bit carry chain is needed (upstream #11329): the descriptor bits
+    // are static, so the high word folds to a constant.
+    uint64_t descBits = std::bit_cast<uint64_t>(currDesc);
+    Value low = tb.add(tb.i32_val(uint32_t(descBits)), addrMasked);
     Value high = tb.i32_val(descBits >> 32);
     Value descWords = packLLVector(loc, {low, high}, rewriter);
     Value result = tb.bitcast(descWords, i64_ty);
     if (useAbsolute) {
       int nextK = (k / 256 + 1) * 256;
-      Value next = smemLoad(desc.transposed ? nextK : a,
-                            desc.transposed ? b : nextK, rewriter, loc);
-      Value nextAddress = tb.and_(next, tb.i64_val(0x3fff));
+      auto next = smemLoad(desc.transposed ? nextK : a,
+                           desc.transposed ? b : nextK, rewriter, loc);
+      if (failed(next))
+        return failure();
+      Value nextAddress = tb.and_(*next, tb.i64_val(0x3fff));
       result = tb.or_(result, tb.shl(nextAddress, tb.i64_val(16)));
     }
     return result;
   }
-  MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
-                         Location loc, int kSize = 0) const override {
-    return {smemLoad(a, b, rewriter, loc, kSize), std::nullopt};
+  FailureOr<MemDescOperand> memLoad(int a, int b,
+                                    ConversionPatternRewriter &rewriter,
+                                    Location loc,
+                                    int kSize = 0) const override {
+    auto loaded = smemLoad(a, b, rewriter, loc, kSize);
+    if (failed(loaded))
+      return failure();
+    return MemDescOperand{*loaded, std::nullopt};
   }
 
   MMASMEMDescriptor &getDescriptor() { return desc; }
 
 private:
   MMASMEMDescriptor desc;
-  Value baseb128;
+  Value baseSrcb128;
   LinearLayout ll;
+  // Initialized here, unlike its neighbours, because the defaulted default
+  // constructor is used (`DotOpMmaSmemLoader aLoader;` in WGMMA.cpp).
+  bool lessRegMMA = false;
+  bool isFp6 = false;
+  bool fp6Trans = false;
+
+  // A dense NPOT layout's strides add rather than XOR, so each warpgroup's
+  // offset is the sum of its warp bits' offsets. Core-matrix-aligned warpgroup
+  // origins keep every tile offset within a warpgroup additive too.
+  static FailureOr<Value>
+  getMixedRadixWarpGroupOffsetb128(Location loc, RewriterBase &rewriter,
+                                   const LinearLayout &ll, int bitwidth,
+                                   RankedTensorType mmaTy, unsigned MNdim) {
+    auto *ctx = rewriter.getContext();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto kWarp = str_attr("warp");
+    auto kOffset = str_attr("offset");
+    auto descLL = nvidia_gpu::getNvmmaDescriptorLayout(ll, bitwidth);
+    auto attrsAndTile = descLL
+                            ? nvidia_gpu::getNvmmaSmemAttrs(*descLL, bitwidth)
+                            : std::nullopt;
+    if (!attrsAndTile)
+      return failure();
+    auto dims = to_vector(ll.getInDimNames());
+    int32_t tile = attrsAndTile->second.getInDimSize(dims[MNdim]);
+    auto mmaLl = gpu::toLinearLayout(mmaTy);
+    SmallVector<std::pair<StringAttr, int32_t>> mmaIns;
+    for (StringAttr inDim : mmaLl.getInDimNames())
+      mmaIns.push_back({inDim, 0});
+    auto warpIt =
+        llvm::find_if(mmaIns, [&](auto in) { return in.first == kWarp; });
+    auto offsetOf = [&](int32_t warp, int32_t &offset) {
+      warpIt->second = warp;
+      int32_t coord = mmaLl.apply(mmaIns)[MNdim].second;
+      SmallVector<std::pair<StringAttr, int32_t>> ins = {{dims[0], 0},
+                                                         {dims[1], 0}};
+      ins[MNdim].second = coord;
+      offset = ll.apply(ins)[ll.getOutDimIndex(kOffset)].second;
+      return coord % tile == 0 && offset * bitwidth % 128 == 0;
+    };
+    int32_t numWarpGroups = mmaLl.getInDimSize(kWarp) / 4;
+    SmallVector<int32_t> bitOffsets;
+    for (int32_t g = 1; g < numWarpGroups; g *= 2)
+      if (!offsetOf(4 * g, bitOffsets.emplace_back()))
+        return failure();
+    for (int32_t g = 0; g < numWarpGroups; ++g) {
+      int32_t offset, sum = 0;
+      for (auto [i, bitOffset] : llvm::enumerate(bitOffsets))
+        if (g >> i & 1)
+          sum += bitOffset;
+      if (!offsetOf(4 * g, offset) || offset != sum)
+        return failure();
+    }
+    Value warpId = mlir::triton::gpu::WarpIdOp::create(rewriter, loc);
+    Value offsetb128 = b.i32_val(0);
+    for (auto [i, bitOffset] : llvm::enumerate(bitOffsets)) {
+      Value bit = b.and_(b.lshr(warpId, b.i32_val(2 + i)), b.i32_val(1));
+      offsetb128 =
+          b.add(offsetb128, b.mul(bit, b.i32_val(bitOffset * bitwidth / 128)));
+    }
+    return offsetb128;
+  }
 
   static FailureOr<MMASMEMDescriptor>
   getDescriptor(Location loc, const LinearLayout &ll,
@@ -247,8 +409,11 @@ private:
     if (swizzling == 0 && MNContig) {
       std::swap(leadingDim, stridedDim);
     }
+    // Compare exact extents (not log2) so non-power-of-2 packed extents
+    // (e.g. fp6 byte K) are handled. Identical for power-of-2 inputs.
     auto log2RowsTile = shmemTileInv.getInDimSizeLog2(dims[leadingDim]);
-    if (llvm::Log2_32(instrShape[leadingDim]) > log2RowsTile) {
+    // Ceil: an NPOT N that ends inside the second atom still needs the LBO.
+    if (llvm::Log2_32_Ceil(instrShape[leadingDim]) > log2RowsTile) {
       lbo = ll.getBasis(dims[leadingDim], log2RowsTile, kOffset);
     }
 

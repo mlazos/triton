@@ -30,6 +30,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -47,9 +48,9 @@ namespace mlir::triton::nvidia_gpu::impl {
 LogicalResult verifyMMAv5Op(Operation *op);
 } // namespace mlir::triton::nvidia_gpu::impl
 
+#define GET_ATTRDEF_CLASSES
 #include "triton/Dialect/TritonNvidiaGPU/IR/OpsEnums.h.inc"
 
-#define GET_ATTRDEF_CLASSES
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUAttrDefs.h.inc"
 
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.h.inc"
@@ -58,6 +59,10 @@ LogicalResult verifyMMAv5Op(Operation *op);
 #include "triton/Dialect/TritonNvidiaGPU/IR/Ops.h.inc"
 
 namespace mlir::triton::nvidia_gpu {
+
+// Kernel arguments are uniform; unsupported region results may vary across
+// ranks. Shared by formation and verification so convergence rules stay equal.
+bool mayDependOnClusterRank(Value value, int axis);
 
 struct PackedArithTypeInfo {
   llvm::StringLiteral suffix;
@@ -79,7 +84,22 @@ PackedArithInstructionSpec getPackedArithInstructionSpec(PackedArithOp op);
 unsigned getPackedArithFp4Axis(PackedArithOp op);
 
 constexpr static char AttrTwoCTAsName[] = "ttng.two-ctas";
+constexpr static char AttrTwoCTALoadName[] = "two_cta_load";
+constexpr static char kPlannedPendingCount[] = "planned_pending_count";
+// tcgen05.mma collector usage for operand A or B ("fill" / "use" / "lastuse"),
+// set by the MMA collector reuse pass on single-instruction MMAs.
+constexpr static char kCollectorAAttrName[] = "ttng.collector_a";
+constexpr static char kCollectorBAttrName[] = "ttng.collector_b";
+// Set by autoWS code partitioning on a nvws.consumer_release whose partition
+// read the buffer through the generic proxy. Token lowering keeps it on the
+// resulting arrive only when another partition refills the buffer with TMA,
+// and ProxyFenceInsertion puts a proxy fence before every marked arrive
+// (mbarrier or named barrier), wherever the barrier passes have moved it.
+constexpr static char kFenceGenericReadsAttrName[] = "ttng.fence_generic_reads";
 
+/// Whether the kernel issues paired-CTA (`cta_group::2`) MMA. This is not the
+/// same question as whether it runs on a cluster, which is
+/// `triton::gpu::isPhysicalCluster`.
 inline bool getModuleTwoCTAs(ModuleOp mod) {
   auto attr = mod->getAttrOfType<BoolAttr>(AttrTwoCTAsName);
   return attr ? attr.getValue() : false;
@@ -88,6 +108,37 @@ inline bool getModuleTwoCTAs(ModuleOp mod) {
 inline bool getModuleTwoCTAs(Operation *op) {
   return getModuleTwoCTAs(op->getParentOfType<ModuleOp>());
 }
+
+enum class Tcgen05Kind { F16OrTF32, F8F6F4, I8, BlockScaled };
+
+// Why a tcgen05.mma of this form cannot use per-CTA tile `m` x `n`, or nullopt
+// if it can (PTX ISA 9.7.18.2.1 Table 48, intersected with CUTLASS
+// mma_sm100_umma.hpp).
+std::optional<std::string>
+getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
+                             bool twoCTAs, unsigned m, unsigned n);
+
+// The tcgen05 kind that issues an MMA on `t` operands.
+std::optional<Tcgen05Kind> getTcgen05Kind(Type t);
+
+// The K of one tcgen05.mma: 32 bytes, 64 for 8-bit operands with 2x fp8 at
+// blockM=128 when 64 divides `k`, or 96 for FP4 with K=96 when 96 divides it.
+unsigned getTcgen05InstrK(unsigned bitwidth, unsigned blockM, int64_t k,
+                          bool supports2xFp8, bool supportsK96 = false);
+
+// Why an NPOT per-CTA accumulator tile can't be issued as tcgen05 tiles of
+// blockM x min(blockN, N) x instruction K, or nullopt if it can. NPOT M, NPOT N
+// at blockM=64 and the block-scaled NPOT N that
+// getNpotTMemScalesUnsupportedReason rejects aren't lowered.
+std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
+    Tcgen05Kind kind, bool aInTmem, bool bMNMajor, bool twoCTAs,
+    unsigned blockM, unsigned blockN, ArrayRef<int64_t> ctaShape, int64_t k,
+    unsigned bitwidth, bool supportsK96 = false);
+
+// Why TMA can't copy NPOT tile `ty` as whole getTMABlockShape boxes, or nullopt
+// if it can. An all-pow2 tile always can.
+std::optional<std::string> getNpotTMAUnsupportedReason(gpu::MemDescType ty,
+                                                       gpu::TMAMode mode);
 
 // Return the declared MMA N, restricted to a true N subview.
 unsigned getMMAv5InstructionN(gpu::MemDescType type);
@@ -143,8 +194,11 @@ inline const char *getOpShape(TMemAccessAtom atom) {
   llvm_unreachable("Unknown TMemAccessAtom");
 }
 
+// With `withWarp`, warp w of a warpgroup accesses lanes [32w, 32w + 32);
+// `numWarpBases` is log2 of the number of those warps (2 for a full warpgroup,
+// fewer for a task of 1 or 2 warps).
 LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
-                           bool withWarp);
+                           bool withWarp, int numWarpBases = 2);
 
 TMemAllocation getTmemAllocSizes(gpu::MemDescType memDescType);
 
@@ -173,6 +227,25 @@ getDefaultLayoutForTmemLdSt(gpu::MemDescType memType, unsigned numWarps);
 std::optional<LinearLayout>
 getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
                                 unsigned numWarps);
+
+/// Lower a single SubtiledRegionOp into flat IR by replicating the tile
+/// body for each tile.
+void lowerSubtiledRegion(SubtiledRegionOp op);
+
+/// Return the minimum number of warps required to execute an operation.
+inline int getMinWarpsForOp(Operation *op) {
+  // TMEM ops require at least 4 warps to be able to read all lanes.
+  // WarpGroupDotOp requires a full warp group (4 warps).
+  if (isa<TMEMLoadOp, TMEMStoreOp, TMEMAllocOp, WarpGroupDotOp>(op))
+    return 4;
+  // Some instructions have critical throughput if they have low register usage.
+  // Make sure there are enough warps for these ops to execute quickly.
+  // TODO: Should we keep a minimum of 2 warps for
+  // AsyncTMACopyGlobalToLocalOp under certain conditions?
+  if (isa<AsyncTMAGatherOp, AsyncTMAScatterOp>(op))
+    return 2;
+  return 1;
+}
 
 SmallVector<uint16_t> getCTABroadcastMasks(bool twoCTAs, ValueRange descs);
 

@@ -1,4 +1,5 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/include/hipblas_instance.h"
@@ -7,10 +8,13 @@
 #include "dylib_utils.h"
 #include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "lld/Common/Driver.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LLVMOptions.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/Constants.h"
@@ -47,6 +51,18 @@
 
 namespace py = nanobind;
 
+// NOTE (sync-train merge of #11911): 4-arg overload uniting enableTreeReduction
+// with upstream cuMode. Declared locally because Passes.h (outside this
+// conflict's scope) only declares the 3-arg factory.
+// TODO: fold this declaration into Passes.h.
+namespace mlir {
+namespace triton {
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonAMDGPUToLLVMPass(::llvm::StringRef gfxArch, bool ftz,
+                                    bool enableTreeReduction, bool cuMode);
+} // namespace triton
+} // namespace mlir
+
 namespace {
 llvm::Triple getAMDTargetTriple(const std::string &arch) {
   llvm::AMDGPU::GPUKind gpuKind = llvm::AMDGPU::parseArchAMDGCN(arch);
@@ -61,8 +77,9 @@ llvm::Triple getAMDTargetTriple(const std::string &arch) {
 void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   using namespace mlir::triton;
   m.def("add_to_llvmir", [](mlir::PassManager &pm, const std::string &arch,
-                            bool ftz, bool cuMode) {
-    pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz, cuMode));
+                            bool ftz, bool enableTreeReduction, bool cuMode) {
+    pm.addPass(createConvertTritonAMDGPUToLLVMPass(
+        arch, ftz, enableTreeReduction, cuMode));
   });
   ADD_PASS_OPTION_WRAPPER_1("add_membar", createTritonAMDGPUMembar,
                             const std::string &);
@@ -70,14 +87,8 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertBuiltinFuncToLLVMPass(arch, ftz));
         });
-  m.def("add_prepare_consan_captures", [](mlir::PassManager &pm) {
-    mlir::triton::instrument::TritonInstrumentPrepareConSanCapturesOptions
-        options;
-    options.target = "amd";
-    pm.addPass(
-        mlir::triton::instrument::createTritonInstrumentPrepareConSanCaptures(
-            options));
-  });
+  ADD_PASS_WRAPPER_0("add_finalize_scheduled_mfma_operands",
+                     mlir::triton::createFinalizeScheduledMfmaOperandsPass);
   ADD_PASS_OPTION_WRAPPER_1("add_allocate_shared_memory",
                             mlir::triton::createAllocateAMDGPUSharedMemoryPass,
                             const std::string &);
@@ -86,6 +97,10 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
                             const std::string, int, int);
   ADD_PASS_WRAPPER_0("add_optimize_epilogue",
                      mlir::createTritonAMDGPUOptimizeEpilogue);
+  ADD_PASS_WRAPPER_0("add_preserve_warp_pipeline_owners",
+                     mlir::createTritonAMDGPUPreserveWarpPipelineOwners);
+  ADD_PASS_WRAPPER_0("add_normalize_warp_pipeline",
+                     mlir::createTritonAMDGPUNormalizeWarpPipeline);
   ADD_PASS_WRAPPER_0("add_warp_pipeline", mlir::createTritonAMDGPUWarpPipeline);
   ADD_PASS_OPTION_WRAPPER_1("add_warp_pipeline_conversion",
                             mlir::triton::AMD::createConvertWarpPipelinePass,
@@ -116,6 +131,8 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   ADD_PASS_OPTION_WRAPPER_3("add_convert_to_buffer_ops",
                             mlir::createTritonAMDGPUConvertToBufferOps,
                             const std::string &, bool, bool);
+  ADD_PASS_WRAPPER_0("add_lower_barrier_ops",
+                     mlir::createTritonAMDGPULowerBarrierOps);
   ADD_FUNC_PASS_WRAPPER_0("add_optimize_buffer_op_ptr",
                           mlir::createTritonAMDGPUOptimizeBufferOpPtr);
   ADD_PASS_WRAPPER_0("add_fold_true_cmpi", mlir::createTritonAMDFoldTrueCmpI);
@@ -127,9 +144,11 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
                             mlir::createTritonAMDGPUScheduleLoops, int);
   ADD_PASS_OPTION_WRAPPER_2("add_pipeline", mlir::createTritonAMDGPUPipeline,
                             bool, bool);
-  ADD_PASS_OPTION_WRAPPER_1("add_coalesce_async_copy",
+  ADD_PASS_WRAPPER_0("add_coalesce_buffer_ops",
+                     mlir::createTritonAMDGPUCoalesceBufferOps);
+  ADD_PASS_OPTION_WRAPPER_2("add_coalesce_async_copy",
                             mlir::createTritonAMDGPUCoalesceAsyncCopy,
-                            std::string);
+                            std::string, bool);
   ADD_PASS_OPTION_WRAPPER_1("add_update_async_wait_count",
                             mlir::createTritonAMDGPUUpdateAsyncWaitCount,
                             std::string);
@@ -137,6 +156,14 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
                      mlir::createTritonAMDGPUOptimizeDescriptorEncoding);
   ADD_PASS_WRAPPER_0("add_convert_to_tensor_ops",
                      mlir::createTritonAMDGPUConvertToTensorOps);
+  ADD_PASS_OPTION_WRAPPER_1("add_dot_decompose_and_schedule",
+                            mlir::createTritonAMDGPUDotDecomposeAndSchedule,
+                            const std::string &);
+  ADD_PASS_OPTION_WRAPPER_2("add_sched_group_barrier_scheduler",
+                            mlir::createTritonAMDGPUSchedGroupBarrierScheduler,
+                            unsigned, unsigned);
+  ADD_PASS_WRAPPER_0("add_intra_wave_pipeline",
+                     mlir::createTritonAMDGPUIntraWavePipeline);
   mlir::registerConSanAMDHooks();
   m.def("add_in_thread_transpose", [](mlir::PassManager &pm) {
     pm.addNestedPass<mlir::triton::FuncOp>(
@@ -346,7 +373,13 @@ static std::optional<std::string> lldInvoke(const char *inPath,
   // Context: lld::elf::LinkerDriver::link uses parallelFor which uses the
   // LLVM's thread pool. During cleanup at ~TaskGroup() the child process hangs
   // waiting.
-  std::array args{"ld.lld", "--threads=1", "-shared", inPath, "-o", outPath};
+  // Facebook begin
+  // Embed a GNU build ID so debuggers and symbol servers can look up this code
+  // object by ID. sha1 hashes the linked output, so identical code objects get
+  // identical 20-byte IDs.
+  std::array args{"ld.lld", "--threads=1", "-shared", "--build-id=sha1",
+                  inPath,   "-o",          outPath};
+  // Facebook end
   std::string errString;
   llvm::raw_string_ostream errStream(errString);
   auto lldRes = lld::lldMain(args, llvm::outs(), errStream,
@@ -377,10 +410,33 @@ void init_triton_amd(py::module_ &m) {
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::amdgpu::TritonAMDGPUDialect>();
+    // tlx barrier calls lower to ttng ops
+    // Without this registration, ttng op creation in triton_tlx.cc will fail
+    // TODO: Fix this after we have ttg barrier ops
+    registry.insert<mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect>();
     // registry.insert<mlir::ROCDL::ROCDLDialect>();
     mlir::registerROCDLDialectTranslation(registry);
+    mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
+    mlir::triton::amdgpu::registerNpotTargetLegality(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
+  });
+
+  m.def("enable_wmma_queuing", [](mlir::triton::FuncOp func) {
+    mlir::OpBuilder builder(func.getContext());
+    builder.setInsertionPointToStart(&func.getBody().front());
+    // HW_REG_WAVE_SCHED_MODE is register 26. Write only bit 2, preserving
+    // bits 0..1 used by LLVM's expert scheduling mode.
+    constexpr unsigned hwreg = 26 | (2 << 6);
+    auto reg = mlir::LLVM::ConstantOp::create(builder, func.getLoc(),
+                                              builder.getI32Type(),
+                                              builder.getI32IntegerAttr(hwreg));
+    auto value = mlir::LLVM::ConstantOp::create(builder, func.getLoc(),
+                                                builder.getI32Type(),
+                                                builder.getI32IntegerAttr(1));
+    mlir::LLVM::CallIntrinsicOp::create(
+        builder, func.getLoc(), builder.getStringAttr("llvm.amdgcn.s.setreg"),
+        mlir::ValueRange{reg, value});
   });
 
   m.def("attach_target_triple",

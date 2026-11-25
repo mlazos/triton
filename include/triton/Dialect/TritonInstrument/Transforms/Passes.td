@@ -3,17 +3,30 @@
 
 include "mlir/Pass/PassBase.td"
 
-def TritonInstrumentConcurrencySanitizer: Pass<"tritoninstrument-concurrency-sanitizer", "mlir::ModuleOp"> {
+def TritonInstrumentConcurrencySanitizer
+    : Pass<"tritoninstrument-concurrency-sanitizer", "mlir::ModuleOp"> {
   let summary = "Add runtime verification of asynchronous operations";
 
-  let description = "Instrument the program with runtime verification of asynchronous operations.";
+  let description = "Instrument the program with runtime verification of "
+                    "asynchronous operations.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect",
                            "mlir::triton::instrument::TritonInstrumentDialect"];
 }
 
-def TritonInstrumentPrepareConSanCaptures: Pass<"tritoninstrument-prepare-consan-captures", "mlir::ModuleOp"> {
+def TritonInstrumentGlobalSanitizer
+    : Pass<"tritoninstrument-global-sanitizer", "mlir::ModuleOp"> {
+  let summary = "Add gsan instrumentation to memory access operations.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::instrument::TritonInstrumentDialect"];
+}
+
+def TritonInstrumentPrepareConSanCaptures
+    : Pass<"tritoninstrument-prepare-consan-captures", "mlir::ModuleOp"> {
   let summary = "Reserve shared memory for ConSan WarpSpecialize captures";
 
   let description = [{
@@ -27,13 +40,13 @@ def TritonInstrumentPrepareConSanCaptures: Pass<"tritoninstrument-prepare-consan
                            "mlir::triton::TritonDialect",
                            "mlir::triton::instrument::TritonInstrumentDialect"];
 
-  let options = [
-    Option<"target", "target", "std::string", /*default*/"std::string{}",
-           "ConSan target hook key, e.g. amd or nvidia">
-  ];
+  let options = [Option<"target", "target", "std::string",
+                        /*default*/ "std::string{}",
+                        "ConSan target hook key, e.g. amd or nvidia">];
 }
 
-def TritonInstrumentFpSanitizer: Pass<"tritoninstrument-fp-sanitizer", "mlir::ModuleOp"> {
+def TritonInstrumentFpSanitizer
+    : Pass<"tritoninstrument-fp-sanitizer", "mlir::ModuleOp"> {
   let summary = "Replace floating-point ops with integer-payload equivalents";
 
   let description = [{
@@ -53,15 +66,6 @@ def TritonInstrumentFpSanitizer: Pass<"tritoninstrument-fp-sanitizer", "mlir::Mo
     Option<"homomorphicCasts", "homomorphic-casts", "bool", /*default*/"false",
            "Use truncating FPSan payload downcasts">
   ];
-}
-
-def TritonInstrumentGlobalSanitizer: Pass<"tritoninstrument-global-sanitizer", "mlir::ModuleOp"> {
-  let summary = "Add gsan instrumentation to memory access operations.";
-
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-                           "mlir::triton::instrument::TritonInstrumentDialect"];
 }
 
 #endif // TRITON_INSTRUMENT_PASSES

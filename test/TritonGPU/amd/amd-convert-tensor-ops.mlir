@@ -28,7 +28,7 @@ tt.func public @test_gather_i32(%desc: !tt.tensordesc<1x32xi8, #padded_desc>,
 // -----
 
 // Gather i16: same NVIDIA-oriented slice encoding on the indices (the shared
-// pass doesn't special-case index element type).
+// pass doesn't special-case index element type). i16 indices are AMD-only.
 
 #nv_slice16 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
 #blocked_res16 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -82,7 +82,7 @@ tt.func public @test_scatter_i32(%desc: !tt.tensordesc<1x32xi8, #padded_desc_s>,
 // -----
 
 // Scatter i16: same NVIDIA-oriented slice encoding on the indices (the shared
-// pass doesn't special-case index element type).
+// pass doesn't special-case index element type). i16 indices are AMD-only.
 
 #nv_slice_s16 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
 #blocked_src16 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -109,9 +109,9 @@ tt.func public @test_scatter_i16(%desc: !tt.tensordesc<1x32xi8, #padded_desc_s16
 // -----
 
 // CHECK-LABEL: test_cvt1
-// CHECK: amdg.async_tdm_copy_global_to_local {{.*}}: !tt.tensordesc<128x16xf16, #shared> -> !ttg.memdesc<128x16xf16, #shared, #smem, mutable>
+// CHECK: amdg.async_tdm_copy_global_to_local {{.*}}: !tt.tensordesc<128x16xf16, #shared> -> !ttg.memdesc<128x16xf16, #shared{{[0-9]*}}, #smem, mutable>
 // CHECK: amdg.async_tdm_wait  {num = 0 : i32}
-// CHECK: amdg.async_tdm_copy_local_to_global {{.*}} : !ttg.memdesc<128x128xf16, #shared2, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared2>
+// CHECK: amdg.async_tdm_copy_local_to_global {{.*}} : !ttg.memdesc<128x128xf16, #shared{{[0-9]*}}, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared2>
 // CHECK: amdg.async_tdm_wait  {num = 0 : i32}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [4, 8], warpsPerCTA = [8, 1], order = [1, 0], CGALayout = [[0, 0], [1, 0]]}>
@@ -138,9 +138,9 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %1 = tt.get_program_id y : i32
     %2 = arith.muli %0, %c128_i32 : i32
     %3 = arith.muli %1, %c128_i32 : i32
-    %4 = tt.make_tensor_descriptor %a_ptr, [%c1024_i32, %c256_i32], [%c256_i64, %c1_i64] : <f16>, <128x16xf16, #shared>
-    %5 = tt.make_tensor_descriptor %b_ptr, [%c256_i32, %c512_i32], [%c512_i64, %c1_i64] : <f16>, <16x128xf16, #shared1>
-    %6 = tt.make_tensor_descriptor %c_ptr, [%c1024_i32, %c512_i32], [%c512_i64, %c1_i64] : <f16>, <128x128xf16, #shared2>
+    %4 = tt.make_tensor_descriptor %a_ptr, [%c1024_i32, %c256_i32], [%c256_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x16xf16, #shared>
+    %5 = tt.make_tensor_descriptor %b_ptr, [%c256_i32, %c512_i32], [%c512_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<16x128xf16, #shared1>
+    %6 = tt.make_tensor_descriptor %c_ptr, [%c1024_i32, %c512_i32], [%c512_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x128xf16, #shared2>
     %7 = tt.descriptor_load %4[%2, %c0_i32] : !tt.tensordesc<128x16xf16, #shared> -> tensor<128x16xf16, #blocked>
     %8 = tt.descriptor_load %5[%c0_i32, %3] : !tt.tensordesc<16x128xf16, #shared1> -> tensor<16x128xf16, #blocked1>
     %9 = ttg.convert_layout %7 : tensor<128x16xf16, #blocked> -> tensor<128x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>

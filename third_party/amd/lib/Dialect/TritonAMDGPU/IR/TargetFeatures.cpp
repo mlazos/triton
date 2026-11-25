@@ -299,21 +299,22 @@ bool TargetFeatures::supportsBufferAtomicFMinMax(Type elementType) const {
   return false;
 }
 
-int32_t TargetFeatures::getBufferAtomicCachePolicy(bool hasUsers) const {
+int32_t TargetFeatures::getBufferAtomicCachePolicy(bool hasUsers,
+                                                   bool clusterScope) const {
   const int sc0Bit = 0b1;          // TH_ATOMIC_RETURN (cpol bit 0)
+  const int scopeSEBit = 0b01000;  // SCOPE_SE = 1 << 3 (cpol bits [4:3])
   const int scopeDevBit = 0b10000; // SCOPE_DEV = 2 << 3 (cpol bits [4:3])
   int32_t aux = 0;
   if (hasUsers)
     aux |= sc0Bit;
   if (getISAFamily() == ISAFamily::CDNA5)
-    aux |= scopeDevBit;
+    aux |= clusterScope ? scopeSEBit : scopeDevBit;
   return aux;
 }
 
 bool TargetFeatures::supportMaximumMinimum() const {
   return getISAFamily() == ISAFamily::CDNA4 ||
          getISAFamily() == ISAFamily::RDNA4m ||
-         getISAFamily() == ISAFamily::RDNA4 ||
          getISAFamily() == ISAFamily::CDNA5;
 }
 
@@ -338,7 +339,11 @@ bool TargetFeatures::supportsPermlaneSwap() const {
 bool TargetFeatures::supportsCvtPkScalePk8() const { return isCDNA5(); }
 
 bool TargetFeatures::supportsCvtPkScalePk8Upcast() const {
-  return supportsCvtPkScalePk8();
+  // TODO: gfx1250-strict implements the v_cvt_scale_pk8_* upcasts in Block32
+  // mode, but LLVM gates them behind block16-cvt-scale-insts, which it does
+  // not enable for gfx1250-strict. Drop the strict check once LLVM ticket is
+  // merged. May require LLVM bump
+  return supportsCvtPkScalePk8() && !isGFX1250Strict();
 }
 
 bool TargetFeatures::supportsCvtPkScalePk8Block16() const {

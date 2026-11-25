@@ -420,8 +420,7 @@ def test_gluon_warp_specialize_completes(with_gsan):
     expected = torch.arange(256, dtype=torch.int32, device="cuda")
 
     out = torch.full((256, ), -1, dtype=torch.int32, device="cuda")
-    compiled = _gluon_ws_completion_kernel[(1, )](out, num_warps=4)
-    assert 'asm sideeffect "barrier.sync $0, $1;"' in compiled.asm["llir"]
+    _gluon_ws_completion_kernel[(1, )](out, num_warps=4)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected)
 
@@ -2004,6 +2003,7 @@ def test_graph_completion_is_immutable_across_stream_slot_reuse(with_gsan):
     assert not torch.equal(snapshot.clock, _stream_sync._current_stream_clock(device, stream))
 
 
+@pytest.mark.skipif(not is_cuda(), reason="GSan requires CUDA")
 def test_explicit_graph_aborted_launch_preserves_stream_order(with_gsan):
     from triton.experimental.gsan import graph, _stream_sync
 
@@ -2022,6 +2022,7 @@ def test_explicit_graph_aborted_launch_preserves_stream_order(with_gsan):
     plan.close()
 
 
+@pytest.mark.skipif(not is_cuda(), reason="GSan requires CUDA")
 def test_explicit_graph_storage_survives_executable_close(with_gsan):
     import gc
     import weakref

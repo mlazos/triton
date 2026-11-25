@@ -33,7 +33,9 @@ def test_dynamic_instrumentation_and_dialect_loading():
     assert not instrument("context", point="load-dialects", backend="test")
 
 
-@pytest.mark.skipif(not is_cuda(), reason="only currently tested on CUDA")
+pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
+
+
 def test_inspection(monkeypatch, fresh_knobs, tmp_path: pathlib.Path):
     stage_name = 'make_ttgir'
     curr_repro_path = tmp_path / ("repro_prefix." + stage_name + ".repro.mlir")

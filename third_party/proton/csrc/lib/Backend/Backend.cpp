@@ -11,6 +11,13 @@
 
 namespace proton {
 
+#ifdef PROTON_NO_EXTERNAL_BACKENDS
+const std::vector<BackendRegistration> &getBackendRegistrations() {
+  static const std::vector<BackendRegistration> registrations;
+  return registrations;
+}
+#endif
+
 const std::vector<ProfilerRegistration> getProfilerRegistrations() {
   std::vector<ProfilerRegistration> registeredProfilers = {
       {"cupti", "cuda", []() { return &CuptiProfiler::instance(); }},

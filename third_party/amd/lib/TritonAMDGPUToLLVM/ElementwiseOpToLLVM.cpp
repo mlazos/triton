@@ -1,4 +1,5 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TargetInfo.h"
 #include "Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -16,13 +17,13 @@
 using namespace mlir;
 
 using mlir::getElementTypeOrSelf;
+using mlir::triton::amdgpu::ISAFamily;
 using mlir::triton::gpu::appendOrGetExternFuncOp;
 using mlir::triton::gpu::ElementwiseOpConversion;
 using mlir::triton::gpu::ElementwiseOpConversionBase;
 using mlir::triton::gpu::ElementwiseToIntrinsicOpConversion;
 using mlir::triton::gpu::getFunctionType;
 using mlir::triton::gpu::MultipleOperandsRange;
-using triton::amdgpu::ISAFamily;
 
 namespace {
 
@@ -61,7 +62,7 @@ struct PackedArithOpConversion
       packedOperands.push_back(
           packLLVector(loc, {operands[0][i], operands[1][i]}, rewriter));
     Value vr = LLVMOp::create(rewriter, loc, packedOperands[0].getType(),
-                              packedOperands, typename LLVMOp::Properties{});
+                              packedOperands);
     return unpackLLVector(loc, vr, rewriter);
   }
 };
@@ -275,11 +276,13 @@ struct Exp2OpConversion
     // which flushes input and output denorms. `llvm.amdgcn.exp2.f32` provides
     // direct access to v_exp_f32. For `llvm.exp2.f32`, the LLVM backend inserts
     // instructions to handle denorms iff `allow_flush_denorm` is False.
-    if (ftz)
-      return {ROCDL::ROCDLExp2::create(rewriter, loc, elemTy, operands[0])};
+    StringRef funcName = ftz ? "llvm.amdgcn.exp2.f32" : "llvm.exp2.f32";
+    Type funcType = getFunctionType(elemTy, operands[0]);
+    LLVM::LLVMFuncOp funcOp =
+        appendOrGetExternFuncOp(rewriter, op, funcName, funcType);
 
-    return {LLVM::Exp2Op::create(rewriter, loc, elemTy, operands[0],
-                                 LLVM::Exp2Op::Properties{})};
+    return {
+        LLVM::createLLVMCallOp(rewriter, loc, funcOp, operands[0]).getResult()};
   }
 
 private:
@@ -505,8 +508,6 @@ void populateElementwiseOpToLLVMPatterns(
                                    targetInfo.getISAFamily(), benefit);
   patterns.add<FPToSIOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<SIToFPOpConversion>(typeConverter, axisInfoAnalysis, benefit);
-  patterns.add<ElementwiseOpConversion<arith::UIToFPOp, LLVM::UIToFPOp>>(
-      typeConverter, axisInfoAnalysis, benefit);
 
   // ExpOpConversionApprox will try using __ocml_exp2_f32 if the input type is
   // FP32. For other input types, ExpOpConversionApprox will return failure and
@@ -520,9 +521,6 @@ void populateElementwiseOpToLLVMPatterns(
   patterns.add<RsqrtOpConversion>(typeConverter, axisInfoAnalysis, ftz,
                                   benefit);
   patterns.add<SqrtOpConversion>(typeConverter, axisInfoAnalysis, ftz, benefit);
-  patterns.add<ElementwiseOpConversion<math::SqrtOp, math::SqrtOp>,
-               ElementwiseOpConversion<math::RsqrtOp, math::RsqrtOp>>(
-      typeConverter, axisInfoAnalysis, benefit);
   patterns.add<ClampFOpConversion>(typeConverter, axisInfoAnalysis,
                                    benefit.getBenefit() + 1);
   triton::populateElementwiseOpToLLVMPatterns(typeConverter, patterns,

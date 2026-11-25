@@ -7,6 +7,10 @@
 #include "CallGraph.h"
 #include "Function.h"
 
+#include "mlir/Analysis/CFGLoopInfo.h"
+#include "mlir/IR/Dominance.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
 #include <functional>
@@ -32,16 +36,33 @@ using MembarSliceFilterFn =
     std::function<bool(const AllocationSlice &, const AllocationSlice &,
                        bool /*lhsIsRead*/, bool /*rhsIsRead*/, Allocation *)>;
 
+/// Optional backend policy for reusing scratch without a CTA rendezvous.
+/// canReuse must be a pure proof that both operations use the same disjoint
+/// per-warp scratch partitions and that only prior reads need ordering before
+/// the next write. It is queried only for intersecting allocated scratch
+/// effects, after the ordinary filter. emitBefore must order those reads before
+/// the supplied operation's writes and be idempotent across repeated analysis.
+/// Membar emits it only for an actual WAR and when no incoming hazard needs a
+/// CTA barrier. Neither callback may discard pending BlockInfo dependencies.
+/// Omitting either callback conservatively disables scratch reuse.
+struct MembarScratchSync {
+  std::function<bool(Operation *, Operation *, Allocation *)> canReuse;
+  std::function<void(Operation *, OpBuilder &)> emitBefore;
+
+  explicit operator bool() const { return canReuse && emitBefore; }
+};
+
 // Represents the access to a slice of an allocation
 // It contains information both on physical memory (the interval) and a
 // logical view on it (layout, subslice offsets and shape for the access)
 struct AllocationSlice {
 public:
   // Create allocation slice from a value, collecting subslice offsets.
-  // Dynamic buffer-index information is attached by BufferIndexAnalysis; use
-  // BufferIndexAnalysis::makeSlice when constructing slices for membar.
+  // BufferIndexAnalysis attaches dynamic buffer-index information to the
+  // stage-aware slice before it is inserted into BlockInfo.
   AllocationSlice(Value value, Interval<size_t> allocationInterval,
-                  Allocation::BufferId bufferId);
+                  Allocation::BufferId bufferId,
+                  Allocation *allocation = nullptr, Value stageBasis = {});
 
   // Builder for accesses that represent accesses to the whole
   // allocation (scratch buffers, ArriveBarrierOp, ..)
@@ -63,6 +84,11 @@ public:
   bool intersects(const AllocationSlice &other) const;
 
   Allocation::BufferId getBufferId() const { return bufferId; }
+
+  // Transport a pending access into the counted loop's current-IV coordinates.
+  AllocationSlice enterStageLoop(Value induction, unsigned initialValue) const;
+  AllocationSlice advanceStageLoop(Value induction) const;
+  AllocationSlice forgetStageLoop() const;
 
   /// Translate shared-memory geometry and discard callee-local index facts.
   AllocationSlice
@@ -97,15 +123,32 @@ public:
   std::optional<unsigned> argumentIndex;
 
 private:
+  // An empty basis denotes a literal stage. A nonempty basis denotes
+  // (basis + offset) % numStages. Only an eligible counted loop supplies a
+  // basis.
+  struct StageInfo {
+    Value parent;
+    Value basis;
+    Interval<size_t> parentInterval{0, 0};
+    size_t stride = 0;
+    unsigned numStages = 0;
+    unsigned offset = 0;
+  } stage;
+  using StageKey = std::tuple<const void *, const void *, Interval<size_t>,
+                              size_t, unsigned, unsigned>;
+
   std::tuple<Interval<size_t>, Allocation::BufferId, const void *,
-             llvm::ArrayRef<int32_t>, const BufferIndexExpr *, const void *,
-             const void *, std::optional<unsigned>,
+             llvm::ArrayRef<int32_t>, StageKey, const BufferIndexExpr *,
+             const void *, const void *, std::optional<unsigned>,
              std::optional<triton::gpu::SharedKind>>
   asTuple() const {
     return {allocationInterval,
             bufferId,
             accessTy.getAsOpaquePointer(),
             subsliceOffsets,
+            {stage.parent.getAsOpaquePointer(),
+             stage.basis.getAsOpaquePointer(), stage.parentInterval,
+             stage.stride, stage.numStages, stage.offset},
             bufferIndexExpr,
             subsliceSource.getAsOpaquePointer(),
             physicalFootprint,
@@ -172,8 +215,12 @@ struct BlockInfo {
 
   // Thread ordering is independent of which physical addresses are accessed.
   struct ThreadSyncState {
+    // Issuers of pending effects that carry a payload.
     IssuerSummary effectIssuers;
     CompletionSync completion = CompletionSync::None;
+    // Issuers of pending waits, proxy fences and mbarrier arrivals. They carry
+    // no payload, so a later publication only needs them finished.
+    IssuerSummary syncIssuers;
     bool peerWaitNeedsSync = false;
 
     bool operator==(const ThreadSyncState &) const = default;
@@ -185,6 +232,9 @@ struct BlockInfo {
     // Only publication demands contribute to this issuer summary.
     IssuerSummary publicationIssuers;
     bool mayNotifyPeer = false;
+    // Some demand can take effect before every thread of its region reaches
+    // it.
+    bool mayIssueAhead = false;
 
     bool operator==(const ThreadDemandState &) const = default;
   } threadDemands;
@@ -192,7 +242,8 @@ struct BlockInfo {
   BlockInfo() = default;
 
   bool hasEffects() const {
-    return !threadSync.effectIssuers.empty() || !syncReadSlices.empty() ||
+    return !threadSync.effectIssuers.empty() ||
+           !threadSync.syncIssuers.empty() || !syncReadSlices.empty() ||
            !syncWriteSlices.empty();
   }
 
@@ -207,6 +258,25 @@ struct BlockInfo {
                                           slice.second.end());
     joinThreadState(other);
     return *this;
+  }
+
+  BlockInfo
+  mapSlices(const std::function<AllocationSlice(const AllocationSlice &)> &map)
+      const {
+    BlockInfo result;
+    // Stage transport re-coordinates slices only; thread ordering is
+    // coordinate-independent and must survive edge traversal and summaries.
+    result.threadSync = threadSync;
+    result.threadDemands = threadDemands;
+    auto transfer = [&](const SliceMapT &source, SliceMapT &destination) {
+      for (const auto &[slice, ops] : source) {
+        auto &mappedOps = destination[map(slice)];
+        mappedOps.insert(ops.begin(), ops.end());
+      }
+    };
+    transfer(syncReadSlices, result.syncReadSlices);
+    transfer(syncWriteSlices, result.syncWriteSlices);
+    return result;
   }
 
   template <typename Transform> void transformSlices(Transform transform) {
@@ -300,6 +370,11 @@ private:
   void joinThreadState(const BlockInfo &other);
 };
 
+/// Classify the barriers that synchronize local memory accesses in `op`
+/// relative to its memory effects.
+triton::BarrierStages getLocalBarrierStages(Operation *op,
+                                            Allocation *allocation);
+
 /// Tracks memory and thread-ordering state at the current program point and at
 /// function boundaries.
 struct MembarInfo {
@@ -362,16 +437,91 @@ struct MembarInfo {
   bool operator==(const MembarInfo &) const = default;
 };
 
-/// Classify the barriers that synchronize local memory accesses in `op`
-/// relative to its memory effects.
-triton::BarrierStages getLocalBarrierStages(Operation *op,
-                                            Allocation *allocation);
-
 //===----------------------------------------------------------------------===//
 // Shared Memory Barrier Analysis
 //===----------------------------------------------------------------------===//
 
-class MembarAnalysis : public triton::PostOrderFunctionAnalysis<MembarInfo> {
+// Shared stage-loop discovery and slice transport for membar and fence
+// analyses.
+class MembarStageAnalysis {
+protected:
+  // A deliberately bounded CF loop: preheader -> header -> body -> header,
+  // with a signed exclusive test, constant nonnegative start and unit step.
+  struct StageLoop {
+    Block *entry;
+    Block *header;
+    Block *body;
+    Value induction;
+    unsigned initialValue;
+  };
+  SmallVector<StageLoop> stageLoops;
+  void discoverStageLoops(FunctionOpInterface function);
+  Value getStageBasis(Operation *operation) const;
+  BlockInfo transferStageEdge(const BlockInfo &info, Block *from,
+                              Block *to) const;
+};
+
+/// Branches that can send some threads of an execution region one way and
+/// the rest the other, so that a barrier under them deadlocks. A condition can
+/// differ between the threads only if it depends on a thread, lane or warp ID,
+/// on a warp vote or ballot, on inline assembly, on a call or on an argument of
+/// a device function. Every thread of a region is assumed to run a loop equally
+/// often, so a branch that can leave a loop never splits it. A branch whose
+/// paths all stay in the loop can, even when one of them returns straight to
+/// the header.
+class DivergentControlFlow {
+public:
+  explicit DivergentControlFlow(Operation *function)
+      : function(function), dominance(function), postDominance(function) {}
+
+  /// Whether `op` is an scf.if, scf.index_switch, cf.cond_br or cf.switch that
+  /// is not a loop branch and whose condition can differ between threads.
+  bool isDivergentBranch(Operation *op);
+
+  /// Visits each operation that the divergent branch `op` may skip.
+  void walkSkippable(Operation *op, function_ref<void(Operation *)> visit);
+
+  /// Whether a divergent branch of its execution region may skip `op`.
+  bool isUnderDivergentBranch(Operation *op);
+
+private:
+  bool isLoopBranch(Operation *branch);
+  ArrayRef<Block *> getSkippableBlocks(Operation *branch);
+  bool mayDiverge(Value value);
+  void findDivergentValues();
+
+  Operation *function;
+  DominanceInfo dominance;
+  PostDominanceInfo postDominance;
+  DenseMap<Region *, std::unique_ptr<CFGLoopInfo>> loops;
+  DenseMap<Operation *, SmallVector<Block *>> skippableBlocks;
+  std::optional<DenseSet<Value>> divergentValues;
+  std::optional<DenseSet<Block *>> divergentBlocks;
+};
+
+// Common class to analyze fence placement with BlockInfo state.
+class MembarOrFenceAnalysis
+    : public triton::PostOrderFunctionAnalysis<BlockInfo>,
+      protected MembarStageAnalysis {
+public:
+  MembarOrFenceAnalysis(Allocation &allocation, MembarFilterFn filter,
+                        MembarScratchSync scratchSync = {})
+      : allocation(allocation), filter(std::move(filter)),
+        scratchSync(std::move(scratchSync)) {}
+
+  void run(FunctionOpInterface function, FuncMapT &funcMap);
+
+protected:
+  BlockInfo transferEdge(const BlockInfo &info, Block *from,
+                         Block *to) const override;
+
+  Allocation &allocation;
+  MembarFilterFn filter;
+  MembarScratchSync scratchSync;
+};
+
+class MembarAnalysis : public triton::PostOrderFunctionAnalysis<MembarInfo>,
+                       protected MembarStageAnalysis {
 public:
   enum class AccessMode { AllSharedAccesses, AllocatorAliasesOnly };
 
@@ -389,15 +539,23 @@ public:
   /// it is considered as the problem of the operation itself but not the membar
   /// analysis.
   MembarAnalysis(Allocation &allocation, MembarFilterFn filter,
+                 MembarScratchSync scratchSync,
                  triton::BufferRegionAnalysis &regions,
                  MembarSliceFilterFn sliceFilter = nullptr,
                  AccessMode accessMode = AccessMode::AllSharedAccesses)
       : allocation(allocation), filter(std::move(filter)), regions(regions),
+        divergence(allocation.getOperation()),
+        scratchSync(std::move(scratchSync)),
         sliceFilter(std::move(sliceFilter)), accessMode(accessMode),
         bufferIndexAnalysis(
             cast<FunctionOpInterface>(allocation.getOperation())) {}
 
+  void run(FunctionOpInterface function, FuncMapT &funcMap);
+
 private:
+  MembarInfo transferEdge(const MembarInfo &info, Block *from,
+                          Block *to) const override;
+
   void updateSuccessor(Operation *terminator, Block *successor,
                        MembarInfo *membarInfo) override;
 
@@ -418,9 +576,12 @@ protected:
   Operation *syncIfNeeded(Operation *operation, const BlockInfo &effects,
                           MembarInfo *membarInfo, OpBuilder *builder,
                           bool cluster = false);
-  Operation *insertBarrier(Operation *operation, OpBuilder *builder,
-                           bool cluster = false);
+  virtual Operation *insertBarrier(Operation *operation, OpBuilder *builder,
+                                   bool cluster = false);
   virtual triton::BarrierStages getBarrierStages(Operation *operation);
+  /// Returns true if the same block has a later wait or barrier, as classified
+  /// by getBarrierStages, before any memory effect or nested control flow.
+  bool hasSyncPointBeforeMemoryEffect(Operation *operation);
 
   /// Whether pending thread effects must rendezvous before upcoming demands.
   virtual bool requiresThreadSync(const BlockInfo &pending,
@@ -429,20 +590,37 @@ protected:
   Allocation &allocation;
   MembarFilterFn filter;
   triton::BufferRegionAnalysis &regions;
+  DivergentControlFlow divergence;
 
 private:
+  /// Whether pending thread effects must rendezvous before a divergent branch
+  /// because an operation it may skip needs them finished.
+  bool requiresSyncBeforeBranch(Operation *branch, const BlockInfo &pending);
+
+  MembarScratchSync scratchSync;
+  // Materialize only the final decisions, after CFG analysis has converged.
+  llvm::SmallPtrSet<Operation *, 16> scratchSyncOps;
   SmallVector<AllocationSlice>
-  getAllocationSlices(Value value,
-                      std::optional<triton::gpu::SharedKind> sharedKind);
+  getAllocationSlices(Value value, Value stageBasis = {},
+                      std::optional<triton::gpu::SharedKind> sharedKind = {});
   bool isRegionLocal(Value value);
   bool mayNotifyPeer(Operation *op);
+  bool waitsForWholeRegion(Operation *op);
   BlockInfo getThreadEffects(Operation *op);
   void addThreadDemand(BlockInfo &effects, Operation *op);
+  /// The thread effects and demands that `op` adds at its program point.
+  BlockInfo getOperationEffects(Operation *op);
 
   MembarSliceFilterFn sliceFilter;
   AccessMode accessMode;
   BufferIndexAnalysis bufferIndexAnalysis;
   DenseMap<Value, bool> regionLocalAllocations;
+  /// What an operation that a divergent branch may skip needs synchronized.
+  struct GuardedDemand {
+    BlockInfo::ThreadDemandState threadDemands;
+    bool missesBarrierLifetime;
+  };
+  DenseMap<Operation *, SmallVector<GuardedDemand>> branchDemands;
 };
 
 /// Inserts shared-memory and operation rendezvous barriers across a module,
@@ -451,8 +629,10 @@ private:
 class ModuleMembarAnalysis {
 public:
   ModuleMembarAnalysis(ModuleAllocation &moduleAllocation,
-                       MembarFilterFn filter = nullptr)
-      : moduleAllocation(moduleAllocation), filter(std::move(filter)) {}
+                       MembarFilterFn filter = nullptr,
+                       MembarScratchSync scratchSync = {})
+      : moduleAllocation(moduleAllocation), filter(std::move(filter)),
+        scratchSync(std::move(scratchSync)) {}
 
   void run();
 
@@ -469,16 +649,18 @@ public:
 
   template <typename AnalysisT>
   void runAnalysis(triton::BufferRegionAnalysis &regions) {
+    triton::encodeSharedMemoryBreakdown(moduleAllocation.getModuleOp());
     AnalysisT::runModule(
         moduleAllocation.getModuleOp(), [&](FunctionOpInterface function) {
           auto &allocation = *moduleAllocation.getFuncData(function);
-          return AnalysisT(allocation, filter, regions);
+          return AnalysisT(allocation, filter, scratchSync, regions);
         });
   }
 
 private:
   ModuleAllocation &moduleAllocation;
   MembarFilterFn filter;
+  MembarScratchSync scratchSync;
 };
 
 } // namespace mlir

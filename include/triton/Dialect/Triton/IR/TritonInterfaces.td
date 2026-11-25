@@ -4,9 +4,6 @@
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 
-// The optional mask or pred enables all elements when absent. An optional
-// other operand supplies the value for masked-off elements.
-def FoldTruePredicate : NativeOpTrait<"FoldTruePredicate">;
 def TensorSizeTrait : NativeOpTrait<"TensorSizeTrait">;
 def VerifyTensorLayoutsTrait : NativeOpTrait<"VerifyTensorLayoutsTrait">;
 def SameOperandsEncoding : NativeOpTrait<"SameOperandsEncoding">;
@@ -17,6 +14,8 @@ def SameLoadStoreOperandsAndResultShape : NativeOpTrait<"SameLoadStoreOperandsAn
 def SameLoadStoreOperandsEncoding : NativeOpTrait<"SameLoadStoreOperandsEncoding">;
 def SameLoadStoreOperandsAndResultEncoding : NativeOpTrait<"SameLoadStoreOperandsAndResultEncoding">;
 def AsyncRegions : NativeOpTrait<"AsyncRegions">;
+def AxisInfoPassthroughTrait : NativeOpTrait<"AxisInfoPassthroughTrait">;
+def MixedRadixLayoutTrait : NativeOpTrait<"MixedRadixLayoutTrait">;
 
 // A trait equivalent to InferTypeOpAdaptor, but that checks for structural
 // equivalence of the layouts of the result rather than just layout equality.

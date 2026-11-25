@@ -2983,7 +2983,7 @@ def test_tmem_index_subslice(device, fresh_knobs):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-@pytest.mark.parametrize("operation,pred", [("store", False), ("store", True), ("copy", False), ("copy", True)])
+@pytest.mark.parametrize("operation,pred", [("store", False), ("store", True), ("copy", True)])
 @pytest.mark.parametrize("column_slice", [False, True])
 def test_tmem_row_subslice(device, operation, pred, column_slice, fresh_knobs):
     _require_cuda_backend(device)
@@ -2994,7 +2994,7 @@ def test_tmem_row_subslice(device, operation, pred, column_slice, fresh_knobs):
 
     fresh_knobs.compilation.instrumentation_mode = "fpsan"
 
-    @gluon.jit(do_not_specialize=["pred"])
+    @gluon.jit
     def kernel(parent_ptr, value_ptr, view_out_ptr, parent_out_ptr, pred, OPERATION: gl.constexpr,
                COLUMN_SLICE: gl.constexpr, VIEW_N: gl.constexpr):
         parent = allocate_tensor_memory(gl.float32, [256, 128], TensorMemoryLayout([128, 64], col_stride=1))
@@ -3017,11 +3017,11 @@ def test_tmem_row_subslice(device, operation, pred, column_slice, fresh_knobs):
             smem.store(values)
             bar = mbarrier.allocate_mbarrier()
             mbarrier.init(bar, count=1)
-            tcgen05_copy(smem, view, pred=pred)
+            tcgen05_copy(smem, view)
             tcgen05_commit(bar)
             mbarrier.wait(bar, phase=0)
         else:
-            view.store(values, pred=pred)
+            view.store(values, pred=pred != 0)
 
         gl.store(view_out_ptr + view_rows * VIEW_N + view_cols, view.load(view_layout))
         gl.store(parent_out_ptr + parent_rows * 128 + parent_cols, parent.load(parent_layout))
@@ -3040,7 +3040,7 @@ def test_tmem_row_subslice(device, operation, pred, column_slice, fresh_knobs):
     parent_out = torch.empty_like(parent)
     kernel[(1, )](triton.TensorWrapper(parent, dtype=torch.float32), triton.TensorWrapper(value, dtype=torch.float32),
                   triton.TensorWrapper(view_out, dtype=torch.float32),
-                  triton.TensorWrapper(parent_out, dtype=torch.float32), pred, operation, column_slice, view_n,
+                  triton.TensorWrapper(parent_out, dtype=torch.float32), int(pred), operation, column_slice, view_n,
                   num_warps=4)
 
     _assert_payload_equal(view_out, expected_view)
@@ -3120,15 +3120,6 @@ def test_tmem_copy_scales_in_warp_specialize_partition(device, scale_shape, two_
     def copy_partition(smem, tmem, bar):
         tcgen05_copy(smem, tmem)
         tcgen05_commit(bar)
-
-    @gluon.jit
-    def load_partition(physical, bar, out_ptr):
-        mbarrier.wait(bar, phase=0)
-        mbarrier.invalidate(bar)
-        physical_reg_layout: gl.constexpr = physical.get_reg_layout()
-        copied = physical.load(physical_reg_layout)
-        out_ptrs = out_ptr + gl.arange(0, TMEM_ROWS)[:, None] * TMEM_COLS + gl.arange(0, TMEM_COLS)[None, :]
-        gl.store(gl.set_auto_layout(out_ptrs, physical_reg_layout), copied)
 
     @gluon.jit
     def default_partition():

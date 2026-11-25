@@ -48,6 +48,185 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#bridge = #ttg.linear<{register = [], lane = [[32], [16], [8], [4], [2], [1]], warp = [], block = []}>
+#predicate_register_order = #ttg.linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+#carried_register_order = #ttg.linear<{register = [[2], [1]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.target" = "hip:gfx950"} {
+// AMD-LABEL: llvm.func @lower_warp_predicate
+llvm.func @lower_warp_predicate(
+    %predicate_struct: !llvm.struct<(i1)>,
+    %init_struct: !llvm.struct<(i32)>) -> !llvm.struct<(i32)> {
+  %predicate = builtin.unrealized_conversion_cast %predicate_struct : !llvm.struct<(i1)> to tensor<64xi1, #blocked>
+
+  %init = builtin.unrealized_conversion_cast %init_struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+
+  // AMD: cf.cond_br %{{.*}}, ^[[BODY:bb[0-9]+]], ^[[MERGE:bb[0-9]+]](%{{.*}} : !llvm.struct<(i32)>)
+  %result = ttg.warp_predicate %predicate (%init) {
+    %two = llvm.mlir.constant(2 : i32) : i32
+    %yield_undef = llvm.mlir.undef : !llvm.struct<(i32)>
+    %yield_struct = llvm.insertvalue %two, %yield_undef[0] : !llvm.struct<(i32)>
+    %yield = builtin.unrealized_conversion_cast %yield_struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+    ttg.predicate_yield %yield : tensor<64xi32, #blocked>
+  } : (tensor<64xi1, #blocked>, tensor<64xi32, #blocked>) -> tensor<64xi32, #blocked>
+  %result_struct = builtin.unrealized_conversion_cast %result : tensor<64xi32, #blocked> to !llvm.struct<(i32)>
+  // AMD: ^[[BODY]]:
+  // AMD: cf.br ^[[MERGE]](%{{.*}} : !llvm.struct<(i32)>)
+  // AMD: ^[[MERGE]](%{{.*}}: !llvm.struct<(i32)>):
+  // AMD-NOT: ttg.warp_predicate
+  llvm.return %result_struct : !llvm.struct<(i32)>
+}
+
+// Partial conversion can add a tensor-to-tensor bridge on top of the LLVM
+// bridge when layout propagation retags a carried value. Lowering must walk the
+// complete chain to recover the false-path LLVM value.
+// AMD-LABEL: llvm.func @lower_bridged_warp_predicate
+// AMD: cf.cond_br %{{.*}}, ^[[BODY:bb[0-9]+]], ^[[MERGE:bb[0-9]+]](%{{.*}} : !llvm.struct<(i32)>)
+// AMD: ^[[BODY]]:
+// AMD: cf.br ^[[MERGE]](%{{.*}} : !llvm.struct<(i32)>)
+// AMD: ^[[MERGE]](%{{.*}}: !llvm.struct<(i32)>):
+// AMD-NOT: ttg.warp_predicate
+llvm.func @lower_bridged_warp_predicate(
+    %predicate_struct: !llvm.struct<(i1)>,
+    %init_struct: !llvm.struct<(i32)>) -> !llvm.struct<(i32)> {
+  %predicate = builtin.unrealized_conversion_cast %predicate_struct : !llvm.struct<(i1)> to tensor<64xi1, #blocked>
+  %init_bridge = builtin.unrealized_conversion_cast %init_struct : !llvm.struct<(i32)> to tensor<64xi32, #bridge>
+  %init = builtin.unrealized_conversion_cast %init_bridge : tensor<64xi32, #bridge> to tensor<64xi32, #blocked>
+  %result = ttg.warp_predicate %predicate (%init) {
+    %two = llvm.mlir.constant(2 : i32) : i32
+    %yield_undef = llvm.mlir.undef : !llvm.struct<(i32)>
+    %yield_struct = llvm.insertvalue %two, %yield_undef[0] : !llvm.struct<(i32)>
+    %yield = builtin.unrealized_conversion_cast %yield_struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+    ttg.predicate_yield %yield : tensor<64xi32, #blocked>
+  } : (tensor<64xi1, #blocked>, tensor<64xi32, #blocked>) -> tensor<64xi32, #blocked>
+  %result_struct = builtin.unrealized_conversion_cast %result : tensor<64xi32, #blocked> to !llvm.struct<(i32)>
+  llvm.return %result_struct : !llvm.struct<(i32)>
+}
+
+// AMD-LABEL: llvm.func @lower_scalar_warp_predicate(
+// AMD-SAME: %[[PREDICATE:.*]]: i1
+llvm.func @lower_scalar_warp_predicate(
+    %predicate: i1,
+    %init_struct: !llvm.struct<(i32)>) -> !llvm.struct<(i32)> {
+  %init = builtin.unrealized_conversion_cast %init_struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+
+  // AMD: cf.cond_br %[[PREDICATE]], ^[[BODY:bb[0-9]+]], ^[[MERGE:bb[0-9]+]](%{{.*}} : !llvm.struct<(i32)>)
+  %result = ttg.warp_predicate %predicate (%init) {
+    %two = llvm.mlir.constant(2 : i32) : i32
+    %yield_undef = llvm.mlir.undef : !llvm.struct<(i32)>
+    %yield_struct = llvm.insertvalue %two, %yield_undef[0] : !llvm.struct<(i32)>
+    %yield = builtin.unrealized_conversion_cast %yield_struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+    ttg.predicate_yield %yield : tensor<64xi32, #blocked>
+  } : (i1, tensor<64xi32, #blocked>) -> tensor<64xi32, #blocked>
+  %result_struct = builtin.unrealized_conversion_cast %result : tensor<64xi32, #blocked> to !llvm.struct<(i32)>
+  // AMD: ^[[BODY]]:
+  // AMD: cf.br ^[[MERGE]](%{{.*}} : !llvm.struct<(i32)>)
+  // AMD: ^[[MERGE]](%{{.*}}: !llvm.struct<(i32)>):
+  // AMD-NOT: ttg.warp_predicate
+  llvm.return %result_struct : !llvm.struct<(i32)>
+}
+
+// AMD-LABEL: llvm.func @lower_scalar_carried_warp_predicate(
+// AMD-SAME: %[[PREDICATE:.*]]: i1,
+// AMD-SAME: %[[INIT:.*]]: i32
+llvm.func @lower_scalar_carried_warp_predicate(
+    %predicate: i1,
+    %init: i32) -> i32 {
+  // AMD: cf.cond_br %[[PREDICATE]], ^[[BODY:bb[0-9]+]], ^[[MERGE:bb[0-9]+]](%[[INIT]] : i32)
+  %result = ttg.warp_predicate %predicate (%init) {
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %yield = llvm.add %init, %one : i32
+    ttg.predicate_yield %yield : i32
+  } : (i1, i32) -> i32
+  %two = llvm.mlir.constant(2 : i32) : i32
+  // AMD: ^[[BODY]]:
+  // AMD: cf.br ^[[MERGE]](%{{.*}} : i32)
+  // AMD: ^[[MERGE]](%[[RESULT:.*]]: i32):
+  // AMD: %[[SUM:.*]] = llvm.add %[[RESULT]], %{{.*}} : i32
+  %sum = llvm.add %result, %two : i32
+  // AMD: llvm.return %[[SUM]] : i32
+  // AMD-NOT: ttg.warp_predicate
+  llvm.return %sum : i32
+}
+
+// AMD-LABEL: llvm.func @lower_register_reordered_warp_predicate
+// AMD: cf.cond_br %{{.*}}, ^[[BODY:bb[0-9]+]], ^[[MERGE:bb[0-9]+]](%{{.*}} : !llvm.struct<(i32, i32, i32, i32)>)
+// AMD: ^[[BODY]]:
+// AMD: cf.br ^[[MERGE]](%{{.*}} : !llvm.struct<(i32, i32, i32, i32)>)
+// AMD: ^[[MERGE]](%{{.*}}: !llvm.struct<(i32, i32, i32, i32)>):
+// AMD-NOT: ttg.warp_predicate
+llvm.func @lower_register_reordered_warp_predicate(
+    %predicate_struct: !llvm.struct<(i1, i1, i1, i1)>,
+    %init_struct: !llvm.struct<(i32, i32, i32, i32)>) -> !llvm.struct<(i32, i32, i32, i32)> {
+  %predicate = builtin.unrealized_conversion_cast %predicate_struct : !llvm.struct<(i1, i1, i1, i1)> to tensor<256xi1, #predicate_register_order>
+  %init = builtin.unrealized_conversion_cast %init_struct : !llvm.struct<(i32, i32, i32, i32)> to tensor<256xi32, #carried_register_order>
+  %result = ttg.warp_predicate %predicate (%init) {
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %undef = llvm.mlir.undef : !llvm.struct<(i32, i32, i32, i32)>
+    %yield_struct = llvm.insertvalue %one, %undef[0] : !llvm.struct<(i32, i32, i32, i32)>
+    %yield = builtin.unrealized_conversion_cast %yield_struct : !llvm.struct<(i32, i32, i32, i32)> to tensor<256xi32, #carried_register_order>
+    ttg.predicate_yield %yield : tensor<256xi32, #carried_register_order>
+  } : (tensor<256xi1, #predicate_register_order>, tensor<256xi32, #carried_register_order>) -> tensor<256xi32, #carried_register_order>
+  %result_struct = builtin.unrealized_conversion_cast %result : tensor<256xi32, #carried_register_order> to !llvm.struct<(i32, i32, i32, i32)>
+  llvm.return %result_struct : !llvm.struct<(i32, i32, i32, i32)>
+}
+
+// AMD-LABEL: llvm.func @lower_chained_warp_predicates
+// AMD-COUNT-2: cf.cond_br
+// AMD-NOT: ttg.warp_predicate
+llvm.func @lower_chained_warp_predicates(
+    %predicate_struct: !llvm.struct<(i1)>,
+    %init_struct: !llvm.struct<(i32)>) -> !llvm.struct<(i32)> {
+  %predicate = builtin.unrealized_conversion_cast %predicate_struct : !llvm.struct<(i1)> to tensor<64xi1, #blocked>
+  %init = builtin.unrealized_conversion_cast %init_struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+
+  %first = ttg.warp_predicate %predicate (%init) {
+    %two = llvm.mlir.constant(2 : i32) : i32
+    %undef = llvm.mlir.undef : !llvm.struct<(i32)>
+    %struct = llvm.insertvalue %two, %undef[0] : !llvm.struct<(i32)>
+    %yield = builtin.unrealized_conversion_cast %struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+    ttg.predicate_yield %yield : tensor<64xi32, #blocked>
+  } : (tensor<64xi1, #blocked>, tensor<64xi32, #blocked>) -> tensor<64xi32, #blocked>
+
+  %second = ttg.warp_predicate %predicate (%first) {
+    %three = llvm.mlir.constant(3 : i32) : i32
+    %undef = llvm.mlir.undef : !llvm.struct<(i32)>
+    %struct = llvm.insertvalue %three, %undef[0] : !llvm.struct<(i32)>
+    %yield = builtin.unrealized_conversion_cast %struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+    ttg.predicate_yield %yield : tensor<64xi32, #blocked>
+  } : (tensor<64xi1, #blocked>, tensor<64xi32, #blocked>) -> tensor<64xi32, #blocked>
+
+  %result = builtin.unrealized_conversion_cast %second : tensor<64xi32, #blocked> to !llvm.struct<(i32)>
+  llvm.return %result : !llvm.struct<(i32)>
+}
+
+// AMD-LABEL: llvm.func @lower_nested_warp_predicates
+// AMD-COUNT-2: cf.cond_br
+// AMD-NOT: ttg.warp_predicate
+llvm.func @lower_nested_warp_predicates(
+    %predicate_struct: !llvm.struct<(i1)>,
+    %init_struct: !llvm.struct<(i32)>) -> !llvm.struct<(i32)> {
+  %predicate = builtin.unrealized_conversion_cast %predicate_struct : !llvm.struct<(i1)> to tensor<64xi1, #blocked>
+  %init = builtin.unrealized_conversion_cast %init_struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+
+  %outer = ttg.warp_predicate %predicate (%init) {
+    %inner = ttg.warp_predicate %predicate (%init) {
+      %two = llvm.mlir.constant(2 : i32) : i32
+      %undef = llvm.mlir.undef : !llvm.struct<(i32)>
+      %struct = llvm.insertvalue %two, %undef[0] : !llvm.struct<(i32)>
+      %yield = builtin.unrealized_conversion_cast %struct : !llvm.struct<(i32)> to tensor<64xi32, #blocked>
+      ttg.predicate_yield %yield : tensor<64xi32, #blocked>
+    } : (tensor<64xi1, #blocked>, tensor<64xi32, #blocked>) -> tensor<64xi32, #blocked>
+    ttg.predicate_yield %inner : tensor<64xi32, #blocked>
+  } : (tensor<64xi1, #blocked>, tensor<64xi32, #blocked>) -> tensor<64xi32, #blocked>
+
+  %result = builtin.unrealized_conversion_cast %outer : tensor<64xi32, #blocked> to !llvm.struct<(i32)>
+  llvm.return %result : !llvm.struct<(i32)>
+}
+}
+
+// -----
+
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.target" = "hip:gfx1250"} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
@@ -59,49 +238,15 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 // AMD-DAG: llvm.mlir.global internal @nbar4() {addr_space = 15 : i32}
 
 llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
-  // AMD-DAG: [[NBAR1:%.*]] = llvm.mlir.addressof @nbar1 : !llvm.ptr<15>
-  // AMD-DAG: [[NBAR2:%.*]] = llvm.mlir.addressof @nbar2 : !llvm.ptr<15>
-  // AMD-DAG: [[NBAR3:%.*]] = llvm.mlir.addressof @nbar3 : !llvm.ptr<15>
-
-  // AMD: llvm.cond_br %{{[0-9]+}}, [[DEFAULT:\^bb[0-9]+]], [[SWITCH_LOOP:\^bb[0-9]+]]
-
-  // AMD: [[SWITCH_LOOP]]:
-  // AMD-NEXT: rocdl.barrier
-  // AMD: llvm.switch
-  // AMD-NEXT: 0: [[PARTITION0:\^bb[0-9]+]],
-  // AMD-NEXT: 1: [[PARTITION1:\^bb[0-9]+]],
-  // AMD-NEXT: 2: [[PARTITION2:\^bb[0-9]+]],
-
-  // partition0
-  // AMD: [[PARTITION0]]:
-  // AMD-NEXT: rocdl.barrier
-  // AMD-NEXT: rocdl.s.barrier.join [[NBAR2]]
-  // AMD-NEXT: rocdl.s.barrier.signal.var [[NBAR2]] member_cnt = 4
-  // AMD-NEXT: rocdl.s.barrier.wait id = 1
+  // AMD: bb{{[0-9]+}}:
   // AMD-NEXT: rocdl.barrier
 
-  // partition1
-  // AMD: [[PARTITION1]]:
-  // AMD-NEXT: rocdl.barrier
-  // AMD-NEXT: rocdl.s.barrier.join [[NBAR3]]
-  // AMD-NEXT: rocdl.s.barrier.signal.var [[NBAR3]] member_cnt = 2
-  // AMD-NEXT: rocdl.s.barrier.wait id = 1
-  // AMD-NEXT: rocdl.barrier
-
-  // partition2
-  // AMD: [[PARTITION2]]:
-  // AMD-NEXT: rocdl.barrier
-  // AMD-NEXT: rocdl.wave.barrier
-  // AMD-NEXT: rocdl.barrier
-
-  // default partition
-  // AMD: [[DEFAULT]]:
-  // AMD: llvm.br [[DEFAULT_REGION:\^bb[0-9]+]]
-  // AMD: [[DEFAULT_REGION]]:
-  // AMD-NEXT: rocdl.s.barrier.join [[NBAR1]]
-  // AMD-NEXT: rocdl.s.barrier.signal.var [[NBAR1]] member_cnt = 4
-  // AMD-NEXT: rocdl.s.barrier.wait id = 1
-  // AMD-NEXT: rocdl.barrier
+  // Check that named barriers are used and that we have the correct counts:
+  // AMD-DAG-COUNT-6: rocdl.s.barrier.join {{.*}} : !llvm.ptr<15>
+  // AMD-DAG-COUNT-4: rocdl.s.barrier.signal.var {{.*}} member_cnt = 4
+  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}} member_cnt = 2
+  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}} member_cnt = 1
+  // AMD-DAG-COUNT-6: rocdl.s.barrier.wait id = 1
 
   rocdl.barrier
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 10>}
@@ -129,7 +274,7 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
 
 // -----
 
-module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32} {
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32, "ttng.warp_specialize_barrier_ids" = array<i32: 2, 4, 5>} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
 
@@ -168,8 +313,8 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   // CHECK-DAG: [[CST:%.*]] = llvm.mlir.constant({{.*}}) : f32
   // CHECK-DAG: [[C0:%.*]] = llvm.mlir.constant(0 : i32)
   // CHECK-DAG: [[C2:%.*]] = llvm.mlir.constant(2 : i32)
-  // CHECK-DAG: [[C3:%.*]] = llvm.mlir.constant(3 : i32)
   // CHECK-DAG: [[C4:%.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK-DAG: [[C5:%.*]] = llvm.mlir.constant(5 : i32)
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 10>}
   default {
     llvm.call @inner_func_nw4() : () -> ()
@@ -183,13 +328,13 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
     ttg.warp_return
   }
   partition1() num_warps(2) {
-    // CHECK: call @inner_func_nw2_ws([[CST]], [[C3]]) : (f32, i32) -> ()
+    // CHECK: call @inner_func_nw2_ws([[CST]], [[C4]]) : (f32, i32) -> ()
     %cst = llvm.mlir.constant(4.2 : f32) : f32
     llvm.call @inner_func_nw2(%cst) : (f32) -> ()
     ttg.warp_return
   }
   partition2() num_warps(1) {
-    // CHECK: call @inner_func_nw1_ws([[C4]]) : (i32) -> ()
+    // CHECK: call @inner_func_nw1_ws([[C5]]) : (i32) -> ()
     llvm.call @inner_func_nw1() : () -> ()
     ttg.warp_return
   } : () -> ()
@@ -228,7 +373,7 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: [[WID:%.*]] = llvm.udiv [[TIDX]], [[C32]]
   // CHECK-NEXT: [[WARP_ID:%.*]] = nvvm.shfl.sync idx [[CNEG1]], [[WID]], [[C0]], [[C31]]
   // CHECK-NEXT: [[IS_DEFAULT:%.*]] = llvm.icmp "ult" [[WARP_ID]], [[C4]]
-  // CHECK-NEXT: llvm.cond_br [[IS_DEFAULT]], [[BODY:\^.*]], [[SWITCH_LOOP:\^.*]]
+  // CHECK-NEXT: llvm.cond_br [[IS_DEFAULT]] weights([4, 7]), [[BODY:\^.*]], [[SWITCH_LOOP:\^.*]]
 
   // CHECK: [[SWITCH_LOOP]]:
   // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
@@ -577,42 +722,22 @@ llvm.func @partition_warpid_order() attributes {allocation.offset = 32 : i32} {
 
 // -----
 
-module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 18 : i32} {
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 5 : i32} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
 
-// CHECK-LABEL: @warpid_warp_specialize
-llvm.func @warpid_warp_specialize() attributes {allocation.offset = 32 : i32} {
-  // CHECK-DAG: [[C4:%.*]] = llvm.mlir.constant(4 : i32)
-  // CHECK-DAG: [[C6:%.*]] = llvm.mlir.constant(6 : i32)
-
-  // Partition warp IDs are rewritten to be relative in this pass, while
-  // keeping ttg.warp_id for NVGPUToLLVM to lower later.
-  // CHECK: %{{.*}} = ttg.warp_id
-  // CHECK-NEXT: [[REL0:%.*]] = llvm.sub %{{.*}}, [[C6]] : i32
-  // CHECK-NEXT: "use"([[REL0]]) : (i32) -> ()
-
-  // CHECK: %{{.*}} = ttg.warp_id
-  // CHECK-NEXT: [[REL1:%.*]] = llvm.sub %{{.*}}, [[C4]] : i32
-  // CHECK-NEXT: "use"([[REL1]]) : (i32) -> ()
-
-  %0 = ttg.warp_id
-  "use"(%0) : (i32) -> ()
-
-  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 6, 4>}
+// CHECK-LABEL: @warpid_one_warp_partition
+llvm.func @warpid_one_warp_partition() attributes {allocation.offset = 32 : i32} {
+  // CHECK: [[C0:%.*]] = llvm.mlir.constant(0 : i32) : i32
+  // CHECK-NOT: ttg.warp_id
+  // CHECK: "use"([[C0]]) : (i32) -> ()
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
   default {
-    %1 = ttg.warp_id
-    "use"(%1) : (i32) -> ()
     ttg.warp_yield
   }
-  partition0() num_warps(4) {
-    %1 = ttg.warp_id
-    "use"(%1) : (i32) -> ()
-    ttg.warp_return
-  }
-  partition1() num_warps(2) {
-    %1 = ttg.warp_id
-    "use"(%1) : (i32) -> ()
+  partition0() num_warps(1) {
+    %0 = ttg.warp_id
+    "use"(%0) : (i32) -> ()
     ttg.warp_return
   } : () -> ()
   llvm.return
@@ -1281,6 +1406,116 @@ llvm.func @dynamic_register_reallocation_overalloc() attributes {allocation.offs
 
 // -----
 
+module attributes {tlx.enable_paired_cta_mma = true, "tlx.cluster_sync_kernel_init" = true, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 6 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @paired_cta_cluster_sync
+
+// non default warps arrive before jumping to switch loop
+// CHECK: llvm.inline_asm
+// CHECK-SAME: @!$0 barrier.cluster.arrive.relaxed.aligned
+// CHECK-NEXT: llvm.cond_br
+
+// default warps keep arrive/wait after bar init
+// CHECK: mbarrier.init.shared::cta.b64
+// CHECK-NEXT: nvvm.cluster.arrive aligned
+// CHECK-NEXT: nvvm.cluster.wait aligned
+
+llvm.func @paired_cta_cluster_sync(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
+  %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
+  nvvm.cluster.arrive aligned
+  nvvm.cluster.wait aligned
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    %1 = llvm.mlir.constant(32 : i32) : i32
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+}
+
+// -----
+
+// Test that explicit_cluster_sync suppresses the auto-inserted
+// barrier.cluster.arrive.aligned for non-default warps. When the user manages
+// cluster sync manually, the compiler must not inject the predicated arrive
+// before the default/partition branch.
+module attributes {tlx.enable_paired_cta_mma = true, tlx.explicit_cluster_sync = true, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 6 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @explicit_cluster_sync_no_ws_arrive
+
+// No cluster arrive for non-default warps, because of explicit cluster sync mod attr
+// CHECK-NOT: barrier.cluster.arrive
+// CHECK-NOT: nvvm.cluster.arrive
+
+llvm.func @explicit_cluster_sync_no_ws_arrive(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
+  %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
+  nvvm.cluster.wait aligned
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    %1 = llvm.mlir.constant(32 : i32) : i32
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+}
+
+// -----
+
+// Test cluster sync insertion for both init and cleanup phases.
+// Init: non-default warps arrive before entering the switch loop so default
+//       warps can complete cluster-wide bar init.
+// Cleanup: non-default warps arrive at partition end so default warps can
+//          proceed with cluster-wide TMEM dealloc.
+module attributes {"tlx.cluster_sync_kernel_init" = true, "tlx.cluster_sync_kernel_cleanup" = true, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 6 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @cluster_sync_init_and_cleanup
+
+// Init: non-default warps arrive before the default/partition branch
+// CHECK: llvm.inline_asm
+// CHECK-SAME: @!$0 barrier.cluster.arrive.relaxed.aligned
+// CHECK-NEXT: llvm.cond_br
+
+// Cleanup: non-default warps arrive at partition end before looping back
+// CHECK: "use"
+// CHECK: nvvm.cluster.arrive aligned
+// CHECK-NEXT: llvm.br
+
+// Default warps: arrive/wait after bar init
+// CHECK: mbarrier.init.shared::cta.b64
+// CHECK-NEXT: nvvm.cluster.arrive aligned
+// CHECK-NEXT: nvvm.cluster.wait aligned
+
+llvm.func @cluster_sync_init_and_cleanup(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
+  %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
+  nvvm.cluster.arrive aligned
+  nvvm.cluster.wait aligned
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    %1 = llvm.mlir.constant(42 : i32) : i32
+    "use"(%1) : (i32) -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+}
+
+// -----
+
 module attributes {ttg.maxnreg = 80 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 8 : i32} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
@@ -1296,6 +1531,109 @@ llvm.func @gsan_dynamic_register_reallocation_disabled() attributes {allocation.
   }
   partition0() num_warps(4) {
     "partition0"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
+// When the module is marked single-warp-specialize, worker warps are dispatched
+// to their partition directly from `wid` -- there is no SMEM state-id load and
+// no switch table, and each partition branches to the shared exit/return block
+// instead of looping back to the switch. The dispatch is target independent, so
+// it is checked with COMMON for both the NVIDIA and AMD backends.
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 16 : i32, "ttg.single-warp-specialize" = true} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// COMMON-LABEL: @single_ws_dispatch
+llvm.func @single_ws_dispatch() attributes {allocation.offset = 32 : i32} {
+  // COMMON: llvm.cond_br %{{.*}}, [[BODY:\^bb[0-9]+]], [[SWITCH_LOOP:\^bb[0-9]+]]
+
+  // COMMON: [[SWITCH_LOOP]]:
+  // No SMEM state id: neither a state load nor a switch table is generated.
+  // COMMON-NOT: llvm.switch
+  // COMMON-NOT: llvm.load
+  // COMMON: [[UGE_HI:%.*]] = llvm.icmp "uge" [[WID:%.*]], %{{.*}}
+  // COMMON-NEXT: llvm.cond_br [[UGE_HI]], [[P2:\^bb[0-9]+]], [[NEXT:\^bb[0-9]+]]
+  // COMMON: [[NEXT]]:
+  // COMMON-NEXT: [[UGE_LO:%.*]] = llvm.icmp "uge" [[WID]], %{{.*}}
+  // COMMON-NEXT: llvm.cond_br [[UGE_LO]], [[P1:\^bb[0-9]+]], [[P0PRE:\^bb[0-9]+]]
+  // COMMON: [[P0PRE]]:
+  // COMMON-NEXT: llvm.br [[P0:\^bb[0-9]+]]
+
+  // COMMON: [[EXIT:\^bb[0-9]+]]:
+  // COMMON-NEXT: llvm.return
+
+  // Each partition runs once and branches to the exit block (no loop back).
+  // COMMON: [[P0]]:
+  // COMMON: "partition0"
+  // COMMON-NEXT: llvm.br [[EXIT]]
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 12>}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  }
+  partition1() num_warps(4) {
+    "partition1"() : () -> ()
+    ttg.warp_return
+  }
+  partition2() num_warps(4) {
+    "partition2"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
+// Single-warp-specialize keeps the register de-allocation on entry to each
+// region (SwitchLoopStart / WorkerPartitionStart / DefaultPartitionStart) but
+// drops the restoration at region end: warp_return and warp_yield no longer
+// emit a trailing barrier or setmaxregister. NVIDIA-specific (setmaxregister).
+module attributes {ttg.maxnreg = 80 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 16 : i32, "ttg.single-warp-specialize" = true} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @single_ws_no_end_realloc
+llvm.func @single_ws_no_end_realloc() attributes {allocation.offset = 0 : i32} {
+  // Entry de-allocation in the switch loop is preserved.
+  // CHECK: nvvm.setmaxregister decrease 24
+
+  // A partition restores its registers on entry, then ends with just a branch:
+  // no trailing barrier and no setmaxregister restore.
+  // CHECK: nvvm.setmaxregister increase 80
+  // CHECK-NEXT: nvvm.barrier id = %{{[0-9]+}} aligned = false
+  // CHECK-NEXT: "partition0"
+  // CHECK-NEXT: llvm.br
+
+  // The default region likewise ends with just a branch.
+  // CHECK: "default"
+  // CHECK-NEXT: llvm.br
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 12>, actualRegisters = array<i32: 152, 80, 48, 128>}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  }
+  partition1() num_warps(4) {
+    "partition1"() : () -> ()
+    ttg.warp_return
+  }
+  partition2() num_warps(4) {
+    "partition2"() : () -> ()
     ttg.warp_return
   } : () -> ()
   llvm.return

@@ -1,0 +1,1749 @@
+import enum
+import hashlib
+from abc import abstractmethod
+from typing import List, Optional, Tuple
+
+import triton.language.core as tl
+from triton._C.libtriton import ir
+from triton.language.core import _aggregate as aggregate
+from triton.runtime.jit import constexpr_function
+
+
+def _freeze_layout_value(value):
+    # Not tl._unwrap_if_constexpr: it also recurses into lists, doubling the walk.
+    while isinstance(value, tl.constexpr):
+        value = value.value
+    if isinstance(value, (list, tuple)):
+        return tuple([_freeze_layout_value(v) for v in value])
+    return value
+
+
+class _value_semantics:
+    """Equality, hashing and repr derived from the instance fields.
+
+    Layouts are passed to kernels as constexprs, so they become part of the
+    JIT kernel cache key: hashing must follow the fields, or a layout rebuilt
+    on every launch adds a new cache entry each time; repr must show the
+    fields, or two different layouts share a compiled-kernel key.
+
+    The normalized fields and their hash are computed once, on the first
+    hash/eq/repr, because the JIT hashes the key on every launch. From then on
+    the object is frozen: setting an attribute raises, and a modified layout
+    must be made with `copy.copy`, which drops the memo.
+    """
+
+    _VALUE_KEY = "_value_key_memo"
+
+    def _value_key(self):
+        key = self.__dict__.get(self._VALUE_KEY)
+        if key is None:
+            fields = tuple(sorted((k, _freeze_layout_value(v)) for k, v in vars(self).items()))
+            key = (fields, hash((type(self), fields)))
+            object.__setattr__(self, self._VALUE_KEY, key)
+        return key
+
+    def _fields(self):
+        return self._value_key()[0]
+
+    def __setattr__(self, name, value):
+        if self._VALUE_KEY in self.__dict__:
+            raise AttributeError(f"{type(self).__name__} is immutable once hashed, compared or printed; "
+                                 f"use copy.copy() to derive a layout with a different {name!r}")
+        object.__setattr__(self, name, value)
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state.pop(self._VALUE_KEY, None)
+        return state
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        return (type(self) is type(other) and self._value_key()[1] == other._value_key()[1]
+                and self._fields() == other._fields())
+
+    def __hash__(self):
+        return self._value_key()[1]
+
+    def __repr__(self):
+        fields = ", ".join(f"{k}={v!r}" for k, v in self._fields())
+        return f"{self.__class__.__name__}<{fields}>"
+
+
+class layout_encoding(_value_semantics):
+    """Base class for every TLX layout that lowers to an MLIR layout attribute.
+
+    Two families live under this base:
+      - **memory** encodings (`shared_layout_encoding`, `tensor_memory_*`): how a
+        buffer is laid out in smem/tmem. Self-describing; `to_ir` needs only the
+        builder.
+      - **distributed/register** encodings (`layout`, `DummyRegisterLayoutEncoding`):
+        how a loaded value is spread across threads/registers. These may need the
+        consuming tensor's `shape`/`element_type` to materialize, hence the
+        optional args on `to_ir`.
+    """
+
+    def __init__(self):
+        pass
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
+
+
+class shared_layout_encoding(layout_encoding):
+
+    def __init__(self):
+        super().__init__()
+
+    # Create a new layout object that is a permutation of the current layout.
+    @abstractmethod
+    def make_permute(self, dims):
+        raise NotImplementedError(f"{self.__class__.__name__}.make_permute() must be overridden in subclasses")
+
+    def to_ir(self, builder: ir.builder) -> None:
+        raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
+
+
+class swizzled_shared_layout_encoding(shared_layout_encoding):
+
+    def __init__(
+        self,
+        vectorSize,
+        perPhase,
+        maxPhase,
+        order,
+        numCTAs,
+        numCTAsPerCGA,
+        numCTASplit,
+        numCTAOrder,
+    ):
+        super().__init__()
+        self.vectorSize = vectorSize
+        self.perPhase = perPhase
+        self.maxPhase = maxPhase
+        self.order = order
+        self.numCTAs = numCTAs
+        self.numCTAsPerCGA = numCTAsPerCGA
+        self.numCTASplit = numCTASplit
+        self.numCTAOrder = numCTAOrder
+
+    # Make a default non-swizzled shared layout encoding.
+    @classmethod
+    def make_default(cls, rank):
+        return cls(
+            vectorSize=1,
+            perPhase=1,
+            maxPhase=1,
+            order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
+            numCTAs=[1] * rank,
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(reversed(range(rank))),
+        )
+
+    # Create a new layout that is a permutation of the given layout.
+    def make_permute(self, dims):
+        permuted_order = tuple(self.order[d] for d in dims)
+        return swizzled_shared_layout_encoding(
+            self.vectorSize,
+            self.perPhase,
+            self.maxPhase,
+            permuted_order,
+            self.numCTAs,
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+        )
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_swizzled_shared_encoding_attr(
+            self.vectorSize,
+            self.perPhase,
+            self.maxPhase,
+            self.order,
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+        )
+
+
+class swizzled_layout:
+    """A CuTe ``Swizzle<B, M, S>`` shared-memory layout.
+
+    Constructed exactly like ``cute::Swizzle<B, M, S>`` with three positional
+    bit-count args, e.g. ``tlx.swizzled_layout(3, 3, 3)``. Use it directly as a
+    ``tlx.local_alloc(..., layout=...)`` layout; it lowers to ``#ttg.swizzled_shared``.
+
+      - ``bits``  (B): log2 number of XOR phases      -> ``maxPhase = 2**B``
+      - ``base``  (M): log2 unswizzled contiguous unit -> ``vec = 2**M``
+      - ``shift`` (S): distance between the XOR'd bit fields in log2 units
+
+    ``order`` lists axes fastest-varying first (like the Triton encoding); it may
+    be omitted, in which case a row-major default is used once the rank is known.
+
+    Because CuTe's ``S`` is defined on the flat offset while Triton's ``perPhase``
+    is per-row, the layout is resolved to concrete ``(vec, perPhase, maxPhase)`` only
+    once the buffer shape is known (at ``local_alloc``), via the inverse of
+    ``DumpLayout``'s ``emitCuteSwizzle``::
+
+        vec      = 2**base
+        maxPhase = 2**bits
+        perPhase = 2**(shift + base) // numContig   # numContig = shape[order[0]]
+
+    A no-op (non-swizzled) default is ``swizzled_layout.make_default(rank)``
+    (``Swizzle<0,0,0>``), which is shape-independent and resolves eagerly.
+    """
+
+    def __init__(self, bits, base=0, shift=0, order=None):
+        self.bits = int(tl._unwrap_if_constexpr(bits))  # B
+        self.base = int(tl._unwrap_if_constexpr(base))  # M
+        self.shift = int(tl._unwrap_if_constexpr(shift))  # S
+        order = tl._unwrap_if_constexpr(order)
+        self.order = ([int(tl._unwrap_if_constexpr(dim)) for dim in order] if order is not None else None)
+
+    @classmethod
+    def make_default(cls, rank):
+        # No swizzle (Swizzle<0,0,0>), row-major order.
+        return cls(bits=0, base=0, shift=0, order=list(reversed(range(rank))))
+
+    @property
+    def maxPhase(self):
+        return 1 << self.bits
+
+    @property
+    def vectorSize(self):
+        return 1 << self.base
+
+    def __repr__(self):
+        return f"swizzled_layout(Swizzle<{self.bits},{self.base},{self.shift}>, order={self.order})"
+
+    def __eq__(self, other):
+        return (isinstance(other, swizzled_layout) and self.bits == other.bits and self.base == other.base
+                and self.shift == other.shift and self.order == other.order)
+
+    def __hash__(self):
+        return hash((self.bits, self.base, self.shift, tuple(self.order) if self.order else None))
+
+    def _to_encoding(self, shape=None):
+        """Resolve to a concrete swizzled_shared_layout_encoding for `shape`.
+
+        `shape` is required for a real swizzle (maxPhase > 1); the trivial
+        default (maxPhase == 1) is shape-independent.
+        """
+        if self.order is not None:
+            rank = len(self.order)
+        elif shape is not None:
+            rank = len(shape)
+        else:
+            raise ValueError("swizzled_layout: cannot resolve without an order or a shape")
+        order = list(self.order) if self.order is not None else list(reversed(range(rank)))
+        vec = 1 << self.base
+        maxPhase = 1 << self.bits
+        if maxPhase == 1:
+            perPhase = 1
+        else:
+            if shape is None:
+                raise ValueError("swizzled_layout: a non-trivial Swizzle requires the buffer shape; "
+                                 "pass it via tlx.local_alloc(..., layout=tlx.swizzled_layout(...))")
+            numContig = int(shape[order[0]])
+            span = 1 << (self.shift + self.base)
+            assert span % numContig == 0, (
+                f"swizzled_layout: Swizzle<{self.bits},{self.base},{self.shift}> gives perPhase < 1 "
+                f"for contiguous extent {numContig} (need shift + base >= log2(numContig))")
+            perPhase = span // numContig
+        return swizzled_shared_layout_encoding(
+            vec,
+            perPhase,
+            maxPhase,
+            order,
+            [1] * rank,
+            [1] * rank,
+            [1] * rank,
+            list(reversed(range(rank))),
+        )
+
+
+class padded_shared_layout_encoding(shared_layout_encoding):
+    """Padded shared encoding with an identity offset map.
+
+    Mirrors ``ttg.padded_shared`` in the identity form:
+    ``padded_shared<[interval_0:+pad_0, ...] {order = ..., shape = ...}>``.
+    """
+
+    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder, offset_bases=None,
+                 block_bases=None):
+        super().__init__()
+        assert len(intervals) == len(paddings), \
+            "intervals and paddings must have the same length"
+        self.intervals = list(intervals)
+        self.paddings = list(paddings)
+        self.order = list(order)
+        self.shape = list(shape)
+        self.numCTAsPerCGA = list(numCTAsPerCGA)
+        self.numCTASplit = list(numCTASplit)
+        self.numCTAOrder = list(numCTAOrder)
+        # When set, the layout is built from an explicit linear component
+        # (offset/block bases) instead of the identity {order, shape} form.
+        self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
+        self.block_bases = None if block_bases is None else [list(b) for b in block_bases]
+
+    @staticmethod
+    @constexpr_function
+    def with_bases(interval_padding_pairs, offset_bases, shape, block_bases=None):
+        """Build a padded_shared encoding with an explicit linear component.
+
+        Mirrors ``#ttg.padded_shared<[i:+p, ...] {offset = [...], block = [...]}>``.
+        ``offset_bases`` is a list of per-dim base vectors (one per offset bit),
+        e.g. ``[[0, 1], [0, 2], ..., [16, 0], [1, 0], ...]`` — this lets you pin
+        a swizzled (row/col-permuted) shared layout rather than the identity one.
+        """
+        rank = len(shape)
+        assert rank > 0, "shape must be non-empty"
+        assert len(offset_bases) > 0, "offset_bases must be non-empty"
+        for b in offset_bases:
+            assert len(b) == rank, \
+                f"each offset base vector must have length rank={rank}, got {len(b)}: {b}"
+        for b in (block_bases or []):
+            assert len(b) == rank, \
+                f"each block base vector must have length rank={rank}, got {len(b)}: {b}"
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        enc = padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(reversed(range(rank))),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+            offset_bases=[[int(x) for x in b] for b in offset_bases],
+            block_bases=[[int(x) for x in b] for b in (block_bases or [])],
+        )
+        return enc
+
+    @staticmethod
+    @constexpr_function
+    def with_identity_for(interval_padding_pairs, shape, order=None):
+        rank = len(shape)
+        if order is None:
+            order = list(reversed(range(rank)))
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        return padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(order),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+        )
+
+    def make_permute(self, dims):
+        permuted_order = [self.order[d] for d in dims]
+        permuted_shape = [self.shape[d] for d in dims]
+        return padded_shared_layout_encoding(
+            intervals=self.intervals,
+            paddings=self.paddings,
+            order=permuted_order,
+            shape=permuted_shape,
+            numCTAsPerCGA=self.numCTAsPerCGA,
+            numCTASplit=self.numCTASplit,
+            numCTAOrder=self.numCTAOrder,
+            # Explicit bases map offsets to coordinates; permute their components.
+            offset_bases=None if self.offset_bases is None else [[base[d] for d in dims] for base in self.offset_bases],
+            block_bases=None if self.block_bases is None else [[base[d] for d in dims] for base in self.block_bases],
+        )
+
+    def to_ir(self, builder: ir.builder) -> None:
+        if self.offset_bases is not None:
+            return builder.make_padded_shared_encoding_attr_with_bases(
+                self.intervals,
+                self.paddings,
+                self.offset_bases,
+                self.block_bases if self.block_bases is not None else [],
+                len(self.shape),
+            )
+        return builder.make_padded_shared_encoding_attr(
+            self.intervals,
+            self.paddings,
+            self.order,
+            [int(s) for s in self.shape],
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+        )
+
+
+class partitioned_shared_layout_encoding(shared_layout_encoding):
+    """Split a tensor's pieces between physical LDS partitions on gfx1250.
+
+    ``partition_layout`` describes one piece. Along ``partition_dim``, each
+    of ``num_groups`` groups contains ``num_partitions`` consecutive pieces.
+    """
+
+    def __init__(self, num_partitions, num_groups, partition_dim, partition_layout):
+        super().__init__()
+        self.num_partitions = int(num_partitions)
+        self.num_groups = int(num_groups)
+        self.partition_dim = int(partition_dim)
+        self.partition_layout = tl._unwrap_if_constexpr(partition_layout)
+        for name, value in (("num_partitions", self.num_partitions), ("num_groups", self.num_groups)):
+            if value <= 0 or value & (value - 1):
+                raise ValueError(f"{name} must be a positive power of two")
+        if self.partition_dim < 0:
+            raise ValueError("partition_dim must be non-negative")
+        if not isinstance(self.partition_layout, shared_layout_encoding):
+            raise TypeError("partition_layout must be a shared-memory layout")
+
+    def make_permute(self, dims):
+        return partitioned_shared_layout_encoding(self.num_partitions, self.num_groups,
+                                                  tuple(dims).index(self.partition_dim),
+                                                  self.partition_layout.make_permute(dims))
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_partitioned_shared_encoding_attr(self.num_partitions, self.num_groups, self.partition_dim,
+                                                             self.partition_layout.to_ir(builder))
+
+
+class shared_linear_layout_encoding(shared_layout_encoding):
+    """Explicit linear shared-memory mapping used by Gluon K-tile paths.
+
+    Unlike :class:`padded_shared_layout_encoding`, this encoding has no
+    implicit interval padding. Each offset basis maps one shared-memory bit
+    to a tensor dimension. NVMMA layouts can also defer materializing these
+    bases until an IR builder is available.
+    """
+
+    def __init__(self, offset_bases, block_bases=None, alignment=16):
+        super().__init__()
+        self.offset_bases = [list(map(int, basis)) for basis in offset_bases]
+        self.block_bases = [list(map(int, basis)) for basis in (block_bases or [])]
+        self.alignment = int(alignment)
+        self._nv_mma_atom = None
+        assert self.offset_bases and len(self.offset_bases[0]) > 0
+        rank = len(self.offset_bases[0])
+        assert all(len(basis) == rank for basis in self.offset_bases)
+        assert all(len(basis) == rank for basis in self.block_bases)
+        assert self.alignment > 0 and (self.alignment & (self.alignment - 1)) == 0
+
+    @classmethod
+    def from_nv_mma(cls, atom_layout, tile_shape, alignment=1024):
+        result = cls.__new__(cls)
+        shared_layout_encoding.__init__(result)
+        result.offset_bases = []
+        result.block_bases = []
+        result.alignment = int(alignment)
+        result._nv_mma_atom = atom_layout
+        result.tile_shape = list(map(int, tile_shape))
+        assert len(result.tile_shape) == len(atom_layout.shape)
+        assert result.alignment > 0 and (result.alignment & (result.alignment - 1)) == 0
+        return result
+
+    def make_permute(self, dims):
+        if self._nv_mma_atom is not None:
+            return shared_linear_layout_encoding.from_nv_mma(
+                self._nv_mma_atom.make_permute(dims),
+                [self.tile_shape[d] for d in dims],
+                self.alignment,
+            )
+        # SharedLinear is used as a physical image; preserve the bit bases and
+        # let the consumer's memdesc_trans describe the logical permutation.
+        return self
+
+    def to_ir(self, builder: ir.builder) -> None:
+        if self._nv_mma_atom is None:
+            return builder.make_shared_linear_encoding_attr(self.offset_bases, self.block_bases, self.alignment)
+        atom = self._nv_mma_atom
+        return builder.make_nv_mma_tiled_shared_linear_encoding_attr(
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.shape],
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.order],
+            atom.elemType.to_ir(builder),
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.numCTAsPerCGA],
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.numCTASplit],
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.numCTAOrder],
+            bool(tl._unwrap_if_constexpr(atom.fp4Padded)),
+            bool(tl._unwrap_if_constexpr(atom.swizzled)),
+            self.tile_shape,
+            self.alignment,
+        )
+
+
+class nv_mma_layout(layout_encoding):
+    """NVIDIA Hopper WGMMA accumulator/register layout."""
+
+    def __init__(self, warps_per_cta, instr_shape, version=(3, 0), cga_layout=None):
+        super().__init__()
+        self.version = list(map(int, tl._unwrap_if_constexpr(version)))
+        self.warps_per_cta = list(map(int, tl._unwrap_if_constexpr(warps_per_cta)))
+        self.instr_shape = list(map(int, tl._unwrap_if_constexpr(instr_shape)))
+        cga_layout = tl._unwrap_if_constexpr(cga_layout)
+        self.cga_layout = [list(map(int, basis)) for basis in (cga_layout or [])]
+        assert self.version == [3, 0], "nv_mma_layout currently supports Hopper WGMMA only"
+        assert len(self.warps_per_cta) == 2, "warps_per_cta must have two entries"
+        assert all(warps > 0 for warps in self.warps_per_cta), "warps_per_cta entries must be positive"
+        assert len(self.instr_shape) == 3, "instr_shape must have three entries"
+        assert all(dim > 0 for dim in self.instr_shape), "instr_shape entries must be positive"
+        assert all(len(basis) == 2 for basis in self.cga_layout), "cga_layout basis rank must be two"
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape, element_type
+        return builder.make_nv_mma_layout_attr(self.version, self.warps_per_cta, self.instr_shape, self.cga_layout)
+
+
+class amd_mfma_layout(layout_encoding):
+    """AMD MFMA distributed layout for explicit shared-load consumers."""
+
+    def __init__(self, version, instr_shape, transposed, warps_per_cta, element_bitwidth=32, tiles_per_warp=None,
+                 cga_layout=None):
+        super().__init__()
+        self.version = int(version)
+        self.instr_shape = list(map(int, instr_shape))
+        self.transposed = bool(transposed)
+        self.warps_per_cta = list(map(int, warps_per_cta))
+        self.element_bitwidth = int(element_bitwidth)
+        # Gluon's AMDMFMALayout uses one tile factor for each warp-layout axis
+        # (M, N).  The instruction shape also has a K dimension, but that
+        # dimension is not a tiles-per-warp axis and must not be synthesized in
+        # the default or validation length.
+        warp_rank = len(self.warps_per_cta)
+        self.tiles_per_warp = list(map(int, tiles_per_warp or [1] * warp_rank))
+        self.cga_layout = [list(map(int, basis)) for basis in (cga_layout or [])]
+        assert 1 <= self.version <= 4
+        assert len(self.instr_shape) == 3
+        assert self.instr_shape[:2] in ([32, 32], [16, 16], [64, 4], [4, 64])
+        assert self.element_bitwidth in (32, 64)
+        assert len(self.tiles_per_warp) == warp_rank
+        assert all(len(basis) == len(self.warps_per_cta) for basis in self.cga_layout)
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape, element_type
+        return builder.make_amd_mfma_encoding_attr(self.version, self.warps_per_cta, self.instr_shape, self.transposed,
+                                                   self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
+
+
+class amd_wmma_layout(layout_encoding):
+    """Explicit AMD WMMA accumulator distribution for one CTA."""
+
+    def __init__(self, warp_bases, reg_bases=(), instr_shape=(16, 16, 128), version=3, transposed=True):
+        super().__init__()
+        self.warp_bases = [list(b) for b in tl._unwrap_if_constexpr(warp_bases)]
+        self.reg_bases = [list(b) for b in tl._unwrap_if_constexpr(reg_bases)]
+        self.instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+        self.version = int(version)
+        self.transposed = bool(transposed)
+        if len(self.instr_shape) != 3 or any(dim <= 0 for dim in self.instr_shape):
+            raise ValueError("instr_shape must contain three positive dimensions")
+        if any(len(basis) != 2 or any(value < 0 for value in basis) for basis in (*self.warp_bases, *self.reg_bases)):
+            raise ValueError("WMMA bases must contain two nonnegative coordinates")
+
+    def __repr__(self):
+        return f"amd_wmma_layout({vars(self)!r})"
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        return builder.make_amd_wmma_encoding_attr(self.version, self.transposed, self.warp_bases, self.reg_bases,
+                                                   self.instr_shape, 2)
+
+
+class slice_layout(layout_encoding):
+    """Rank-reduced view of a distributed parent layout.
+
+    This is the explicit-layout counterpart of the encoding inferred for a
+    reduction result. Keeping the parent is important because a later
+    ``expand_dims`` reconstructs that parent layout.
+    """
+
+    def __init__(self, parent, dim):
+        super().__init__()
+        self.parent = tl._unwrap_if_constexpr(parent)
+        self.dim = int(dim)
+        if not isinstance(self.parent, layout_encoding):
+            raise TypeError("slice_layout parent must be a TLX layout encoding")
+        if self.dim < 0:
+            raise ValueError("slice_layout dim must be non-negative")
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape
+        parent = self.parent.to_ir(builder, element_type=element_type)
+        return builder.make_slice_encoding_attr(self.dim, parent)
+
+    def __repr__(self):
+        return f"slice_layout<dim={self.dim}, parent={self.parent!r}>"
+
+    def __eq__(self, other):
+        return isinstance(other, slice_layout) and self.dim == other.dim and self.parent == other.parent
+
+    def __hash__(self):
+        return hash((self.__class__.__name__, self.dim, self.parent))
+
+
+class dot_operand_layout(layout_encoding):
+    """Explicit MFMA dot-operand view for a shared-memory local load."""
+
+    def __init__(self, operand_index, parent, k_width=8):
+        super().__init__()
+        self.operand_index = int(operand_index)
+        # Layout constructors are commonly nested inside a Triton JIT body,
+        # where an annotated ``tl.constexpr`` argument is wrapped once more by
+        # the frontend. Unwrap it here so ``to_ir`` sees the actual MFMA
+        # encoding rather than a constexpr shell.
+        self.parent = tl._unwrap_if_constexpr(parent)
+        self.k_width = int(k_width)
+        assert self.operand_index in (0, 1)
+        assert self.k_width > 0
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape
+        parent = self.parent.to_ir(builder)
+        del element_type
+        return builder.make_dot_operand_encoding_attr_with_type(self.operand_index, parent, self.k_width)
+
+
+class TMemCTAMode:
+    # The order of fields here must be in sync with TTNG_TensorMemoryCTAMode enum
+    DEFAULT = 0
+    TwoCTA_LHS = 1
+    TwoCTA_RHS = 2
+
+
+class tensor_memory_layout_encoding(shared_layout_encoding):
+
+    def __init__(self, blockM, blockN, colStride, CTASplitM, CTASplitN, ctaMode=TMemCTAMode.DEFAULT):
+        super().__init__()
+        self.blockM = blockM
+        self.blockN = blockN
+        self.colStride = colStride
+        self.CTASplitM = CTASplitM
+        self.CTASplitN = CTASplitN
+        self.ctaMode = ctaMode
+
+    @classmethod
+    def make_default(cls, shape):
+        return cls(
+            blockM=shape[0],
+            blockN=shape[1],
+            colStride=1,
+            CTASplitM=1,
+            CTASplitN=1,
+        )
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_tensor_memory_encoding_attr(
+            self.blockM,
+            self.blockN,
+            self.colStride,
+            self.CTASplitM,
+            self.CTASplitN,
+            self.ctaMode,
+        )
+
+
+@tl.builtin
+def make_tensor_memory_layout(block_m: tl.constexpr, block_n: tl.constexpr, _semantic=None):
+    return tensor_memory_layout_encoding.make_default(
+        (tl._unwrap_if_constexpr(block_m), tl._unwrap_if_constexpr(block_n)))
+
+
+class tensor_memory_scales_layout_encoding(_value_semantics):
+    """
+    Tensor memory scales layout encoding for Blackwell.
+    Used for scales in scaled MMA operations.
+    """
+
+    def __init__(
+        self,
+        CTASplitM: int = 1,
+        CTASplitN: int = 1,
+        ctaMode: int = TMemCTAMode.DEFAULT,
+    ):
+        self.CTASplitM = CTASplitM
+        self.CTASplitN = CTASplitN
+        self.ctaMode = ctaMode
+
+    @classmethod
+    def make_default(cls, ctaMode: int = TMemCTAMode.DEFAULT):
+        return cls(CTASplitM=1, CTASplitN=1, ctaMode=ctaMode)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_tensor_memory_scales_encoding_attr(
+            self.CTASplitM,
+            self.CTASplitN,
+            self.ctaMode,
+        )
+
+
+@tl.builtin
+def make_tensor_memory_scales_layout(_semantic=None):
+    return tensor_memory_scales_layout_encoding.make_default()
+
+
+class nv_mma_shared_layout_encoding(shared_layout_encoding):
+
+    def __init__(
+        self,
+        shape,
+        order,
+        elemType,
+        numCTAsPerCGA,
+        numCTASplit,
+        numCTAOrder,
+        fp4Padded,
+        swizzled,
+    ):
+        super().__init__()
+        self.shape = shape
+        self.order = order
+        self.elemType = elemType
+        self.numCTAsPerCGA = numCTAsPerCGA
+        self.numCTASplit = numCTASplit
+        self.numCTAOrder = numCTAOrder
+        self.fp4Padded = fp4Padded
+        self.swizzled = swizzled
+
+    # Make a default NVMMA shared layout encoding.
+    @classmethod
+    def make_default(cls, shape, elemType, fp4Padded=False):
+        rank = len(shape)
+        return cls(
+            shape=shape,
+            order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
+            elemType=elemType,
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(reversed(range(rank))),
+            fp4Padded=fp4Padded,
+            swizzled=True,
+        )
+
+    # Create a new layout that is a permutation of the given layout.
+    def make_permute(self, dims):
+        permuted_order = tuple(self.order[d] for d in dims)
+        return nv_mma_shared_layout_encoding(
+            self.shape,
+            permuted_order,
+            self.elemType,
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+            self.fp4Padded,
+            self.swizzled,
+        )
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_nv_mma_shared_encoding_attr(
+            [int(tl._unwrap_if_constexpr(x)) for x in self.shape],
+            [int(tl._unwrap_if_constexpr(x)) for x in self.order],
+            self.elemType.to_ir(builder),
+            [int(tl._unwrap_if_constexpr(x)) for x in self.numCTAsPerCGA],
+            [int(tl._unwrap_if_constexpr(x)) for x in self.numCTASplit],
+            [int(tl._unwrap_if_constexpr(x)) for x in self.numCTAOrder],
+            bool(tl._unwrap_if_constexpr(self.fp4Padded)),
+            bool(tl._unwrap_if_constexpr(self.swizzled)),
+        )
+
+    def tile_to_shape(self, tile_shape, alignment=1024):
+        return shared_linear_layout_encoding.from_nv_mma(self, tile_shape, alignment)
+
+    def make_shared_linear(self, alignment=1024, tile_shape=None):
+        return self.tile_to_shape(tile_shape or self.shape, alignment)
+
+    def __str__(self) -> str:
+        return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
+
+
+class DummyRegisterLayoutEncoding(layout_encoding):
+    """
+    Placeholder layout for register-distributed tensors.
+    Will be resolved to BlockedEncodingAttr, MmaEncodingAttr,
+    DotOperandEncodingAttr, etc. after inlining.
+    If tmem_compatible is True, the layout will be resolved to a
+    TMEM-compatible register layout suitable for TMEM load/store.
+    """
+
+    def __init__(self, shape: List[int], element_type: tl.dtype, tmem_compatible: bool = False):
+        super().__init__()
+        self.shape = shape
+        self.element_type = element_type
+        self.tmem_compatible = tmem_compatible
+
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_register_layout_attr(self.shape, self.element_type.to_ir(builder),
+                                                       self.tmem_compatible)
+
+    def __repr__(self):
+        return f"DummyRegisterLayoutEncoding<{self.shape}, {self.element_type}, tmem_compatible={self.tmem_compatible}>"
+
+    def __eq__(self, other):
+        return (isinstance(other, DummyRegisterLayoutEncoding) and self.shape == other.shape
+                and self.element_type == other.element_type and self.tmem_compatible == other.tmem_compatible)
+
+    def __hash__(self):
+        return hash((tuple(self.shape), self.element_type, self.tmem_compatible))
+
+
+def _modes_to_flat_strides(shape, stride):
+    """Expand a Shape:Stride list of modes into per-bit flat strides.
+
+    `shape` is a tuple of power-of-two mode extents, `stride` the matching tuple
+    of (scalar) flat offsets. A mode `(2^k, s)` contributes the `k` bit-strides
+    `s, 2s, 4s, ..., 2^(k-1) s` (GF(2) decomposition).
+    """
+    assert len(shape) == len(stride), "layout: shape and stride must have the same number of modes"
+    flat = []
+    for extent, s in zip(shape, stride):
+        extent = int(extent)
+        s = int(s)
+        assert extent & (extent - 1) == 0, f"layout mode extent {extent} must be a power of two"
+        b = 1
+        while b < extent:
+            flat.append(s * b)
+            b <<= 1
+    return flat
+
+
+def _flat_to_coord(flat, tensor_shape):
+    """Decode a flat (row-major) offset into a per-dimension coordinate vector."""
+    coord = []
+    for d in range(len(tensor_shape)):
+        dim_stride = 1
+        for later in tensor_shape[d + 1:]:
+            dim_stride *= int(later)
+        coord.append((flat // dim_stride) % int(tensor_shape[d]))
+    return coord
+
+
+class layout(layout_encoding):
+    """
+    A user-specified distributed (register) layout — one of the two families of
+    `layout_encoding` (see that base class). Written purely as **shape** and
+    **stride** (a CuTe-style thread-value layout), for
+    `tlx.local_load(buf, layout=...)`.
+
+    For a swizzled shared-memory layout use :class:`swizzled_layout` (a CuTe
+    ``Swizzle<B, M, S>``) directly; ``tlx.layout(swizzled_layout(...))`` also
+    accepts one and forwards it as a shared-memory layout rather than a register
+    layout.
+
+    The layout has two top-level modes — `(thread, value)`:
+      - ``shape``  = ``(thread_shape, value_shape)``
+      - ``stride`` = ``(thread_stride, value_stride)``
+    Each `*_shape` is a tuple of power-of-two extents and each `*_stride` the
+    matching tuple of **flat, row-major offsets** into the tile. The author only
+    speaks shape/stride; the compiler decomposes each mode `(2^k, s)` into bits
+    `s, 2s, ..., 2^(k-1)s`, splits the thread bits into lane (the low
+    `log2(threads_per_warp)`) and warp (the rest), and maps the value bits to
+    registers. Permutation layouts resolve to ``#ttg.linear``; layouts with
+    swizzled warp bases resolve to ``#ttg.generic_linear``.
+
+    Example (separable QK layout, tile [N=128, M=128], row-major flat offset
+    = ``n * 128 + m``):
+        tlx.layout(
+            shape =((32, 4, 2), (32, 2)),          # (thread, value)
+            stride=((128, 4096, 32), (1, 64)),
+        )
+    """
+
+    def __new__(cls, spec=None, *, shape=None, stride=None):
+        # ``tlx.layout(swizzled_layout(...))`` -> a swizzled shared-memory layout.
+        # shape/stride are declared here only to mirror __init__ signature;
+        # they are unused in __new__ because __new__ returns early for swizzled
+        # case and super().__new__ for register case does not need them.
+        if isinstance(spec, swizzled_layout):
+            # A trivial (non-)swizzle is shape-independent, so resolve it now to a
+            # concrete encoding. A real swizzle's perPhase depends on the buffer
+            # shape, so defer it: local_alloc resolves the atom once shape is known.
+            if spec.maxPhase == 1:
+                return spec._to_encoding()
+            return spec
+        return super().__new__(cls)
+
+    def __init__(self, spec=None, *, shape=None, stride=None):
+        super().__init__()
+        # Note: shape and stride are keyword-only as of the swizzled_layout
+        # refactor to avoid ambiguity with positional swizzled_layout args.
+        # Pre-existing callers in-tree already use kwargs; positional use
+        # would be misinterpreted as spec and fail with a clear AssertionError.
+        assert shape is not None and stride is not None, \
+            "tlx.layout requires a swizzled_layout(...), or shape=/stride= for a register layout"
+        assert len(shape) == 2 and len(stride) == 2, \
+            "layout: shape and stride must each be (thread, value)"
+        self.thread_shape, self.value_shape = shape
+        self.thread_stride, self.value_stride = stride
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type: tl.dtype = None):
+        assert shape is not None, "layout.to_ir requires the consuming tensor shape"
+        tensor_shape = [int(s) for s in shape]
+        warp_size = int(builder.options.warp_size)
+        lane_bits = warp_size.bit_length() - 1  # log2(threads_per_warp)
+
+        value_flat = _modes_to_flat_strides(self.value_shape, self.value_stride)
+        thread_flat = _modes_to_flat_strides(self.thread_shape, self.thread_stride)
+        lane_flat = thread_flat[:lane_bits]
+        warp_flat = thread_flat[lane_bits:]
+
+        reg_bases = [_flat_to_coord(f, tensor_shape) for f in value_flat]
+        lane_bases = [_flat_to_coord(f, tensor_shape) for f in lane_flat]
+        warp_bases = [_flat_to_coord(f, tensor_shape) for f in warp_flat]
+        return builder.make_linear_encoding_attr(reg_bases, lane_bases, warp_bases, tensor_shape)
+
+    def __repr__(self):
+        return (f"layout<shape=({self.thread_shape}, {self.value_shape}), "
+                f"stride=({self.thread_stride}, {self.value_stride})>")
+
+    def __eq__(self, other):
+        return (isinstance(other, layout) and self.thread_shape == other.thread_shape
+                and self.value_shape == other.value_shape and self.thread_stride == other.thread_stride
+                and self.value_stride == other.value_stride)
+
+    def __hash__(self):
+        return hash(
+            (tuple(self.thread_shape), tuple(self.value_shape), tuple(self.thread_stride), tuple(self.value_stride)))
+
+
+class storage_kind(enum.Enum):
+    smem = "smem"
+    tmem = "tmem"
+    smemCluster = "smemCluster"
+
+
+class DummyTMEMLayoutEncoding(layout_encoding):
+    """
+    Placeholder layout for TMEM tensors that will be resolved during layout propagation.
+    Used for sub-16-bit element types where the final layout depends on usage context
+    (e.g., as scales in scaled MMA operations).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_tmem_layout_attr()
+
+    def __repr__(self):
+        return "DummyTMEMLayoutEncoding<>"
+
+    def __eq__(self, other):
+        return isinstance(other, DummyTMEMLayoutEncoding)
+
+    def __hash__(self):
+        return hash(self.__class__.__name__)
+
+
+class reuse_group_type(enum.Enum):
+    """
+    Type of buffer relationship within a reuse group.
+
+    - **shared**: Elements must logically occupy the same region in memory.
+      There is no cross-index overlap, and elements share the memory. Elements
+      are guaranteed to overlap at the same buffer index.
+    - **distinct**: Elements must be placed into non-overlapping regions of
+      memory. Elements can be accessed simultaneously without conflicts.
+
+    Example:
+        In the Flash Attention buffer sharing scheme:
+        - qk_tiles and (p_tiles, alpha, l, m) are **shared** because they
+          occupy the same logical memory region at each buffer index.
+        - p_tiles, alpha, l, and m are **distinct** because they must not
+          overlap with each other within a buffer index.
+
+    Note:
+        The "shared" requirement does not mean elements are identical or must
+        physically overlap. With infinite memory, elements could be placed in
+        completely separate regions. However, when elements are shared, the
+        user is responsible for proper synchronization via barriers.
+    """
+
+    shared = "shared"
+    distinct = "distinct"
+
+
+class reuse_group:
+    """
+    Defines buffer overlap relationships for memory allocations (shared memory or tensor memory).
+
+    A reuse_group organizes multiple buffers (or nested groups) into either:
+    - **shared**: Elements logically occupy the same memory region at each
+      buffer index. Useful when buffers are used at different times and can
+      share the same physical memory.
+    - **distinct**: Elements must be placed in non-overlapping memory regions.
+      Useful when buffers need to be accessed simultaneously.
+
+    The reuse_group forms a tree structure where:
+    - Leaf nodes are `buffered_tensor` objects
+    - Internal nodes are nested `reuse_group` objects
+    - The root defines the top-level sharing relationship
+
+    Note: The storage_alias_spec is NOT passed to reuse_group. Instead, the
+    spec is associated with the reuse group tree when passed to
+    `storage_alias_spec.set_buffer_overlap()`. Validation that all elements
+    reference the same storage_alias_spec is performed during that call.
+
+    Example - Flash Attention buffer sharing:
+        ```python
+        spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+        qk_tiles = tlx.local_alloc(..., reuse=spec)
+        p_tiles = tlx.local_alloc(..., reuse=spec)
+        alpha = tlx.local_alloc(..., reuse=spec)
+        l = tlx.local_alloc(..., reuse=spec)
+        m = tlx.local_alloc(..., reuse=spec)
+
+        # QK and (P, alpha) share the same memory region
+        # P and alpha are placed in distinct (non-overlapping) regions
+        # Note: spec is passed to set_buffer_overlap, not to reuse_group
+        spec.set_buffer_overlap(
+            tlx.reuse_group(
+                qk_tiles,
+                tlx.reuse_group(
+                    p_tiles,
+                    alpha,
+                    l,
+                    m,
+                    group_type=tlx.reuse_group_type.distinct
+                ),
+            )
+        )
+        ```
+
+    Example - Subtiling with group_size:
+        ```python
+        # P has 2 * NUM_SLICES buffers, QK has 2 buffers.
+        # We need to be able to access NUM_SLICES buffers at once as logically
+        # this subtiled buffer is a single iteration.
+        # With NUM_SLICES=2, P's buffers [0,1] map to QK[0], [2,3] map to QK[1]
+        spec.set_buffer_overlap(
+            tlx.reuse_group(
+                qk_tiles,
+                tlx.reuse_group(
+                    tlx.reuse_group(p_tiles, group_size=NUM_SLICES),  # Subtiling wrapper
+                    alpha,
+                    l,
+                    m,
+                    group_type=tlx.reuse_group_type.distinct,
+                ),
+            )
+        )
+        ```
+    """
+
+    def __init__(
+        self,
+        *args: "buffered_tensor | reuse_group",
+        group_type: "reuse_group_type" = reuse_group_type.shared,
+        group_size: int = 1,
+    ):
+        """
+        Initialize a reuse group.
+
+        Args:
+            *args: buffered_tensor or reuse_group objects. Must not be empty.
+            group_type: The relationship type for elements in this group.
+                - shared: Elements occupy the same logical memory region.
+                - distinct: Elements must be in non-overlapping regions.
+                Defaults to shared.
+            group_size: Multiplier for buffer grouping (subtiling). Defaults to 1.
+                When > 1, K consecutive buffers are treated as a single logical
+                group for offset calculation. This enables subtiling where a
+                logical buffer is divided into smaller chunks.
+
+                For example, with group_size=2 on a tensor with 4 buffers:
+                - Buffers [0,1] are treated as logical group 0
+                - Buffers [2,3] are treated as logical group 1
+
+                This changes buffer count validation: after dividing by group_size,
+                all elements at each level must have identical effective buffer counts.
+
+        Raises:
+            ValueError: If args is empty.
+            ValueError: If group_size is not a positive integer.
+            TypeError: If any element is not a buffered_tensor or reuse_group.
+        """
+        if len(args) == 0:
+            raise ValueError("reuse_group requires at least one element")
+
+        # Validate group_size
+        group_size = tl._unwrap_if_constexpr(group_size)
+        if not isinstance(group_size, int) or group_size < 1:
+            raise ValueError(f"group_size must be a positive integer, got {group_size}")
+
+        # Validate element types
+        args = tuple(tl._unwrap_if_constexpr(elem) for elem in args)
+        for elem in args:
+            if not isinstance(elem, (reuse_group, buffered_tensor)):
+                raise TypeError(f"reuse_group elements must be buffered_tensor or reuse_group, "
+                                f"got {type(elem).__name__}")
+
+        self._args = args
+        self._group_type = group_type
+        self._group_size = group_size
+
+    @property
+    def args(self) -> tuple:
+        """The elements in this group (read-only)."""
+        return self._args
+
+    @property
+    def group_type(self) -> reuse_group_type:
+        """The relationship type for this group (read-only)."""
+        return self._group_type
+
+    @property
+    def group_size(self) -> int:
+        """The buffer grouping multiplier for subtiling (read-only).
+
+        Defaults to 1 (no grouping). When > 1, K consecutive buffers are
+        treated as a single logical group for offset calculation purposes.
+        """
+        return self._group_size
+
+    def _flatten_ir(self, handles) -> None:
+        """Recursively flatten IR handles from all elements in the group."""
+        for elem in self._args:
+            elem._flatten_ir(handles)
+
+    def to_ir(self, builder) -> ir.value:
+        """
+        Recursively lower this reuse_group tree to IR.
+
+        Args:
+            builder: The IR builder.
+
+        Returns:
+            The IR value representing the reuse_group.
+        """
+        # Collect IR values for elements
+        ir_elements = []
+        for elem in self._args:
+            if isinstance(elem, reuse_group):
+                # Recursively lower nested reuse_group
+                ir_elements.append(elem.to_ir(builder))
+            elif isinstance(elem, buffered_tensor):
+                # Get the memdesc handle from the buffered_tensor
+                ir_elements.append(elem.handle)
+            else:
+                raise TypeError(f"reuse_group element must be buffered_tensor or reuse_group, "
+                                f"got {type(elem).__name__}")
+
+        # Create the reuse_group IR operation
+        group_kind = self._group_type.value  # "shared" or "distinct"
+        return builder.create_reuse_group(ir_elements, group_kind, self._group_size)
+
+    def __repr__(self):
+        if self._group_size == 1:
+            return f"reuse_group({self._args}, group_type={self._group_type.value})"
+        else:
+            return f"reuse_group({self._args}, group_type={self._group_type.value}, group_size={self._group_size})"
+
+
+class reuse_group_ir_type(tl.base_type):
+    """
+    Type for reuse group specifications in MLIR.
+
+    This type represents the MLIR ReuseGroupType and carries
+    the group kind (shared/distinct).
+    The storage kind is inferred from the elements and not stored in the type.
+    """
+
+    def __init__(
+        self,
+        group_kind: reuse_group_type,
+    ):
+        self._group_kind = group_kind
+
+    @property
+    def group_kind(self) -> reuse_group_type:
+        """The group kind (shared/distinct) (read-only)."""
+        return self._group_kind
+
+    def __eq__(self, other):
+        return (isinstance(other, reuse_group_ir_type) and self._group_kind == other._group_kind)
+
+    def __repr__(self) -> str:
+        return f"reuse_group_ir_type(group_kind={self._group_kind.value})"
+
+    def mangle(self) -> str:
+        return f"reuse_group_{self._group_kind.value}"
+
+
+class storage_alias_spec(tl.base_value):
+    """
+    Definition of a storage alias specification.
+
+    This class represents ownership of an underlying memory buffer that can be
+    shared by multiple `local_alloc` calls. It can be either unsized or sized:
+
+    - **Unsized (default)**: The compiler sets the buffer size to accommodate
+      the largest allocation that references it.
+    - **Sized**: The user specifies an explicit size, and the compiler verifies
+      all referencing allocations fit within it.
+
+    All attributes are immutable after construction.
+
+    Attributes:
+        storage: The storage kind (smem or tmem) for this buffer.
+        buffer_size_bytes: Optional explicit size in bytes. Must be a compile-time
+            constant if provided. Immutable after construction.
+
+    Note:
+        smemCluster storage is not supported yet for storage alias specifications.
+
+    Example:
+        # Create an unsized storage alias spec (size determined by largest user)
+        alias_spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+        # Create a sized storage alias spec with explicit padding
+        alias_spec = tlx.storage_alias_spec(
+            buffer_size_bytes=16384,
+            storage=tlx.storage_kind.tmem
+        )
+    """
+
+    def __init__(
+        self,
+        handle,
+        storage: storage_kind,
+        buffer_size_bytes: Optional[int] = None,
+    ):
+        """
+        Initialize a shared buffer definition.
+
+        This constructor is internal. Use tlx.storage_alias_spec() builtin instead.
+
+        Args:
+            handle: The IR handle for this storage alias specification.
+            storage: The storage kind for this buffer. Must be smem or tmem.
+                smemCluster is not supported.
+            buffer_size_bytes: Optional explicit size in bytes. If provided,
+                the compiler will verify that all referencing allocations fit
+                within this size. This value is immutable after construction.
+
+        Raises:
+            ValueError: If storage is smemCluster (not supported).
+        """
+        super().__init__()
+        if storage == storage_kind.smemCluster:
+            raise ValueError("smemCluster storage is not supported for storage_alias_spec")
+        self._handle = handle
+        self._storage = storage
+        self._buffer_size_bytes = buffer_size_bytes
+        self.type = storage_alias_spec_type(storage, buffer_size_bytes)
+
+    @property
+    def handle(self):
+        """The IR handle (read-only)."""
+        return self._handle
+
+    @property
+    def storage(self) -> storage_kind:
+        """The storage kind for this buffer (read-only)."""
+        return self._storage
+
+    @property
+    def buffer_size_bytes(self) -> Optional[int]:
+        """The explicit buffer size in bytes, or None if unsized (read-only)."""
+        return self._buffer_size_bytes
+
+    @tl.builtin
+    def set_buffer_overlap(self, overlap_def: "reuse_group", _semantic=None) -> None:
+        """
+        Define the buffer overlap scheme for allocations using this storage alias spec.
+
+        This method specifies how buffers should be laid out in memory relative to
+        each other. The overlap_def is a reuse_group tree that defines:
+        - **shared**: Elements logically occupy the same memory region
+        - **distinct**: Elements must be in non-overlapping memory regions
+
+        This function lowers to an IR operation that links the storage alias spec
+        to its defined overlap scheme. The compiler will use this information to
+        compute buffer offsets in subsequent passes.
+
+        Note: This method should be called after all allocations using this
+        storage_alias_spec have been created, and the reuse_group should contain
+        all relevant buffered_tensor objects.
+
+        Args:
+            overlap_def: A reuse_group defining the buffer overlap relationships.
+            _semantic: Internal semantic parameter (passed automatically in JIT context).
+
+        Raises:
+            TypeError: If overlap_def is not a reuse_group.
+
+        Example:
+            ```python
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers
+            qk_tiles = tlx.local_alloc(..., reuse=spec)
+            p_tiles = tlx.local_alloc(..., reuse=spec)
+            alpha = tlx.local_alloc(..., reuse=spec)
+
+            # Define overlap scheme: QK shares with (P and alpha which are distinct)
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk_tiles,
+                    tlx.reuse_group(p_tiles, alpha, group_type=tlx.reuse_group_type.distinct),
+                    group_type=tlx.reuse_group_type.shared,
+                )
+            )
+            ```
+        """
+        overlap_def = tl._unwrap_if_constexpr(overlap_def)
+        # Validate input type
+        if not isinstance(overlap_def, reuse_group):
+            raise TypeError(f"overlap_def must be a reuse_group, got {type(overlap_def).__name__}")
+
+        # Recursively lower the reuse_group tree to IR
+        overlap_def_ir = overlap_def.to_ir(_semantic.builder)
+
+        # Create the set_buffer_overlap IR operation
+        _semantic.builder.create_set_buffer_overlap(self._handle, overlap_def_ir)
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self._handle)
+
+    def __repr__(self):
+        size_str = f", size={self._buffer_size_bytes}" if self._buffer_size_bytes else ""
+        return f"storage_alias_spec(storage={self._storage.value}{size_str})"
+
+
+class storage_alias_spec_type(tl.base_type):
+    """
+    Type for storage alias specifications.
+
+    This type represents the MLIR StorageAliasSpecType and carries
+    storage kind and optional explicit size information.
+    """
+
+    def __init__(
+        self,
+        storage: storage_kind,
+        buffer_size_bytes: Optional[int] = None,
+    ):
+        self._storage = storage
+        self._buffer_size_bytes = buffer_size_bytes
+
+    @property
+    def storage(self) -> storage_kind:
+        """The storage kind (read-only)."""
+        return self._storage
+
+    @property
+    def buffer_size_bytes(self) -> Optional[int]:
+        """The explicit buffer size in bytes, or None (read-only)."""
+        return self._buffer_size_bytes
+
+    def __eq__(self, other):
+        return (isinstance(other, storage_alias_spec_type) and self._storage == other._storage
+                and self._buffer_size_bytes == other._buffer_size_bytes)
+
+    def __repr__(self) -> str:
+        size_str = f", size={self._buffer_size_bytes}" if self._buffer_size_bytes else ""
+        return f"storage_alias_spec_type(storage={self._storage.value}{size_str})"
+
+    def mangle(self) -> str:
+        size_part = "" if self._buffer_size_bytes is None else f"_{self._buffer_size_bytes}"
+        return f"storage_alias_spec_{self._storage.value}{size_part}"
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(self.to_ir(builder))
+
+    def to_ir(self, builder: ir.builder):
+        return builder.get_storage_alias_spec_type(
+            self._storage.value,
+            self._buffer_size_bytes,
+        )
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple["storage_alias_spec", int]:
+        value = storage_alias_spec(
+            handles[cursor],
+            self._storage,
+            self._buffer_size_bytes,
+        )
+        return value, cursor + 1
+
+
+class buffered_tensor(tl.base_value):
+    """
+    A symbolic type representing a tensor allocated in a manually managed buffer
+    such as shared memory (SMEM).
+
+    This type is to model data that is not stored in global memory or registers
+    but instead resides in hardware-close memory spaces with specialized
+    allocation, access, or swizzling patterns.
+
+    Unlike regular `tl.tensor`, which models values computed by operations,
+    `buffered_tensor` reflects a memory-backed buffer that may be explicitly
+    allocated and reused across program regions. It is primarily used with
+    low-level intrinsics such as `tlx.local_alloc()`.
+
+    Examples:
+        a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, num=4)
+
+    Attributes:
+        handle: The backing IR value representing the buffer allocation.
+    """
+
+    def __init__(
+        self,
+        handle,
+        element_ty: tl.dtype,
+        shape: List,
+        num: int,
+        storage: storage_kind,
+        layout: Optional[shared_layout_encoding] = None,
+    ):
+        """Not called by user code."""
+        super().__init__()
+        # IR handle
+        self.handle = handle
+        # Block shape
+        self.shape = shape
+        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout,
+                                         ir_type=handle.get_type() if handle is not None else None)
+        # Following the practice in pytorch, dtype is scalar type
+        self.dtype = element_ty
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def make_permute(self, handle, dims):
+        permuted_layout = self.type.layout.make_permute(dims)
+        return buffered_tensor(
+            handle,
+            self.dtype,
+            [self.shape[d] for d in dims],
+            self.type.num,
+            self.type.storage,
+            permuted_layout,
+        )
+
+
+class buffered_tensor_type(tl.block_type):
+
+    def __init__(
+        self,
+        element_ty: tl.dtype,
+        shape: List,
+        num: int,
+        storage: storage_kind,
+        layout: Optional[shared_layout_encoding] = None,
+        ir_type=None,
+    ):
+        super().__init__(element_ty, shape)
+        # Storage
+        self.storage = storage
+        # Layout encoding
+        self.layout = layout
+        # Buffer number. 0 means a single buffer, 1+ means a buffer array.
+        self.num = num
+        # Views carry an allocation shape and concrete encoding that cannot be
+        # reconstructed from their logical shape and frontend layout alone.
+        # Keep that type across JIT calls, just as the descriptor value does.
+        self._ir_type = ir_type
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
+        value = buffered_tensor(
+            handles[cursor],
+            self.scalar,
+            self.shape,
+            self.num,
+            self.storage,
+            self.layout,
+        )
+        return value, cursor + 1
+
+    def _identity(self) -> tuple:
+        # Everything that distinguishes values of this type: equality and
+        # mangling both derive from it, so JIT helpers specialize exactly per
+        # distinct type. The concrete IR type, when present, also fixes the
+        # allocation shape and resolved encoding. Without one, the frontend
+        # storage and layout still keep differently placed buffers apart.
+        return (self.element_ty, tuple(self.shape), self.num, self.storage, self.layout,
+                None if self._ir_type is None else str(self._ir_type))
+
+    def _mangle_prefix(self) -> str:
+        return f"buffered_{self.scalar.mangle()}"
+
+    def mangle(self) -> str:
+        shape = "_".join(map(str, self.shape))
+        if self.num > 0:
+            shape += f"_{self.num}"
+        digest = hashlib.sha256(repr(self._identity()).encode()).hexdigest()[:16]
+        return f"{self._mangle_prefix()}S{shape}_{self.storage.value}M{digest}"
+
+    def __str__(self) -> str:
+        # Two views can differ only in their IR type (e.g. the allocation
+        # shape), so show it to make type mismatches readable.
+        ir_type = "" if self._ir_type is None else f", {self._ir_type}"
+        return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}{ir_type}>"
+
+    def __eq__(self, other) -> bool:
+        return type(self) is type(other) and self._identity() == other._identity()
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(self.to_ir(builder))
+
+    def to_ir(self, builder: ir.builder) -> None:
+        if self._ir_type is not None:
+            return self._ir_type
+        shape = self.shape
+        if self.num >= 1:
+            shape = [self.num] + list(shape)
+        layout_handle = self.layout.to_ir(builder)
+        # An explicit, user-pinned shared layout (tlx.local_alloc(layout=...)) is
+        # wrapped as #tlx.user_layout<...> so layout propagation respects it. The
+        # pin is marked on the layout object by local_alloc; wrap here so the same
+        # wrapper appears wherever this type is reconstructed -- e.g. a @triton.jit
+        # callee's param rebuilt from this type, or a subview's result -- keeping
+        # tt.call operand/param and memdesc subview encodings consistent. The
+        # wrapper is stripped later by tlx-resolve-placeholder-layouts.
+        if getattr(self.layout, "_tlx_user_pinned", False):
+            layout_handle = builder.make_user_layout_attr(layout_handle)
+        return builder.get_memdesc_type(
+            shape,
+            self.element_ty.to_ir(builder),
+            layout_handle,
+            self.storage.value,
+        )
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+
+class mbarrier(tl.base_value):
+    """
+    Define a mbarrier object
+    """
+
+    def __init__(
+        self,
+        handle,
+        num: int,
+        layout: Optional[swizzled_shared_layout_encoding],
+        storage: storage_kind = storage_kind.smem,
+        is_warp_barrier: bool = False,
+    ):
+        assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
+            "mbarrier requires storage to be smem or smemCluster")
+        self.handle = handle
+        self.type = mbarrier_type(num, layout, storage, is_warp_barrier)
+        self.num = num
+        self.is_warp_barrier = is_warp_barrier
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        """Build a frontend value with the current dtype, wrapping a list of existing handles.
+        cursor is the index of the first handle relevant to this value, and the function
+        should return the updated cursor position after any handles consumed by the created value.
+        """
+        raise NotImplementedError
+
+
+class mbarrier_type(buffered_tensor_type):
+
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], storage,
+                 is_warp_barrier: bool = False):
+        super().__init__(tl.int64, [1], num, storage, layout)
+        self.is_warp_barrier = is_warp_barrier
+
+    def _identity(self) -> tuple:
+        # Warp barriers arrive per thread; ordinary ones once per CTA.
+        return super()._identity() + (self.is_warp_barrier, )
+
+    def _mangle_prefix(self) -> str:
+        return "mbarrier"
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
+        value = mbarrier(handles[cursor], self.num, self.layout, self.storage, is_warp_barrier=self.is_warp_barrier)
+        return value, cursor + 1
+
+    def to_ir(self, builder: ir.builder) -> None:
+        if self.num >= 1:
+            shape = [self.num]
+        else:
+            shape = self.shape
+        return builder.get_memdesc_type(
+            shape,
+            self.element_ty.to_ir(builder),
+            self.layout.to_ir(builder),
+            self.storage.value,
+        )
+
+
+class clc_response(tl.base_value):
+    """
+    Define a CLC response object
+    """
+
+    def __init__(
+        self,
+        handle,
+        num: int,
+        layout: Optional[swizzled_shared_layout_encoding],
+    ):
+        self.handle = handle
+        self.type = clc_response_type(num, layout)
+        self.num = num
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        """Build a frontend value with the current dtype, wrapping a list of existing handles.
+        cursor is the index of the first handle relevant to this value, and the function
+        should return the updated cursor position after any handles consumed by the created value.
+        """
+        raise NotImplementedError
+
+
+class clc_response_type(buffered_tensor_type):
+    # TODO. a more generic design about buffered tensor type
+    # since we have two concrete use cases now (mbarrier and clc_response)
+    # both of which are opaque objects with fixed size
+
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+        # A CLC response is a 16-byte opaque hardware object, i.e. one `ui128`
+        # per stage. Triton has no 128-bit `tl.dtype`, so the base class is
+        # given `tl.int64` as a placeholder and `to_ir` below builds the real
+        # element type through the builder instead of from `self.element_ty`.
+        super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
+        value = clc_response(handles[cursor], self.num, self.layout)
+        return value, cursor + 1
+
+    def _mangle_prefix(self) -> str:
+        # Distinct from buffered_tensor_type/mbarrier_type, whose mangles are
+        # derived from the (placeholder) int64 element type and would otherwise
+        # collide with this one for the same shape.
+        return "clc_response"
+
+    def to_ir(self, builder: ir.builder) -> None:
+        if self.num >= 1:
+            shape = [self.num]
+        else:
+            shape = self.shape
+        return builder.get_memdesc_type(
+            shape,
+            # NOT self.element_ty: the allocation created by
+            # create_alloc_clc_responses uses `ui128`. Using the placeholder
+            # int64 here builds a different memdesc type whenever this type is
+            # reconstructed -- notably for a @triton.jit callee's parameter when
+            # a CLC context crosses a tt.call -- which fails TTIR verification
+            # with a `tt.call` operand type mismatch.
+            builder.get_clc_response_element_ty(),
+            self.layout.to_ir(builder),
+            self.storage.value,
+        )
+
+
+@aggregate
+class CLCPipelineContext:
+    _clc_mbars_empty: mbarrier
+    _clc_mbars_full: mbarrier
+    _clc_responses: clc_response
+
+    def __init__(
+        self,
+        clc_mbars_empty: mbarrier,
+        clc_mbars_full: mbarrier,
+        clc_responses: clc_response,
+    ):
+        self._clc_mbars_empty = clc_mbars_empty
+        self._clc_mbars_full = clc_mbars_full
+        self._clc_responses = clc_responses
+
+
+class async_token(tl.base_value):
+    """
+    Defines a type of value used to track and synchronize asynchronous operations.
+    """
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.type = async_token_type(handle)
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        return async_token(handles[cursor]), cursor + 1
+
+
+class async_token_type(tl.base_type):
+
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        return isinstance(other, async_token_type)
+
+    def __repr__(self) -> str:
+        return "async_token_type"
+
+    def mangle(self) -> str:
+        return repr(self)
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(self.value.get_type())
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int):
+        return async_token(handles[cursor]), cursor + 1
+
+
+class tensor_descriptor_ptr(tl.base_value):
+    """
+    A pointer type for tensor descriptors with 128-byte stride semantics.
+    When performing pointer arithmetic (ptr + 1), the pointer advances by 128 bytes,
+    which is the size of a single tensor descriptor.
+    """
+
+    def __init__(self, handle, num: int, descriptor_size: int):
+        super().__init__()
+        self.handle = handle
+        self.type = tensor_descriptor_ptr_type(num, descriptor_size)
+
+    @property
+    def num(self) -> int:
+        """Number of descriptors this pointer can access."""
+        return self.type.num
+
+    @property
+    def descriptor_size(self) -> int:
+        """Size of each descriptor in bytes."""
+        return self.type.size
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        raise NotImplementedError
+
+
+class tensor_descriptor_ptr_type(tl.pointer_type):
+    """
+    Type for pointers to tensor descriptors.
+    Encodes size-byte stride semantics for pointer arithmetic.
+    """
+
+    def __init__(self, num: int, size: int = 128):
+        # Initialize with a block type of size int8 elements to get size-byte stride
+        element_type = tl.block_type(tl.int8, [size])
+        super().__init__(element_type, address_space=1)
+        # Number of descriptors this pointer can access (1 means single descriptor)
+        self.num = num
+        # Size of each descriptor in bytes
+        self.size = size
+
+    def __eq__(self, other):
+        return isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size
+
+    def __repr__(self) -> str:
+        return f"tensor_descriptor_ptr_type(num={self.num}, size={self.size})"
+
+    def mangle(self) -> str:
+        return f"tensor_desc_ptr_{self.num}_{self.size}"
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int):
+        return tensor_descriptor_ptr(handles[cursor], self.num, self.size), cursor + 1

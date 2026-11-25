@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import sys
 
 import pytest
 import torch
@@ -13,6 +15,10 @@ from triton._internal_testing import is_cuda, is_hopper_or_newer
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._allocator import get_reserve_pointer, get_reserve_size
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+# The fast runner collects with --import-mode=importlib, which does not put
+# this directory on sys.path. Keep the sibling import working there.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_gsan_failures import _raw_kernel, _run_failure_case
 
 pytestmark = pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")

@@ -9,7 +9,6 @@ AMD CDNA 5
     :template: autosummary/gluon-module.rst
 
     async_copy
-    buffer
     cluster
     mbarrier
     tdm
@@ -29,5 +28,4 @@ AMD CDNA 5
     scaled_upcast
     wmma
     wmma_scaled
-    CachePolicy
     PartitionedSharedLayout

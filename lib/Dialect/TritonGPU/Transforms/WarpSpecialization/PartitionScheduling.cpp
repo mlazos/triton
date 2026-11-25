@@ -36,6 +36,7 @@ namespace mlir::triton::gpu {
 // Finally the partition assignments in the dataflow graph are serialized to
 // attributes, and the temporary data structure is discarded.
 
+#define GEN_PASS_DECL_TRITONGPUPARTITIONSCHEDULING
 #define GEN_PASS_DEF_TRITONGPUPARTITIONSCHEDULING
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
@@ -171,23 +172,6 @@ std::unique_ptr<Graph> buildGraph(Operation *region) {
           assert(reduceOp.getResults().size() == 1);
           auto result = reduceOp.getResults().front();
           values.push_back(std::make_pair(OutputPort(node, 0), result));
-
-          for (auto &region : op->getRegions())
-            for (auto &block : region)
-              for (auto &op : block)
-                visitOperation(node, &op);
-
-        } else if (auto scanOp = dyn_cast<tt::ScanOp>(op)) {
-          // Like tt.reduce, but a scan can carry several operands and results
-          // (tl.associative_scan over a tuple), so give each one a port.
-          auto node =
-              graph->addNode(op, op->getNumOperands(), op->getNumResults());
-          nodes[op] = node;
-          for (size_t idx = 0; idx < op->getNumOperands(); idx++)
-            operands[std::make_pair(op, idx)] = InputPort(node, idx);
-          for (auto result : scanOp.getResults())
-            values.push_back(std::make_pair(
-                OutputPort(node, result.getResultNumber()), result));
 
           for (auto &region : op->getRegions())
             for (auto &block : region)
@@ -1097,9 +1081,9 @@ void propagatePartitions(Graph *graph, std::string funcName,
 
   visualize(funcName, "propagate", "propagate forward", graph, vis_info);
 
-  // propagate partitions of tt.reduce and tt.scan into their bodies
+  // propagate partitions of tt.reduce into its body
   graph->walk([&](Node *node) {
-    if (node->isOp() && isa<tt::ReduceOp, tt::ScanOp>(node->getOp())) {
+    if (node->isOp() && isa<tt::ReduceOp>(node->getOp())) {
       auto partitions = node->getPartitions();
       node->walk(
           [&](Node *child_node) { child_node->addPartitions(partitions); });
@@ -1334,11 +1318,6 @@ void serialize(size_t idx, Operation *region, Graph *graph) {
         // result of a reduce
         auto reduce = node->getParent()->getOp();
         setPartitionOutputsAttr(reduce, 0, 1, node);
-      } else if (isa<tt::ScanReturnOp>(node->getOp())) {
-        // results of a scan
-        auto scan = node->getParent()->getOp();
-        for (size_t idx = 0; idx < scan->getNumResults(); idx++)
-          setPartitionOutputsAttr(scan, idx, scan->getNumResults(), node);
       }
 
     } else {
@@ -1569,8 +1548,10 @@ void assignCLCConsumers(scf::WhileOp whileOp, Graph *graph) {
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
+namespace {
 struct PartitionScheduling
-    : public impl::TritonGPUPartitionSchedulingBase<PartitionScheduling> {
+    : public mlir::triton::gpu::impl::TritonGPUPartitionSchedulingBase<
+          PartitionScheduling> {
   using TritonGPUPartitionSchedulingBase::TritonGPUPartitionSchedulingBase;
 
   void runOnOperation() override {
@@ -1765,5 +1746,7 @@ private:
     }
   }
 };
+
+} // namespace
 
 } // namespace mlir::triton::gpu

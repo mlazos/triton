@@ -1,8 +1,8 @@
 #ifndef TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_CONVERTFPCASTOPTOLLVM_H_
 #define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_CONVERTFPCASTOPTOLLVM_H_
 
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
 
 namespace mlir::triton::AMD {

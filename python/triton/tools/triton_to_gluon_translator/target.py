@@ -16,7 +16,6 @@ class TranslatorTarget(str, Enum):
     SM90 = "sm90"
     SM100 = "sm100"
     SM103 = "sm103"
-    SM107 = "sm107"
     # AMD targets currently exercised by the translator test suite:
     GFX90A = "gfx90a"
     GFX1250 = "gfx1250"
@@ -25,20 +24,15 @@ class TranslatorTarget(str, Enum):
 
     @classmethod
     def _missing_(cls, value: object) -> "TranslatorTarget | None":
-        if value not in cls._value2member_map_:
-            return None
-        if isinstance(value, str):
-            return cls(value)
+        if isinstance(value, str) and value.startswith("gfx"):
+            obj = str.__new__(cls, value)
+            obj._value_ = value
+            return obj
         return None
 
     @property
     def is_amd(self) -> bool:
-        return self in (
-            TranslatorTarget.GFX90A,
-            TranslatorTarget.GFX942,
-            TranslatorTarget.GFX950,
-            TranslatorTarget.GFX1250,
-        )
+        return self.value.startswith("gfx")
 
     @property
     def is_nvidia(self) -> bool:
@@ -47,7 +41,6 @@ class TranslatorTarget(str, Enum):
             TranslatorTarget.SM90,
             TranslatorTarget.SM100,
             TranslatorTarget.SM103,
-            TranslatorTarget.SM107,
         )
 
     @property
@@ -63,7 +56,7 @@ class TranslatorTarget(str, Enum):
             return f"{base}.amd_helpers"
 
         if self.is_nvidia:
-            if self in (TranslatorTarget.SM100, TranslatorTarget.SM103, TranslatorTarget.SM107):
+            if self in (TranslatorTarget.SM100, TranslatorTarget.SM103):
                 return f"{base}.blackwell_helpers"
             if self in (TranslatorTarget.SM90):
                 return f"{base}.hopper_helpers"

@@ -216,20 +216,6 @@ def _convert_float(input, input_dtype, output_dtype, rounding_mode):
         exponent[zero_significand_index & subnormal_index] = bias_input - bias_output
         significand[subnormal_index] = (significand[subnormal_index] << bit_pos[subnormal_index]) & (
             (1 << input_dtype.fp_mantissa_width) - 1)
-    if input_dtype == tl.float8e4nv:
-        magnitude = input_bin & ((1 << (input_dtype.primitive_bitwidth - 1)) - 1)
-        input_nan = magnitude == (1 << (input_dtype.primitive_bitwidth - 1)) - 1
-        input_inf = np.zeros(input_bin.shape, dtype=bool)
-    elif input_dtype in (tl.float8e4b8, tl.float8e5b16):
-        input_nan = input_bin == (1 << (input_dtype.primitive_bitwidth - 1))
-        input_inf = np.zeros(input_bin.shape, dtype=bool)
-    elif input_dtype == tl.float8e4b15:
-        input_nan = np.zeros(input_bin.shape, dtype=bool)
-        input_inf = np.zeros(input_bin.shape, dtype=bool)
-    else:
-        nonfinite_input = input_exponent == (1 << input_exponent_width) - 1
-        input_nan = nonfinite_input & ((input_bin & ((1 << input_dtype.fp_mantissa_width) - 1)) != 0)
-        input_inf = nonfinite_input & ((input_bin & ((1 << input_dtype.fp_mantissa_width) - 1)) == 0)
     sign_output = sign
     # Include the leading bit and align subnormal results before rounding.
     full_significand = significand | (1 << input_dtype.fp_mantissa_width)
@@ -251,20 +237,20 @@ def _convert_float(input, input_dtype, output_dtype, rounding_mode):
     exponent_output = np.minimum(output_exponent, max_exponent)
     exponent_output[retained < (1 << output_dtype.fp_mantissa_width)] = 0
     significand_output = retained & ((1 << output_dtype.fp_mantissa_width) - 1)
-    if not output_dtype.is_fp8():
-        nonfinite = input_nan | input_inf
+    if not input_dtype.is_fp8() and not output_dtype.is_fp8():
+        # Reserved source exponents represent infinities/NaNs, not finite exponents.
+        nonfinite = input_exponent == (1 << input_exponent_width) - 1
+        input_nan = nonfinite & ((input_bin & ((1 << input_dtype.fp_mantissa_width) - 1)) != 0)
         overflow = (output_exponent >= max_exponent) & ~nonfinite
         if rounding_mode == _ir.ROUNDING_MODE.RTNE:
             exponent_output[overflow] = max_exponent
             significand_output[overflow] = 0
+            significand_output[input_nan] = 1 << (output_dtype.fp_mantissa_width - 1)
         else:
             exponent_output[overflow] = max_exponent - 1
             significand_output[overflow] = (1 << output_dtype.fp_mantissa_width) - 1
         exponent_output[nonfinite] = max_exponent
-        significand_output[input_inf] = 0
-        # if the input was NaN but conversion erased all its mantissa bits,
-        # set one bit so the output remains NaN.
-        significand_output[input_nan] = 1 << (output_dtype.fp_mantissa_width - 1)
+        significand_output[nonfinite & ~input_nan] = 0
     if output_dtype in (tl.float8e4b8, tl.float8e5b16):
         # FNUZ formats have only unsigned zero; the sign bit alone encodes NaN.
         zero_output = (exponent_output == 0) & (significand_output == 0)
@@ -360,6 +346,55 @@ def _unpack_e2m1(data, axis):
     return np.moveaxis(unpacked, -1, axis)
 
 
+def _unpack_fp6_to_u6(data):
+    # Operand tensors count logical values: the leading 3/4 of the packed
+    # dim hold dense bytes (groups of 16 codes per 12 bytes; within a
+    # group, code i is in bits [6*i, 6*i+6)); the trailing quarter is
+    # masked-load padding. Global storage itself is dense; kernels
+    # expand it to this width on load.
+    assert data.dtype == np.uint8
+    # Logical K follows the MXFP6Tensor storage contract (groups of 16
+    # values), same as the frontend and IR verifiers.
+    assert data.shape[-1] % 16 == 0
+    data = data[..., :data.shape[-1] * 3 // 4]
+    grouped = data.reshape(data.shape[:-1] + (data.shape[-1] // 3, 3))
+    b0 = grouped[..., 0].astype(np.uint16)
+    b1 = grouped[..., 1].astype(np.uint16)
+    b2 = grouped[..., 2].astype(np.uint16)
+    codes = np.empty(data.shape[:-1] + (grouped.shape[-2] * 4, ), dtype=np.uint8)
+    codes[..., 0::4] = b0 & np.uint16(0x3F)
+    codes[..., 1::4] = ((b0 >> np.uint16(6)) | (b1 << np.uint16(2))) & np.uint16(0x3F)
+    codes[..., 2::4] = ((b1 >> np.uint16(4)) | (b2 << np.uint16(4))) & np.uint16(0x3F)
+    codes[..., 3::4] = (b2 >> np.uint16(2)) & np.uint16(0x3F)
+    return codes
+
+
+def _fp6_to_f32(codes, num_exp_bits, bias):
+    # OCP MX FP6: no Inf/NaN encodings; subnormals supported.
+    assert codes.dtype == np.uint8
+    codes = codes.astype(np.int32)
+    num_mant_bits = 5 - num_exp_bits
+    signs = (codes >> 5) != 0
+    exp = (codes >> num_mant_bits) & ((1 << num_exp_bits) - 1)
+    mant = (codes & ((1 << num_mant_bits) - 1)).astype(np.float32)
+    scale = np.float32(2.0)**(exp - bias).astype(np.float32)
+    sub_scale = np.float32(2.0)**np.float32(1 - bias)
+    values = np.where(exp != 0, (np.float32(1.0) + mant / np.float32(1 << num_mant_bits)) * scale,
+                      (mant / np.float32(1 << num_mant_bits)) * sub_scale)
+    return np.where(signs, -values, values)
+
+
+def _unpack_fp6(data, axis, format_enum):
+    data = np.moveaxis(data, axis, -1)
+    codes = _unpack_fp6_to_u6(data)
+    if format_enum == _ir.ScaleDotElemTypeTY.E2M3:
+        unpacked = _fp6_to_f32(codes, 2, 1)
+    else:
+        assert format_enum == _ir.ScaleDotElemTypeTY.E3M2
+        unpacked = _fp6_to_f32(codes, 3, 3)
+    return np.moveaxis(unpacked, -1, axis)
+
+
 def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack, compute_type, is_rhs):
     if format_enum == _ir.ScaleDotElemTypeTY.E2M1:
         if is_rhs:
@@ -367,6 +402,10 @@ def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack,
         else:
             unpack_axis = -1 if k_pack else -2
         value = _unpack_e2m1(value_handle.data, unpack_axis)
+    elif format_enum in (_ir.ScaleDotElemTypeTY.E2M3, _ir.ScaleDotElemTypeTY.E3M2):
+        assert k_pack, "interpreter: fp6 only supports K-packed inputs"
+        unpack_axis = -2 if is_rhs else -1
+        value = _unpack_fp6(value_handle.data, unpack_axis, format_enum)
     else:
         value = _mxfp_value_handle_to_float32(value_handle)
 
@@ -561,6 +600,41 @@ class InterpreterBuilder:
     def create_store(self, ptr, val, cache_policy):
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
         return self.create_masked_store(ptr, val, mask, cache_policy)
+
+    def create_sr_store(self, ptr, value, index, mask, site, cache, eviction, satfinite):
+        from ._sr_reference import bf16_bits, random_bits
+        from .stochastic_rounding import _interpreter_launch, _PHILOX_ROUNDS
+
+        launch = _interpreter_launch.get()
+        if launch is None:
+            raise ValueError("sr_store requires the stochastic rounding decorator")
+        spec, state, written = launch
+        declaration = next((entry for entry in spec.store_specs if entry.name == site), None)
+        if declaration is None:
+            raise ValueError(f"undeclared SR site: {site}")
+        if mask is None:
+            mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
+        target = ptr.get_element_ty()
+        if state.enabled:
+            addresses = ptr.data[mask.data].flatten().tolist()
+            if len(set(addresses)) != len(addresses) or any(address in written for address in addresses):
+                raise ValueError("SR interpreter requires non-overlapping writes")
+            written.update(addresses)
+        if state.enabled and value.dtype == tl.float32 and target == tl.bfloat16:
+            bits = value.data.view(np.uint32).flatten()
+            indices = index.data.flatten()
+            step = int(state.dynamic_seed.item())
+            rounded = [
+                bf16_bits(
+                    int(value),
+                    random_bits(int(logical), state.base_seed, step, state.invocation_offset, _PHILOX_ROUNDS[spec.prng],
+                                declaration.site_id, entropy=spec.entropy), spec.overflow)
+                for value, logical in zip(bits, indices)
+            ]
+            value = TensorHandle(np.array(rounded, dtype=np.uint16).reshape(value.data.shape), target)
+        else:
+            value = self.cast_impl(value, target)
+        return self.create_masked_store(ptr, value, mask, None)
 
     def create_masked_load(self, ptrs, mask, other, cache_policy, is_volatile):
         dtype_tt = ptrs.get_element_ty()
@@ -787,12 +861,15 @@ class InterpreterBuilder:
         return TensorHandle(1 / np.sqrt(arg.data), arg.dtype.scalar)
 
     # tensor operators
-    create_reshape = lambda self, arg, shape: TensorHandle(arg.data.reshape(shape), arg.dtype.scalar)
+    create_reshape = lambda self, arg, shape, allow_reorder: TensorHandle(arg.data.reshape(shape), arg.dtype.scalar)
 
     def create_trans(self, arg, perm):
         return TensorHandle(np.transpose(arg.data, perm), arg.dtype.scalar)
 
-    def create_dot(self, a, b, d, input_precision, max_num_imprecise_acc):
+    def create_dot(self, a, b, d, input_precision, max_num_imprecise_acc, two_ctas=False):
+        # two_ctas only splits the MMA across a CTA pair on the device; the
+        # operand shapes and the mathematical result are unchanged, so the
+        # interpreter ignores it.
         a_data = a.data
         b_data = b.data
         if (a.dtype.primitive_bitwidth == 8 and a.dtype.is_floating()) or \
@@ -957,7 +1034,8 @@ class InterpreterBuilder:
                                            padding: str = "zero"):
         return TensorDescHandle(base, shape, strides, tensor_shape, padding)
 
-    def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_policy):
+    def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_policy, multicast=None):
+        assert isinstance(desc, TensorDescHandle)
         ptrs, mask = desc.materialize_pointers(indices)
         dtype_tt = ptrs.get_element_ty()
         dtype_np = _get_np_dtype(dtype_tt)
@@ -973,7 +1051,10 @@ class InterpreterBuilder:
             result = TensorHandle(_round_f32_to_tf32(result.data), dtype_tt)
         return result
 
-    def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle]):
+    def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle],
+                                reduce_kind=_ir.DESCRIPTOR_REDUCE_KIND.NONE):
+        if reduce_kind != _ir.DESCRIPTOR_REDUCE_KIND.NONE:
+            raise NotImplementedError("descriptor store reductions are not supported by the interpreter")
         ptrs, mask = desc.materialize_pointers(indices)
         return self.create_masked_store(ptrs, value, mask, None)
 
@@ -1008,8 +1089,11 @@ class InterpreterBuilder:
     def create_dot_scaled(self, lhs: TensorHandle, lhs_scale_handle: Optional[TensorHandle],
                           lhs_format_enum: _ir.ScaleDotElemTypeTY, rhs: TensorHandle,
                           rhs_scale_handle: Optional[TensorHandle], rhs_format_enum: _ir.ScaleDotElemTypeTY,
-                          fast_math: bool, lhs_k_pack: bool, rhs_k_pack: bool,
-                          acc_handle: TensorHandle) -> TensorHandle:
+                          fast_math: bool, lhs_k_pack: bool, rhs_k_pack: bool, acc_handle: TensorHandle,
+                          two_ctas: bool = False) -> TensorHandle:
+        # two_ctas only splits the MMA across a CTA pair on the device; the
+        # operand shapes and the mathematical result are unchanged, so the
+        # interpreter ignores it.
         compute_type = tl.float16 if _ir.ScaleDotElemTypeTY.FP16 in (lhs_format_enum, rhs_format_enum) else tl.bfloat16
         lhs_data = _prepare_dot_scaled_operand(lhs, lhs_scale_handle, lhs_format_enum, lhs_k_pack, compute_type,
                                                is_rhs=False)
@@ -1069,6 +1153,7 @@ def _patch_lang_tensor(tensor, scope: _LangPatchScope):
 
     def _get_transpose(self):
         handle = TensorHandle(np.transpose(self.handle.data), self.handle.dtype)
+        assert self.type.is_block()
         block_shape = list(self.type.shape)
         block_shape[-1], block_shape[-2] = block_shape[-2], block_shape[-1]
         res_ty = tl.core.block_type(self.dtype, block_shape)
@@ -1088,9 +1173,8 @@ class ReduceScanOpInterface:
         self.combine_fn = combine_fn
 
     def check_axis(self, shape, axis):
-        axis = tl.core._unwrap_if_constexpr(axis)
-        if axis is not None:
-            self.axis = tl.core._wrap_axis(axis, len(shape))
+        if axis is not None and axis >= len(shape):
+            raise ValueError(f"axis {axis} out of bounds for shape {shape}")
 
     def check_tensor(self, input):
         for arg in input:
@@ -1200,9 +1284,46 @@ class ReduceOps(ReduceScanOpInterface):
 
 class ScanOps(ReduceScanOpInterface):
 
-    def __init__(self, axis, combine_fn, reverse):
+    def __init__(self, axis, combine_fn, reverse, reduction_ordering=None):
         super().__init__(axis, combine_fn)
         self.reverse = reverse
+        self.reduction_ordering = tl.core._unwrap_if_constexpr(reduction_ordering)
+        if self.reduction_ordering not in (None, tl.ReductionOrdering.UNORDERED, tl.ReductionOrdering.INNER_TREE):
+            raise ValueError(f"unsupported scan reduction_ordering: {self.reduction_ordering}")
+
+    def inner_tree_scan(self, input):
+        output = [arg.handle.data.copy() for arg in input]
+        length = output[0].shape[self.axis]
+        indices = np.arange(length)
+        for level in range((length - 1).bit_length()):
+            span = 1 << level
+            if self.combine_fn not in (tl.standard._sum_combine, tl.standard._prod_combine):
+                # User combine functions receive scalars, including in control flow.
+                for index in np.ndindex(output[0].shape):
+                    if not index[self.axis] & span:
+                        continue
+                    source = list(index)
+                    source[self.axis] = (index[self.axis] // (2 * span)) * (2 * span) + span - 1
+                    lhs = [self.to_tensor(data[tuple(source)], arg.dtype) for data, arg in zip(output, input)]
+                    rhs = [self.to_tensor(data[index], arg.dtype) for data, arg in zip(output, input)]
+                    result = self.combine_fn.fn(*lhs, *rhs)
+                    if not isinstance(result, tuple):
+                        result = (result, )
+                    for data, value in zip(output, result):
+                        data[index] = value.handle.data.item() if isinstance(value, tl.core.tensor) else value
+                continue
+            right = indices[(indices & span) != 0]
+            left = (right // (2 * span)) * (2 * span) + span - 1
+            lhs = [self.to_tensor(np.take(data, left, axis=self.axis), arg.dtype) for data, arg in zip(output, input)]
+            rhs = [self.to_tensor(np.take(data, right, axis=self.axis), arg.dtype) for data, arg in zip(output, input)]
+            result = self.combine_fn.fn(*lhs, *rhs)
+            if not isinstance(result, tuple):
+                result = (result, )
+            selection = [slice(None)] * output[0].ndim
+            selection[self.axis] = right
+            for data, value in zip(output, result):
+                data[tuple(selection)] = value.handle.data
+        return [self.to_tensor(data, arg.dtype) for data, arg in zip(output, input)]
 
     def cumsum(self, input):
         return [self.to_tensor(np.cumsum(input.handle.data, axis=self.axis), dtype=input.dtype)]
@@ -1248,7 +1369,9 @@ class ScanOps(ReduceScanOpInterface):
                     self.to_tensor(np.ascontiguousarray(np.flip(arg.handle.data, axis=self.axis)), arg.dtype))
         else:
             new_input = input
-        if self.combine_fn == tl.standard._sum_combine:
+        if self.reduction_ordering == tl.ReductionOrdering.INNER_TREE:
+            ret = self.inner_tree_scan(new_input)
+        elif self.combine_fn == tl.standard._sum_combine:
             ret = self.cumsum(new_input[0])
         elif self.combine_fn == tl.standard._prod_combine:
             ret = self.cumprod(new_input[0])
@@ -1268,8 +1391,8 @@ def _patch_reduce_scan(scope: _LangPatchScope):
     def _new_reduce(input, axis, combine_fn, keep_dims=False, **kwargs):
         return ReduceOps(axis, combine_fn, keep_dims).apply(input)
 
-    def _new_scan(input, axis, combine_fn, reverse=False, **kwargs):
-        return ScanOps(axis, combine_fn, reverse).apply(input)
+    def _new_scan(input, axis, combine_fn, reverse=False, reduction_ordering=None, **kwargs):
+        return ScanOps(axis, combine_fn, reverse, reduction_ordering).apply(input)
 
     scope.set_attr(tl, "reduce", _new_reduce)
     scope.set_attr(tl, "associative_scan", _new_scan)
@@ -1512,11 +1635,6 @@ class GridExecutor:
         # run pre-run hooks
         for hook in self.pre_run_hooks:
             hook(*args_hst, **kwargs_hst)
-        # Callable grids inspect the original launch arguments and tensor metadata.
-        if callable(self.grid):
-            grid = self.grid(inspect.getcallargs(self.fn, *args_dev, **kwargs))
-        else:
-            grid = self.grid
         # remaps core language functions to interpreted ones
         patch_scope = _patch_lang(self.fn)
         try:
@@ -1525,6 +1643,7 @@ class GridExecutor:
             args = inspect.getcallargs(self.fn, *args_hst, **kwargs_hst)
             args = {name: arg if name in self.constexprs else _implicit_cvt(arg) for name, arg in args.items()}
             # iterate through grid
+            grid = self.grid(args) if callable(self.grid) else self.grid
             assert len(grid) <= 3, "grid must have at most 3 dimensions"
             grid = grid + (1, ) * (3 - len(grid))
             interpreter_builder.set_grid_dim(*grid)
@@ -1703,9 +1822,6 @@ class InterpretedFunction(KernelInterface[T]):
         if warmup:
             return
         fn = self.rewrite()
-        # Match JITFunction.run's debug precedence.
-        debug = kwargs.get("debug", self.kwargs.get("debug")) or triton.knobs.runtime.debug
-        interpreter_builder.options = InterpreterOptions(debug=bool(debug))
         return GridExecutor(fn, self.arg_names, grid, self.pre_run_hooks)(*args, **kwargs)
 
     def add_pre_run_hook(self, hook):
@@ -1723,11 +1839,9 @@ class InterpretedFunction(KernelInterface[T]):
 
     def __call__(self, *args, **kwargs):
         # This is a device function call
-        scope = _patch_lang(self.fn)
+        _patch_lang(self.fn)
+        fn = self.rewrite()
         try:
-            fn = self.rewrite()
             return fn(*args, **kwargs)
         except Exception as e:
             raise InterpreterError(repr(e)) from e
-        finally:
-            scope.restore()

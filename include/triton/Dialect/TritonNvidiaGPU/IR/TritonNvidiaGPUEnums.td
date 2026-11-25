@@ -59,4 +59,69 @@ def TTNG_TensorMemoryScalesBlockRepOrderAttr : I32EnumAttr<
   let genSpecializedAttr = 0;
 }
 
+//===----------------------------------------------------------------------===//
+// TensorMemoryCTAMode enum
+//===----------------------------------------------------------------------===//
+
+def TTNG_TensorMemoryCTAMode_Default : I32EnumAttrCase<"DEFAULT", 0, "default">;
+def TTNG_TensorMemoryCTAMode_TwoCTA_LHS
+    : I32EnumAttrCase<"TwoCTA_LHS", 1, "twocta_lhs">;
+def TTNG_TensorMemoryCTAMode_TwoCTA_RHS
+    : I32EnumAttrCase<"TwoCTA_RHS", 2, "twocta_rhs">;
+
+def TTNG_TensorMemoryCTAMode
+    : I32EnumAttr<"TensorMemoryCTAMode",
+                  "Tensor memory CTA mode for LinearLayout conversion",
+                  [TTNG_TensorMemoryCTAMode_Default,
+                   TTNG_TensorMemoryCTAMode_TwoCTA_LHS,
+                   TTNG_TensorMemoryCTAMode_TwoCTA_RHS]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+}
+
+//===----------------------------------------------------------------------===//
+// BarrierPlacement enum
+//===----------------------------------------------------------------------===//
+
+def TTNG_BarrierPlacementBefore : I32EnumAttrCase<"BEFORE", 0, "before">;
+def TTNG_BarrierPlacementAfter : I32EnumAttrCase<"AFTER", 1, "after">;
+
+def TTNG_BarrierPlacement
+    : I32EnumAttr<"BarrierPlacement", "Barrier placement relative to target op",
+                  [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+}
+
+//===----------------------------------------------------------------------===//
+// BarrierRegion enum
+//===----------------------------------------------------------------------===//
+
+def TTNG_BarrierRegionTile : I32EnumAttrCase<"TILE", 0, "tile">;
+def TTNG_BarrierRegionSetup : I32EnumAttrCase<"SETUP", 1, "setup">;
+def TTNG_BarrierRegionTeardown : I32EnumAttrCase<"TEARDOWN", 2, "teardown">;
+
+def TTNG_BarrierRegion
+    : I32EnumAttr<"BarrierRegion",
+                  "Which region of a subtiled_region the barrier targets",
+                  [TTNG_BarrierRegionTile, TTNG_BarrierRegionSetup,
+                   TTNG_BarrierRegionTeardown]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+}
+
+def TTNG_TensorModeAttr
+    : I32EnumAttr<"TensorMode", "",
+                  [I32EnumAttrCase<"TILED", 0, "tiled">,
+                   I32EnumAttrCase<"IM2COL", 1, "im2col">]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+  let description = [{
+    Enum attribute for TMA tensor mode.
+
+    TILED: Tiled mode for regular tensor memory access.
+    IM2COL: Im2col mode for convolution-friendly tensor memory access.
+
+    See:
+    - https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-tiled-mode
+    - https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-im2col-mode
+  }];
+}
+
 #endif // TRITONNVIDIAGPU_ENUMS

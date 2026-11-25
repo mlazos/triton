@@ -13,15 +13,20 @@
 #define TRITON_PLUGIN_UTILS_H
 
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
-#include "python/src/ir.h"
 #include "triton/Version.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/Error.h"
 #include <cstdint>
 #include <vector>
+
+// Defined in python/src/ir.h (pulls in pybind11). PluginUtils only references
+// it by reference, so forward-declare to keep pybind11 out of TritonTools,
+// which is a non-python lib in the beta buck build.
+class TritonOpBuilder;
 
 /// Identifies the API version understood by this plugin.
 ///

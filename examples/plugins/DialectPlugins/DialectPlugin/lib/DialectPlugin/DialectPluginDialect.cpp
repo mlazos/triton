@@ -30,6 +30,10 @@ void DialectPluginDialect::initialize() {
 #include "mlir/Tools/Plugins/PassPlugin.h"
 #include "triton/Tools/PluginUtils.h"
 #include "llvm/Config/llvm-config.h"
+// PluginUtils.h only forward-declares TritonOpBuilder (to keep pybind11 out of
+// the non-python TritonTools buck lib); this TU calls the templated
+// self.create<>() so it needs the complete type from ir.h.
+#include "python/src/ir.h"
 
 static const char *PLUGIN_NAME = "DialectPlugin";
 static const char *DIALECT_NAME = "DialectPlugin";

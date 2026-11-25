@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import functools
 import importlib
 import os
@@ -10,7 +11,20 @@ import pathlib
 
 from dataclasses import dataclass
 from contextlib import contextmanager
-from typing import cast, Any, Callable, Generator, Generic, Optional, Protocol, Type, TypeVar, TypedDict, TYPE_CHECKING, Union
+from typing import (
+    cast,
+    Any,
+    Callable,
+    Generator,
+    Generic,
+    Optional,
+    Protocol,
+    Type,
+    TypeVar,
+    TypedDict,
+    TYPE_CHECKING,
+    Union,
+)
 
 from triton._C.libtriton import getenv, getenv_bool  # type: ignore
 
@@ -173,6 +187,12 @@ class env_class(Generic[ClassType], env_base[Optional[Type[ClassType]], Optional
         return cast(Type[ClassType], cls)
 
 
+# How much of a failed tool's output to quote back in the failure reason. A tool
+# that fails verbosely should not be able to turn into a multi-megabyte
+# exception string. The tail is kept because that is where the error usually is.
+_MAX_TOOL_OUTPUT = 2048
+
+
 @dataclass
 class NvidiaTool:
     path: str
@@ -180,15 +200,40 @@ class NvidiaTool:
 
     @staticmethod
     @functools.lru_cache
-    def from_path(path: str) -> Optional[NvidiaTool]:
+    def probe(path: str) -> tuple[Optional[NvidiaTool], Optional[str]]:
+        """Run `<path> --version`.
+
+        Returns `(tool, None)` on success and `(None, reason)` on failure, where
+        `reason` explains why the binary was unusable. Callers that surface a
+        "cannot find" error should include it: a tool that exists but cannot be
+        executed is indistinguishable from a missing one otherwise.
+        """
         try:
-            result = subprocess.check_output([path, "--version"], stderr=subprocess.STDOUT)
-            version = re.search(r".*release (\d+\.\d+).*", result.decode("utf-8"), flags=re.MULTILINE)
-            if version is None:
-                return None
-            return NvidiaTool(path, version.group(1))
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return None
+            result = subprocess.check_output([path, "--version"], stderr=subprocess.STDOUT, env=nvidia.get_tool_env())
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                return None, "no such file"
+            if e.errno in (errno.EACCES, errno.EPERM, errno.ENOEXEC, errno.EISDIR):
+                return None, f"cannot execute: {e.strerror or e}"
+            # Anything else -- EMFILE, EAGAIN, ENOMEM -- is a failure of the
+            # spawning process, not of this candidate. Reporting it as a
+            # per-candidate reason would bury it under the same misleading
+            # "Cannot find <tool>" that this reporting exists to eliminate.
+            raise
+        except subprocess.CalledProcessError as e:
+            output = (e.output or b"").decode(errors="replace").strip()
+            if len(output) > _MAX_TOOL_OUTPUT:
+                output = "..." + output[-_MAX_TOOL_OUTPUT:]
+            reason = f"`--version` exited with status {e.returncode}"
+            return None, f"{reason}: {output}" if output else reason
+        version = re.search(r".*release (\d+\.\d+).*", result.decode("utf-8"), flags=re.MULTILINE)
+        if version is None:
+            return None, "`--version` did not report a `release X.Y` version"
+        return NvidiaTool(path, version.group(1)), None
+
+    @staticmethod
+    def from_path(path: str) -> Optional[NvidiaTool]:
+        return NvidiaTool.probe(path)[0]
 
 
 class env_nvidia_tool(env_base[str, NvidiaTool]):
@@ -210,11 +255,14 @@ class env_nvidia_tool(env_base[str, NvidiaTool]):
         else:
             paths = [self.default_path]
 
+        failures = []
         for path in paths:
-            if tool := NvidiaTool.from_path(path):
+            tool, reason = NvidiaTool.probe(path)
+            if tool is not None:
                 return tool
+            failures.append(f"  {path}: {reason}")
 
-        raise RuntimeError(f"Cannot find {self.binary}")
+        raise RuntimeError("Cannot find {}. Tried:\n{}".format(self.binary, "\n".join(failures)))
 
 
 # Separate classes so that types are correct
@@ -259,12 +307,19 @@ class CompileTimes:
 
 class CompilationListener(Protocol):
 
-    def __call__(self, *, src: Union[ASTSource, IRSource], metadata: dict[str, Any], metadata_group: dict[str, str],
-                 times: CompileTimes, cache_hit: bool) -> None:
+    def __call__(
+        self,
+        *,
+        src: Union[ASTSource, IRSource],
+        metadata: dict[str, Any],
+        metadata_group: dict[str, str],
+        times: CompileTimes,
+        cache_hit: bool,
+    ) -> None:
         ...
 
 
-knobs_type = TypeVar("knobs_type", bound='base_knobs')
+knobs_type = TypeVar("knobs_type", bound="base_knobs")
 
 
 class base_knobs:
@@ -311,13 +366,23 @@ class base_knobs:
 
 class BuildImpl(Protocol):
 
-    def __call__(self, name: str, src: str, srcdir: str, library_dirs: list[str], include_dirs: list[str],
-                 libraries: list[str], /) -> str:
+    def __call__(
+        self,
+        name: str,
+        src: str,
+        srcdir: str,
+        library_dirs: list[str],
+        include_dirs: list[str],
+        libraries: list[str],
+        ccflags: list[str],
+        /,
+    ) -> str:
         ...
 
 
 class build_knobs(base_knobs):
     """Configuration controlling how the native compiler is invoked"""
+
     cc: env_opt_str = env_opt_str("CC")
 
     cudacrt_path: env_opt_str = env_opt_str("TRITON_CUDACRT_PATH")
@@ -357,10 +422,16 @@ class compilation_knobs(base_knobs):
     override: env_bool = env_bool("TRITON_KERNEL_OVERRIDE")
     dump_ir: env_bool = env_bool("TRITON_KERNEL_DUMP")
     dump_ir_extract_di_local_variables: env_bool = env_bool("LLVM_EXTRACT_DI_LOCAL_VARIABLES")
+    # Dump the final TTGIR of each kernel as equivalent TLX Python
+    dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
+    dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     store_binary_only: env_bool = env_bool("TRITON_STORE_BINARY_ONLY")
     always_compile: env_bool = env_bool("TRITON_ALWAYS_COMPILE")
+    # Perfetto trace of compilation; see triton/tools/compile_trace.py
+    compile_trace: env_opt_str = env_opt_str("TRITON_COMPILE_TRACE")
     # TODO: Use enum to constrain / 'typecheck' the values
     use_ir_loc: env_opt_str = env_opt_str("USE_IR_LOC")
+    use_ptx_loc: env_bool = env_bool("USE_PTX_LOC")
     enable_asan: env_bool = env_bool("TRITON_ENABLE_ASAN")
     disable_line_info: env_bool = env_bool("TRITON_DISABLE_LINE_INFO")
     front_end_debugging: env_bool = env_bool("TRITON_FRONT_END_DEBUGGING")
@@ -369,6 +440,11 @@ class compilation_knobs(base_knobs):
     # We cache the value here to avoid the expensive check on every run.
     instrumentation_mode: str = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
     fpsan_homomorphic_casts: env_bool = env_bool("TRITON_FPSAN_HOMOMORPHIC_CASTS")
+    # os.pathsep-separated plugin extension shared objects. loadPlugins()
+    # (lib/Tools/PluginUtils.cpp) reads the environment directly and is memoized on
+    # the first call, which happens while libtriton is being imported, so assigning
+    # this afterwards records the value but loads nothing.
+    plugin_paths: env_opt_str = env_opt_str("TRITON_PLUGIN_PATHS")
     listener: Union[CompilationListener, None] = None
 
 
@@ -382,12 +458,15 @@ class AutotuneListener(Protocol):
 class autotuning_knobs(base_knobs):
     cache: env_bool = env_bool("TRITON_CACHE_AUTOTUNING")
     print: env_bool = env_bool("TRITON_PRINT_AUTOTUNING")
+    dump_best_config_ir: env_bool = env_bool("TRITON_KERNEL_DUMP_BEST_CONFIG")
+    warmup: env_int = env_int("TRITON_AUTOTUNE_WARMUP_MS", 25)
+    rep: env_int = env_int("TRITON_AUTOTUNE_REP_MS", 100)
+    use_entropy: env_bool = env_bool("TRITON_AUTOTUNE_USE_ENTROPY", True)
     listener: Union[AutotuneListener, None] = None
 
 
 class LaunchHook(Protocol):
-    """Hook invoked before and after kernel launching
-    """
+    """Hook invoked before and after kernel launching"""
 
     def __call__(self, metadata: LazyDict) -> None:
         ...
@@ -413,8 +492,7 @@ F = TypeVar("F", bound=Callable)
 
 
 class HookChain(Generic[F]):
-    """A chain of hooks of the same type F to be called in order.
-    """
+    """A chain of hooks of the same type F to be called in order."""
 
     def __init__(self, reversed: bool = False):
         self.calls: list[F] = []
@@ -427,6 +505,9 @@ class HookChain(Generic[F]):
     def remove(self, func: F) -> None:
         if func in self.calls:
             self.calls.remove(func)
+
+    def __bool__(self):
+        return len(self.calls) > 0
 
     def __call__(self, *args, **kwargs):
         for call in self.calls if not self.reversed else reversed(self.calls):
@@ -446,6 +527,9 @@ class JITHookCompileInfo(TypedDict):
     num_warps: int
     num_ctas: int
     num_stages: int
+    minRegAutoWS: Optional[int]
+    maxRegAutoWS: Optional[int]
+    pingpongAutoWS: Optional[bool]
     enable_fp_fusion: bool
     launch_cooperative_grid: bool
     extern_libs: tuple[tuple[str, str], ...]
@@ -456,8 +540,16 @@ class JITHookCompileInfo(TypedDict):
 
 class JITHook(Protocol):
 
-    def __call__(self, *, key: str, repr: str, fn: JitFunctionInfo, compile: JITHookCompileInfo, is_manual_warmup: bool,
-                 already_compiled: bool) -> Optional[bool]:
+    def __call__(
+        self,
+        *,
+        key: str,
+        repr: str,
+        fn: JitFunctionInfo,
+        compile: JITHookCompileInfo,
+        is_manual_warmup: bool,
+        already_compiled: bool,
+    ) -> Optional[bool]:
         ...
 
 
@@ -472,6 +564,8 @@ class runtime_knobs(base_knobs):
     # debug is on critical path for kernel launches
     # avoid repeated reads from env-var by calling get directly
     debug: bool = env_bool("TRITON_DEBUG").get()
+    # sanitize_overflow enables overflow checking for integer operations
+    sanitize_overflow: bool = env_bool("TRITON_SANITIZE_OVERFLOW").get()
     override_arch: env_opt_str = env_opt_str("TRITON_OVERRIDE_ARCH")
 
     launch_enter_hook: HookChain[LaunchHook] = HookChain()
@@ -491,14 +585,22 @@ class runtime_knobs(base_knobs):
     # Hook for inspecting compiler pipeline stages
     add_stages_inspection_hook: Optional[PipelineStagesHook] = None
 
+    # Shared C dispatcher and FastCache controls apply to all supported backends.
+    # Keep the environment names stable for existing users.
+    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER", True)
+    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE", True)
+    enable_c_cache: env_bool = env_bool("TRITON_ENABLE_C_CACHE", True)
+
 
 class language_knobs(base_knobs):
     fp32_default: env_opt_str = env_opt_str("TRITON_F32_DEFAULT")
-    default_fp_fusion: env_bool = env_bool("TRITON_DEFAULT_FP_FUSION", False)
-    allow_fp_fusion: env_bool = env_bool("TRITON_ALLOW_FP_FUSION")
+    default_fp_fusion: env_bool = env_bool("TRITON_DEFAULT_FP_FUSION", True)
+    force_disable_fp_fusion: env_bool = env_bool("TRITON_FORCE_DISABLE_FP_FUSION")
+    strict_reduction_ordering: env_bool = env_bool("TRITON_STRICT_REDUCTION_ORDERING")
+    allow_npot: env_bool = env_bool("TRITON_ALLOW_NPOT")
 
     def fp_fusion_enabled(self, requested: Optional[bool]) -> bool:
-        return self.allow_fp_fusion and (self.default_fp_fusion if requested is None else requested)
+        return not self.force_disable_fp_fusion and (self.default_fp_fusion if requested is None else requested)
 
 
 class nvidia_knobs(base_knobs):
@@ -512,17 +614,116 @@ class nvidia_knobs(base_knobs):
     ptxas_options: env_opt_str = env_opt_str("PTXAS_OPTIONS")
     mock_ptx_version: env_opt_str = env_opt_str("TRITON_MOCK_PTX_VERSION")
     dump_ptxas_log: env_bool = env_bool("TRITON_DUMP_PTXAS_LOG")
+    # Keep real source paths in PTX .file directives instead of virtualizing them
+    # to <source>/<basename>, so profilers like ncu can resolve the source files.
+    preserve_ptx_source_paths: env_bool = env_bool("TRITON_PRESERVE_PTX_SOURCE_PATHS")
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
+    use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
+    # Re-issue tcgen05 MMAs that share operand A so A is read once through the
+    # collector buffer (see triton-nvidia-mma-collector-reuse).
+    disable_mma_collector_reuse: env_bool = env_bool("TRITON_DISABLE_MMA_COLLECTOR_REUSE")
+
+    # Deprecated aliases. Use knobs.runtime for shared dispatcher controls.
+    @property
+    def use_triton_dispatcher(self) -> bool:
+        return runtime.use_triton_dispatcher
+
+    @use_triton_dispatcher.setter
+    def use_triton_dispatcher(self, value: bool) -> None:
+        runtime.use_triton_dispatcher = value
+
+    @use_triton_dispatcher.deleter
+    def use_triton_dispatcher(self) -> None:
+        del runtime.use_triton_dispatcher
+
+    @property
+    def use_autotune_c_cache(self) -> bool:
+        return runtime.use_autotune_c_cache
+
+    @use_autotune_c_cache.setter
+    def use_autotune_c_cache(self, value: bool) -> None:
+        runtime.use_autotune_c_cache = value
+
+    @use_autotune_c_cache.deleter
+    def use_autotune_c_cache(self) -> None:
+        del runtime.use_autotune_c_cache
+
+    @property
+    def enable_c_cache(self) -> bool:
+        return runtime.enable_c_cache
+
+    @enable_c_cache.setter
+    def enable_c_cache(self, value: bool) -> None:
+        runtime.enable_c_cache = value
+
+    @enable_c_cache.deleter
+    def enable_c_cache(self) -> None:
+        del runtime.enable_c_cache
+
+    # Environment used to spawn the NVIDIA tools above. `None` inherits the
+    # current environment. Packagers whose interpreter runs with an environment
+    # that is hostile to standalone binaries -- e.g. an LD_PRELOAD'd allocator
+    # that only resolves its own symbols inside the host interpreter -- can
+    # install a callable here to sanitize it. Set it before the first tool
+    # lookup: `NvidiaTool.probe` caches per path.
+    tool_env: Union[Callable[[], Optional[dict[str, str]]], None] = None
+
+    def get_tool_env(self) -> Optional[dict[str, str]]:
+        return self.tool_env() if self.tool_env is not None else None
+
+    # Number of buffers for the dynamic-persistent tile-id broadcast channel
+    # (cross-partition run-once atomic support). 1 = single-stage.
+    ws_tile_prefetch_depth: env_int = env_int("TRITON_WS_TILE_PREFETCH_DEPTH", 1)
+    # TMEM memory-planner top-K packing search. topk>1 enumerates the top-K
+    # column packings; pick selects which rank to apply (0 = cost/occupancy-best,
+    # == the default first-fit result); topk_dump writes the ranked packings as
+    # JSON for a harness. Prefer these knobs over the TRITON_WS_MEM_PLAN_* env
+    # vars so tests can scope them (knobs.nvidia.scope()) without leaking global
+    # env state across a batch run.
+    ws_mem_plan_topk: env_int = env_int("TRITON_WS_MEM_PLAN_TOPK", 1)
+    ws_mem_plan_pick: env_int = env_int("TRITON_WS_MEM_PLAN_PICK", 0)
+    ws_mem_plan_topk_dump: env_opt_str = env_opt_str("TRITON_WS_MEM_PLAN_TOPK_DUMP")
+    use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
+    use_list_schedule: env_bool = env_bool("TRITON_USE_LIST_SCHEDULE")
+    use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")
+    use_joint_schedule: env_bool = env_bool("TRITON_USE_JOINT_SCHEDULE")
+    # Terminal policy when the joint solver cannot produce a complete verified
+    # schedule. Off (default) falls back to the baseline schedule + partition
+    # path and emits a remark; on turns every terminal trigger into a
+    # compilation error. Read on the C++ side, mirrored here so tests can scope
+    # it (knobs.nvidia.scope()) instead of leaking global env state.
+    modulo_strict_error: env_bool = env_bool("TRITON_MODULO_STRICT_ERROR")
+    disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
+    promote_mbarrier_to_named_barrier: env_bool = env_bool("TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER")
+    # Read-only TLX looped-barrier remarks; does not enable barrier promotion.
+    report_tlx_barrier_hotspots: env_bool = env_bool("TRITON_REPORT_BARRIER_HOTSPOTS")
+    use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
+    auto_tma: env_bool = env_bool("TRITON_AUTO_TMA")
+    auto_tma_device: env_bool = env_bool("TRITON_AUTO_TMA_DEVICE")
+    generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
+    # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.
+    # Default ON; set TRITON_ENABLE_INTERLEAVE_TMEM=0 to opt out for A/B
+    # testing against the operand-D back-edge channel fix.
+    enable_interleave_tmem: env_bool = env_bool("TRITON_ENABLE_INTERLEAVE_TMEM", True)
+    # Default ON; opt out with TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS=0.
+    enable_unify_ws_barrier_locations: env_bool = env_bool("TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS", True)
+    enable_tileir: env_bool = env_bool("ENABLE_TILE")
+    disable_budget_aware_layout_conversion: env_bool = env_bool("TRITON_DISABLE_BUDGET_AWARE_LAYOUT_CONVERSION")
+    # Gate opt-in perf-benchmark tests (do_bench sweeps) so unit-test runs do
+    # not pay the perf-sweep cost.
+    run_perf: env_bool = env_bool("TRITON_RUN_PERF")
+    # M2 (bitequiv): tritongpu-optimize-reduction-layout tunables, forwarded as
+    # pass Options. The pass always runs at end of make_ttgir.
+    red_ordering_strategy: env_str = env_str("TRITON_RED_ORDERING_STRATEGY", "ideal")
+    red_ordering_min_underparallel: env_int = env_int("TRITON_RED_ORDERING_MIN_UNDERPARALLEL", 8)
+    red_ordering_max_elems_per_thread: env_int = env_int("TRITON_RED_ORDERING_MAX_ELEMS_PER_THREAD", 256)
 
 
 class amd_knobs(base_knobs):
     codegen_path: env_opt_str = env_opt_str("TRITON_AMD_CODEGEN_PATH")
-    bitcode_path: env_opt_str = env_opt_str("TRITON_AMD_BITCODE_PATH")
-    # use_buffer_ops is read once per tensor arg on the kernel launch critical path
-    # avoid repeated reads from env-var by calling get directly
-    use_buffer_ops: bool = env_bool("AMDGCN_USE_BUFFER_OPS", True).get()
+    use_buffer_ops: env_bool = env_bool("AMDGCN_USE_BUFFER_OPS", True)
     # Note: This requires use_buffer_ops be true to have any effect
     use_buffer_atomics: env_bool = env_bool("AMDGCN_USE_BUFFER_ATOMICS", True)
     # Note: This requires use_buffer_ops be true to have any effect
@@ -536,6 +737,7 @@ class amd_knobs(base_knobs):
     use_async_copy: env_opt_bool = env_opt_bool("TRITON_HIP_USE_ASYNC_COPY")
     use_coexec_scheduler: env_opt_bool = env_opt_bool("TRITON_HIP_USE_COEXEC_SCHEDULER")
     use_expert_scheduling: env_opt_bool = env_opt_bool("TRITON_HIP_USE_EXPERT_SCHEDULING")
+    enable_ttgir_schedule: env_bool = env_bool("TRITON_AMD_TTGIR_SCHEDULE")
 
     # Path to dump MIR files for debugging/analysis
     dump_mir: env_opt_str = env_opt_str("TRITON_DUMP_MIR")
@@ -549,10 +751,12 @@ class proton_knobs(base_knobs):
     disable: env_bool = env_bool("TRITON_PROTON_DISABLE", False)
     cupti_lib_dir: env_str = env_str(
         "TRITON_CUPTI_LIB_PATH",
-        str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti"))
+        str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti"),
+    )
     cupti_lib_blackwell_dir: env_str = env_str(
         "TRITON_CUPTI_LIB_BLACKWELL_PATH",
-        str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti-blackwell"))
+        str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti-blackwell"),
+    )
     hsa_runtime_path: env_opt_str = env_opt_str("TRITON_HSA_RUNTIME_PATH")
     hsa_runtime_library: env_opt_str = env_opt_str("TRITON_HSA_RUNTIME_LIBRARY")
     rocprofiler_sdk_include_path: env_opt_str = env_opt_str("TRITON_ROCPROFILER_SDK_INCLUDE_PATH")
@@ -599,5 +803,5 @@ proton = proton_knobs()
 
 def refresh_knobs():
     runtime.debug = env_bool("TRITON_DEBUG").get()
+    runtime.sanitize_overflow = env_bool("TRITON_SANITIZE_OVERFLOW").get()
     compilation.instrumentation_mode = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
-    amd.use_buffer_ops = env_bool("AMDGCN_USE_BUFFER_OPS", True).get()

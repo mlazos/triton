@@ -112,3 +112,77 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// On AMD, int8 scales are E8M0 at any block size: block-16 int8 scales take
+// the E8M0 decode (extui/shli/bitcast), never the NV-only UE5M3 decode.
+// CHECK-LABEL: mfma_dot_scaled_block16_int8_stays_e8m0
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_dot_scaled_block16_int8_stays_e8m0(
+      %arg0: tensor<32x64x!tt.ptr<bf16>, #blocked2>,
+      %arg1: tensor<32x32x!tt.ptr<i8>, #blocked>,
+      %arg2: tensor<32x4x!tt.ptr<i8>, #blocked1>,
+      %arg3: tensor<32x32x!tt.ptr<f32>, #blocked>
+    ) {
+    // CHECK: %[[ES:.*]] = arith.extui
+    // CHECK-NOT: arith.shrui
+    // CHECK-NOT: arith.andi
+    // CHECK: %[[SHS:.*]] = arith.shli %[[ES]]
+    // CHECK: %[[CLAMP:.*]] = arith.maxui %[[SHS]]
+    // CHECK: tt.bitcast %[[CLAMP]] : tensor<4x32xi16, #linear{{.*}}> -> tensor<4x32xbf16, #linear{{.*}}>
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
+    %1 = tt.load %arg0 : tensor<32x64x!tt.ptr<bf16>, #blocked2>
+    %2 = tt.load %arg1 : tensor<32x32x!tt.ptr<i8>, #blocked>
+    %3 = tt.load %arg2 : tensor<32x4x!tt.ptr<i8>, #blocked1>
+    %4 = tt.dot_scaled %1, %2 scale %3, %cst lhs = bf16 rhs = e2m1 {fastMath = true} : tensor<32x64xbf16, #blocked2> * tensor<32x32xi8, #blocked>, tensor<32x4xi8, #blocked1> -> tensor<32x32xf32, #blocked>
+    tt.store %arg3, %4 : tensor<32x32x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// MFMA-layout FP6 decomposes to BF16 (multi-step K=256 shown);
+// single-step K=128 is native (next test).
+// CHECK-LABEL: mfma_dot_scaled_fp6_layout_decompose
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 2], warpsPerCTA = [1, 4], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 128], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_dot_scaled_fp6_layout_decompose(
+      %arg0: tensor<32x256xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>,
+      %arg1: tensor<32x8xi8, #blocked>,
+      %arg2: tensor<256x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>,
+      %arg3: tensor<32x8xi8, #blocked>,
+      %arg4: tensor<32x32xf32, #mma>
+    ) -> tensor<32x32xf32, #mma> {
+    // CHECK: tt.dot {{.*}} : tensor<32x256xbf16, #ttg.dot_op<{opIdx = 0, parent = {{.*}}, kWidth = 8}>> * tensor<256x32xbf16, #ttg.dot_op<{opIdx = 1, parent = {{.*}}, kWidth = 8}>> -> tensor<32x32xf32, {{.*}}>
+    // CHECK-NOT: tt.dot_scaled
+    %0 = tt.dot_scaled %arg0 scale %arg1, %arg2 scale %arg3, %arg4 lhs = e2m3 rhs = e3m2 {fastMath = false} : tensor<32x256xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, tensor<32x8xi8, #blocked> * tensor<256x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, tensor<32x8xi8, #blocked> -> tensor<32x32xf32, #mma>
+    tt.return %0 : tensor<32x32xf32, #mma>
+  }
+}
+
+// -----
+
+// Manual 96-byte packed K (128 logical values): single-step stays native instead of decomposing.
+// CHECK-LABEL: mfma_dot_scaled_fp6_layout_native_packed_k
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 2], warpsPerCTA = [1, 4], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 128], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_dot_scaled_fp6_layout_native_packed_k(
+      %arg0: tensor<32x128xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>,
+      %arg1: tensor<32x4xi8, #blocked>,
+      %arg2: tensor<128x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>,
+      %arg3: tensor<32x4xi8, #blocked>,
+      %arg4: tensor<32x32xf32, #mma>
+    ) -> tensor<32x32xf32, #mma> {
+    // CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+    // CHECK-NOT: tt.dot {{.*}} tensor<32x128xbf16
+    %0 = tt.dot_scaled %arg0 scale %arg1, %arg2 scale %arg3, %arg4 lhs = e2m3 rhs = e3m2 {fastMath = false} : tensor<32x128xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, tensor<32x4xi8, #blocked> * tensor<128x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, tensor<32x4xi8, #blocked> -> tensor<32x32xf32, #mma>
+    tt.return %0 : tensor<32x32xf32, #mma>
+  }
+}

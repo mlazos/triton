@@ -28,7 +28,7 @@ NUM_WARPS = 8
 
 def is_hopper():
     target = triton.runtime.driver.active.get_current_target()
-    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] == 9
+    return target.is_cuda_backend() and torch.cuda.get_device_capability()[0] == 9
 
 
 def config_helper(description: str):
@@ -64,6 +64,12 @@ def config_helper(description: str):
         default=False,
         help="Use global memory as the internal buffer during profiling (default: False).",
     )
+    parser.add_argument(
+        "--gmem_buffer",
+        action="store_true",
+        default=False,
+        help="Use global memory as the internal buffer during profiling (default: False).",
+    )
 
     args = parser.parse_args()
 
@@ -73,6 +79,11 @@ def config_helper(description: str):
     # `clock_32` provides lower overhead per record, `time_shift`` post-processes to reduce noise
     if args.increase_accuracy:
         opts = "clock32,time_shift"
+
+    if args.gmem_buffer:
+        buf = "global"
+    else:
+        buf = "shared"
 
     if args.gmem_buffer:
         buf = "global"

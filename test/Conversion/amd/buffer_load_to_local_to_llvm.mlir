@@ -22,6 +22,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#scale_offsets = #ttg.generic_linear<{register = [[1, 0], [2, 0]], lane = [[4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 1]], warp = [[0, 2], [16, 4], [0, 0]], block = []}>
+#scale_shared = #ttg.shared_linear<{offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [16, 4]]}, alignment = 16>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.shared = 0 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: buffer_load_to_local_shared_linear_direct_mapping
+  tt.func public @buffer_load_to_local_shared_linear_direct_mapping(
+      %ptr: !tt.ptr<i8> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+      %offsets: tensor<128x8xi32, #scale_offsets> {tt.contiguity = dense<[128, 1]> : tensor<2xi32>, tt.divisibility = dense<[16, 1]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>},
+      %dst: !ttg.memdesc<128x8xi8, #scale_shared, #smem, mutable>) {
+    // The source distribution and shared layout describe the same physical
+    // swizzle, so lowering writes the final LDS image directly.
+    // COMMON-NOT: rocdl.ds_bpermute
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds
+    // COMMON-NOT: rocdl.ds_bpermute
+    %0 = amdg.buffer_load_to_local %ptr[%offsets] into %dst : !tt.ptr<i8>[tensor<128x8xi32, #scale_offsets>] -> <128x8xi8, #scale_shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [32, 2], warpsPerCTA = [1, 32], order = [0, 1]}>
 #shared = #ttg.swizzled_shared<{vec = 2, perPhase = 1, maxPhase = 1, order = [0, 1]}>
 #smem = #ttg.shared_memory
@@ -118,14 +139,62 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 8192 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
-  // COMMON-LABEL: buffer_load_to_local_mask_other
-  tt.func public @buffer_load_to_local_mask_other(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+  // COMMON-LABEL: buffer_load_to_local_mask_other_0
+  tt.func public @buffer_load_to_local_mask_other_0(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
                                 %arg1: !tt.ptr<f32>,
                                 %arg2: tensor<32x32xi32, #blocked>,
                                 %arg3: !ttg.memdesc<32x32xf32, #shared, #smem, mutable>,
                                 %arg4: i32) {
     // We need the splat to allow the AxisAnalysis to work during lowering
     %cst_0 = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %c31_i32 = arith.constant 31 : i32
+    %1 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>, #blocked>
+    %29 = arith.addi %arg4, %c31_i32 : i32
+    %30 = arith.divsi %29, %c32_i32 : i32
+    %31 = arith.cmpi sgt, %30, %c0_i32 : i32
+
+    %51 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %52 = tt.expand_dims %51 {axis = 1 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<32x1xi32, #blocked>
+    %65 = tt.splat %arg4 : i32 -> tensor<32x1xi32, #blocked>
+    %66 = arith.cmpi slt, %52, %65 : tensor<32x1xi32, #blocked>
+    %67 = tt.broadcast %66 : tensor<32x1xi1, #blocked> -> tensor<32x32xi1, #blocked>
+
+    %70 = tt.splat %31 : i1 -> tensor<32x32xi1, #blocked>
+    %71 = arith.andi %70, %67 : tensor<32x32xi1, #blocked>
+
+    // Each thread needs to load 4 elements and we load 1 (sizePerThread) per buffer load instruction
+    // no conditionals are generated with other = 0.0
+
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds
+    // COMMON-NOT: rocdl.raw.ptr.buffer.load.async.lds
+    // COMMON-NOT: _predicated_store
+    // COMMON-NOT: llvm.cond_br
+    // COMMON-NOT: llvm.store
+
+    amdg.buffer_load_to_local %arg1[%arg2] mask=%67 other=%cst_0 into %arg3 : !tt.ptr<f32>[tensor<32x32xi32, #blocked>] tensor<32x32xf32, #blocked>  -> <32x32xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 8192 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: buffer_load_to_local_mask_other_not_zero
+  tt.func public @buffer_load_to_local_mask_other_not_zero(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+                                %arg1: !tt.ptr<f32>,
+                                %arg2: tensor<32x32xi32, #blocked>,
+                                %arg3: !ttg.memdesc<32x32xf32, #shared, #smem, mutable>,
+                                %arg4: i32) {
+    // We need the splat to allow the AxisAnalysis to work during lowering
+    %cst_1 = arith.constant dense<1.000000e+00> : tensor<32x32xf32, #blocked>
     %c0_i32 = arith.constant 0 : i32
     %c32_i32 = arith.constant 32 : i32
     %c31_i32 = arith.constant 31 : i32
@@ -171,7 +240,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     // COMMON-NOT: llvm.cond_br
     // COMMON-NOT: llvm.store
 
-    amdg.buffer_load_to_local %arg1[%arg2] mask=%67 other=%cst_0 into %arg3 : !tt.ptr<f32>[tensor<32x32xi32, #blocked>] tensor<32x32xf32, #blocked>  -> <32x32xf32, #shared, #smem, mutable>
+    amdg.buffer_load_to_local %arg1[%arg2] mask=%67 other=%cst_1 into %arg3 : !tt.ptr<f32>[tensor<32x32xi32, #blocked>] tensor<32x32xf32, #blocked>  -> <32x32xf32, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -199,6 +268,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     // COMMON: llvm.getelementptr
     // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, 17
     %3 = amdg.buffer_load_to_local %arg0[%0] cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_normal> into %arg2: !tt.ptr<f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
+    // evict_first sets the nt bit (0 -> 2).
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, 2
+    %4 = amdg.buffer_load_to_local %arg0[%0] cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_first> into %arg2: !tt.ptr<f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
+    // evict_last clears the nt bit that .cs sets (3 -> 1).
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, 1
+    %5 = amdg.buffer_load_to_local %arg0[%0] cachePolicy = #tt.cache_policy<cache_modifier = cs, eviction_policy = evict_last> into %arg2: !tt.ptr<f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
+    // evict_first keeps the nt bit that .cg sets (3 -> 3).
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, 3
+    %6 = amdg.buffer_load_to_local %arg0[%0] cachePolicy = #tt.cache_policy<cache_modifier = cg, eviction_policy = evict_first> into %arg2: !tt.ptr<f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
 
     tt.return
   }
@@ -265,26 +343,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     // COMMON: rocdl.ds_bpermute
     // COMMON: rocdl.ballot
     // COMMON: rocdl.raw.ptr.buffer.load.async.lds
-    // COMMON: llvm.cond_br
-    // COMMON: llvm.store
 
     // COMMON: rocdl.ds_bpermute
     // COMMON: rocdl.ballot
     // COMMON: rocdl.raw.ptr.buffer.load.async.lds
-    // COMMON: llvm.cond_br
-    // COMMON: llvm.store
 
     // COMMON: rocdl.ds_bpermute
     // COMMON: rocdl.ballot
     // COMMON: rocdl.raw.ptr.buffer.load.async.lds
-    // COMMON: llvm.cond_br
-    // COMMON: llvm.store
 
     // COMMON: rocdl.ds_bpermute
     // COMMON: rocdl.ballot
     // COMMON: rocdl.raw.ptr.buffer.load.async.lds
-    // COMMON: llvm.cond_br
-    // COMMON: llvm.store
 
     // COMMON-NOT: rocdl.ds_bpermute
     // COMMON-NOT: rocdl.ballot
@@ -385,6 +455,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+// Verify that when mask+other are present, the `other` (not 0.0) store is emitted in the
+// after-load block (not inside the load block). This ensures masked-out lanes
+// write the `other` value to LDS even when the load branch is not taken.
+// Regression test: before the fix, `emitOtherStore` was placed inside the
+// load block, so masked-out lanes never wrote `other`, leaving stale LDS data.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -392,7 +467,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // COMMON-LABEL: @buffer_load_to_local_other_in_after_block
   tt.func @buffer_load_to_local_other_in_after_block(%ptr: !tt.ptr<f32>, %lds: !ttg.memdesc<64xf32, #shared, #smem, mutable>, %mask: tensor<64xi1, #blocked>) {
     %off = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
-    %other = arith.constant dense<0.000000e+00> : tensor<64xf32, #blocked>
+    %other = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
     // The conditional branch enters the load block only when pred is true.
     // COMMON: llvm.cond_br %{{.*}}, ^[[LOAD_BB:bb[0-9]+]], ^[[AFTER_BB:bb[0-9]+]]
     // COMMON-NEXT: ^[[LOAD_BB]]:
@@ -409,6 +484,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+// Verify that when mask+other are present, if `other` is 0.0, no store is emitted
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: @buffer_load_to_local_no_other_in_after_block
+  tt.func @buffer_load_to_local_no_other_in_after_block(%ptr: !tt.ptr<f32>, %lds: !ttg.memdesc<64xf32, #shared, #smem, mutable>, %mask: tensor<64xi1, #blocked>) {
+    %off = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %other = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds
+    amdg.buffer_load_to_local %ptr[%off] mask=%mask other=%other into %lds : !tt.ptr<f32>[tensor<64xi32, #blocked>] tensor<64xf32, #blocked> -> <64xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
 // The blocked layout will return contiguity of 2 because the repeat pattern to cover the full tensor.
 // Check that we lower it to 2 separate instructions because the order of blocked layout and shared layout disagree.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [1, 0]}>

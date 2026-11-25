@@ -164,7 +164,7 @@ getMBarrierArrivals(Operation *op, OpBuilder &builder) {
     bool multicast = false;
     int32_t sourceBroadcastMask = 0;
     if (arrive.isMulticast()) {
-      multicastMasks.push_back(arrive.getMulticastCTA());
+      multicastMasks.push_back(static_cast<int32_t>(arrive.getMulticastCTA()));
       multicast = true;
     } else if (std::optional<uint32_t> fromCTA = arrive.getFromCTA();
                fromCTA && *fromCTA != static_cast<uint32_t>(numCTAs - 1)) {

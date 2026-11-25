@@ -42,6 +42,17 @@ static Attribute pickDescriptorLoadStoreLayout(int numWarps, int threadsPerWarp,
 
   SmallVector<unsigned> order =
       getMatrixOrder(type.getRank(), /*rowMajor*/ true);
+  // A mixed-radix tile keeps a mixed-radix layout, at the widest vector adding
+  // no registers.
+  if (!isRadix2Encoding(type.getEncoding())) {
+    MLIRContext *ctx = type.getContext();
+    FailureOr<LinearEncodingAttr> mixedRadix = getMixedRadixEncoding(
+        ctx, type.getShape(), numWarps, threadsPerWarp, /*numCTAs=*/1,
+        getMixedRadixVector(ctx, type.getShape(), maxVectorSize, order,
+                            numWarps, threadsPerWarp),
+        order);
+    return succeeded(mixedRadix) ? Attribute(*mixedRadix) : type.getEncoding();
+  }
   auto cgaLayout = triton::gpu::getCGALayout(type.getEncoding());
 
   Attribute layout = triton::gpu::BlockedEncodingAttr::get(
@@ -68,7 +79,30 @@ static void pickDescriptorLoadStoreLayout(
   });
 }
 
+// The vector AxisInfo proves for this access, kept only as wide as adds no
+// registers to the layout the pad pass accepted unless a store predicates off
+// the duplicates (its vector check calls the same helpers).
+static FailureOr<LinearEncodingAttr>
+buildCoalescedMixedRadixEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                 Operation *op, int numWarps,
+                                 int threadsPerWarp, unsigned maxVecBits) {
+  MLIRContext *ctx = op->getContext();
+  Value ptr = getMemAccessPtr(op);
+  auto type = cast<RankedTensorType>(ptr.getType());
+  AxisInfo &info = *axisInfoAnalysis.getAxisInfo(ptr);
+  SmallVector<unsigned> order = getOrderFromContiguity(info.getContiguity());
+  unsigned vector = getMixedRadixVector(
+      ctx, type.getShape(),
+      getAxisInfoVector(info, type, type.getShape(), order[0],
+                        numWarps * threadsPerWarp, maxVecBits),
+      order, numWarps, threadsPerWarp, npotStoreTakesPredicatedVector(op));
+  return getMixedRadixEncoding(ctx, type.getShape(), numWarps, threadsPerWarp,
+                               /*numCTAs=*/1, vector, order);
+}
+
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
+  using impl::TritonGPUCoalesceBase<CoalescePass>::TritonGPUCoalesceBase;
+
   static Type getNewType(Type type, Attribute encoding) {
     RankedTensorType tensorType = cast<RankedTensorType>(type);
     return tensorType.cloneWithEncoding(encoding);
@@ -78,7 +112,8 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
-    CoalescedEncodingAnalysis coalescedEncodingAnalysis(axisInfoAnalysis);
+    CoalescedEncodingAnalysis coalescedEncodingAnalysis(axisInfoAnalysis,
+                                                        maxVecBits);
 
     // For each i/o operation, we determine what layout
     // the pointers should have for best memory coalescing
@@ -86,22 +121,99 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
     int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(moduleOp);
     moduleOp.walk([&](Operation *curr) {
       Value ptr = getMemAccessPtr(curr);
-      if (!ptr)
+      if (ptr) {
+        // Handle global memory operations (load/store/atomic)
+        // We only convert `tensor<tt.ptr<>>` load/store
+        bool isPtrTensor = false;
+        if (auto tensorType = dyn_cast<RankedTensorType>(ptr.getType()))
+          isPtrTensor = isa<PointerType>(tensorType.getElementType());
+        if (!isPtrTensor)
+          return;
+      } else if (auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(curr)) {
+        // Handle local_load - we assume full contiguity for shared memory reads
+        auto resultType =
+            dyn_cast<RankedTensorType>(localLoad.getResult().getType());
+        if (!resultType)
+          return;
+        // Respect a user-pinned result layout: don't coalesce it to a "full
+        // contiguity" blocked layout -- the user chose this register layout on
+        // purpose. The pin (PinnedEncodingTrait) may sit under a
+        // #tlx.no_verify_layout wrapper here (peeled later by
+        // resolve-placeholder).
+        if (containsPinnedEncoding(resultType.getEncoding()))
+          return;
+      } else {
+        // Not a memory operation we handle
         return;
-      // We only convert `tensor<tt.ptr<>>` load/store
-      bool isPtrTensor = false;
-      if (auto tensorType = dyn_cast<RankedTensorType>(ptr.getType()))
-        isPtrTensor = isa<PointerType>(tensorType.getElementType());
-      if (!isPtrTensor)
-        return;
+      }
+
       int numWarps = lookupNumWarps(curr);
 
-      auto tensorType = cast<RankedTensorType>(ptr.getType());
-      CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());
-      SmallVector<int64_t> shapePerCTA = getShapePerCTA(tensorType);
-      auto layout = coalescedEncodingAnalysis.getEncoding(
-          curr, numWarps, threadsPerWarp, cgaLayout, shapePerCTA);
-      layoutMap[curr] = layout;
+      if (auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(curr)) {
+        // Meta-local: handle local_load with full contiguity assumption
+        auto resultType =
+            cast<RankedTensorType>(localLoad.getResult().getType());
+        SmallVector<unsigned> order(resultType.getRank());
+        std::iota(order.rbegin(), order.rend(), 0);
+
+        auto shapePerCTA = triton::gpu::getShapePerCTA(resultType);
+        int numElems = product<int64_t>(shapePerCTA);
+        int numThreads = numWarps * threadsPerWarp;
+        int elemBits = resultType.getElementTypeBitWidth();
+        int maxPerThread = 128 / elemBits;
+        unsigned perThread = std::min<int>(
+            maxPerThread, std::max<int>(numElems / numThreads, 1));
+
+        SmallVector<unsigned> sizePerThread(resultType.getRank(), 1);
+        sizePerThread[order[0]] = perThread;
+        auto CGALayout = triton::gpu::getCGALayout(resultType.getEncoding());
+        layoutMap[curr] = triton::gpu::BlockedEncodingAttr::get(
+            &getContext(), resultType.getShape(), sizePerThread, order,
+            numWarps, threadsPerWarp, CGALayout);
+      } else {
+        // Respect a user-pinned store value layout. A tt.store has no result to
+        // carry a PinnedEncodingTrait, so the pin rides on the value operand,
+        // wrapped as #tlx.no_verify_layout(#tlx.user_layout): the outer
+        // no-verify defers store operand-layout verification until
+        // resolve-placeholder-layouts peels it, and it is still present here
+        // because coalesce runs before that pass. Find the pin
+        // (hasRecursivePin), then store in the peeled concrete layout instead
+        // of a freshly-coalesced one: convertDistributedOpEncoding then
+        // converts ptr/mask to match, the value's bridging convert folds away,
+        // and the user's chosen store layout survives to codegen (AMD
+        // OptimizeEpilogue leaves it alone since it is no longer a #blocked
+        // store).
+        Attribute pinned;
+        if (auto store = dyn_cast<triton::StoreOp>(curr)) {
+          if (auto vt =
+                  dyn_cast<RankedTensorType>(store.getValue().getType())) {
+            if (containsPinnedEncoding(vt.getEncoding())) {
+              Attribute concrete = triton::unwrapTlxWrappers(vt.getEncoding());
+              if (isa_and_nonnull<DistributedEncodingTrait>(concrete))
+                pinned = concrete;
+            }
+          }
+        }
+        if (pinned) {
+          layoutMap[curr] = pinned;
+        } else if (!isRadix2Encoding(
+                       cast<RankedTensorType>(ptr.getType()).getEncoding())) {
+          // A mixed-radix layout has no CGA layout: without a mixed-radix
+          // rebuild, the access keeps its layout.
+          FailureOr<LinearEncodingAttr> mixedRadix =
+              buildCoalescedMixedRadixEncoding(axisInfoAnalysis, curr, numWarps,
+                                               threadsPerWarp, maxVecBits);
+          if (succeeded(mixedRadix))
+            layoutMap[curr] = *mixedRadix;
+        } else {
+          auto tensorType = cast<RankedTensorType>(ptr.getType());
+          CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());
+          SmallVector<int64_t> shapePerCTA = getShapePerCTA(tensorType);
+          auto layout = coalescedEncodingAnalysis.getEncoding(
+              curr, numWarps, threadsPerWarp, cgaLayout, shapePerCTA);
+          layoutMap[curr] = layout;
+        }
+      }
     });
 
     // Also pick a layout for descriptor load/store ops.

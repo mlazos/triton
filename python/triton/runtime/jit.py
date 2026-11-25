@@ -1,13 +1,15 @@
 from __future__ import annotations, division
 import ast
+import contextlib
 import copy
 import hashlib
-import importlib
 import inspect
 import itertools
+import os
 import threading
 import re
 import textwrap
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
@@ -19,10 +21,165 @@ from .. import knobs
 from .driver import driver
 from . import _async_compile
 from .._utils import find_paths_if, get_iterable_path, type_canonicalisation_dict, is_namedtuple
+from ..magnon.flags import collect_enabled as _compile_iq_collect_enabled
 from .cache import get_cache_key
-from triton._C.libtriton import get_cache_invalidating_env_vars, native_specialize_impl, ir
+from triton._C.libtriton import get_cache_invalidating_env_vars, native_specialize_impl, native_fast_dispatch, native_fast_dispatch_insert
+try:
+    from triton._C.libtriton import native_create_jit_proxy
+except ImportError:
+    native_create_jit_proxy = None
+
+# --- dispatch/cache stats (opt-in via TRITON_CACHE_STATS=1) ------------------
+# Counts, per kernel, the outcome of the Python run() dispatch once a C proxy has
+# fallen back into Python (or for callable-grid / first-call cases). Combined with
+# the C-side proxy hit/fallback counters (native_dump_cache_stats), this gives a
+# per-path, per-kernel picture of where the C fast path is / isn't taken — so
+# owners can find kernels that silently miss it now that the flags default on.
+# Zero work when off: a single module-level bool checked at each count site.
+_CACHE_STATS_ON = os.environ.get("TRITON_CACHE_STATS", "0") == "1"
+_CACHE_STATS_PY: dict = {}  # kernel name -> {event: count}
+
+
+def _active_target_supports_triton_dispatcher() -> bool:
+    try:
+        target = driver.active.get_current_target()
+    except Exception:
+        return False
+    return getattr(target, "backend", None) in ("cuda", "hip")
+
+
+def _cache_stats_record(name: str, event: str) -> None:
+    # Callers must guard with `if _CACHE_STATS_ON`.
+    k = _CACHE_STATS_PY.get(name)
+    if k is None:
+        k = {}
+        _CACHE_STATS_PY[name] = k
+    k[event] = k.get(event, 0) + 1
+
+
+def dump_cache_stats() -> dict:
+    """Merged {kernel: {event: count}} of C proxy + Python run() dispatch stats.
+
+    Enable collection with TRITON_CACHE_STATS=1. Events:
+      autotune_proxy_hit / autotune_proxy_fallback  (C, autotuned kernels)
+      jit_proxy_hit / jit_proxy_fallback            (C, bare kernels)
+      run_fast_hit_c / run_fast_py_fallback         (Python run() fast path)
+      run_slow_c / run_slow_py_fallback             (Python run() slow path)
+    """
+    merged: dict = {}
+    try:
+        from triton._C.libtriton import native_dump_cache_stats
+        for kname, events in native_dump_cache_stats().items():
+            merged.setdefault(kname, {}).update(events)
+    except (ImportError, AttributeError):
+        pass
+    for kname, events in _CACHE_STATS_PY.items():
+        dst = merged.setdefault(kname, {})
+        for ev, n in events.items():
+            dst[ev] = dst.get(ev, 0) + n
+    return merged
+
+
+if _CACHE_STATS_ON:
+    import atexit as _atexit
+
+    @_atexit.register
+    def _dump_cache_stats_atexit() -> None:
+        stats = dump_cache_stats()
+        if not stats:
+            return
+        import sys as _sys
+        print("[TRITON_CACHE_STATS] per-kernel dispatch hit/fallback:", file=_sys.stderr, flush=True)
+        for kname in sorted(stats):
+            events = stats[kname]
+            summary = ", ".join(f"{ev}={events[ev]}" for ev in sorted(events))
+            print(f"  {kname}: {summary}", file=_sys.stderr, flush=True)
+
+
+def _make_hashable(v):
+    """Convert unhashable types to hashable equivalents for options hashing.
+
+    The C fast-path hashes non-parameter kwargs (e.g. ``extern_libs``) via
+    ``hash(tuple(sorted(opts.items())))``.  Dict/list/set values are not
+    hashable, so we recursively convert them:
+    - dicts  -> tuple of (key, transformed-value) pairs sorted by key
+    - sets   -> sorted tuple (order-independent hash)
+    - lists  -> tuple preserving order
+    """
+    if isinstance(v, dict):
+        return tuple((k, _make_hashable(val)) for k, val in sorted(v.items(), key=lambda kv: kv[0]))
+    if isinstance(v, (set, frozenset)):
+        return tuple(sorted(_make_hashable(x) for x in v))
+    if isinstance(v, list):
+        return tuple(_make_hashable(x) for x in v)
+    return v
+
+
+def _hash_fc_opts(opts):
+    """Compute a stable uint64 hash over non-parameter kwargs for the C fast cache."""
+    return hash(tuple(
+        (k, _make_hashable(v)) for k, v in sorted(opts.items(), key=lambda kv: kv[0]))) & 0xFFFFFFFFFFFFFFFF
+
+
+def _bind_fc_args(params, name_to_idx, args, kwargs):
+    """Bind kernel arguments before a native cache lookup."""
+    if len(args) > len(params):
+        return None
+    values = list(args) + [inspect.Parameter.empty] * (len(params) - len(args))
+    for name, value in kwargs.items():
+        index = name_to_idx.get(name)
+        if index is not None:
+            if index < len(args):
+                return None
+            values[index] = value
+    for index, value in enumerate(values):
+        if value is inspect.Parameter.empty:
+            default = params[index].default
+            if default is inspect.Parameter.empty:
+                return None
+            values[index] = default
+    return tuple(values)
+
+
+# Fast tensor access API — lazily registered on first use.
+# Provides ~10x faster dtype/data_ptr extraction via direct C struct access.
+_torch_bridge_loaded = False
+_torch_bridge_init_done = False
+
+
+def _ensure_torch_bridge():
+    global _torch_bridge_loaded, _torch_bridge_init_done
+    if _torch_bridge_init_done:
+        return
+    _torch_bridge_init_done = True
+    try:
+        from triton._C.libtriton import register_tensor_access_api
+        from triton._C._torch_bridge import get_tensor_access_capsule
+        register_tensor_access_api(get_tensor_access_capsule())
+        _torch_bridge_loaded = True
+    except (ImportError, AttributeError):
+        pass
+
 
 TRITON_MODULE = "triton.language"
+
+# compile_iq free-win: the launch-time plain-vs-ACF competition (CompiledKernel._compile_iq_resolve)
+# must NOT fire while the autotuner is benchmarking configs -- otherwise the one-shot A/B would run
+# mid-do_bench and corrupt a config's timing. The autotuner wraps its do_bench in this suppressor;
+# the autotune flow tunes configs on plain timing (ACF candidate-expansion is handled separately).
+_compile_iq_state = threading.local()
+
+
+@contextlib.contextmanager
+def _compile_iq_suppress_competition():
+    prev = getattr(_compile_iq_state, "suppressed", False)
+    _compile_iq_state.suppressed = True
+    try:
+        yield
+    finally:
+        _compile_iq_state.suppressed = prev
+
+
 GLUON_MODULE = "triton.experimental.gluon.language"
 
 INDENT_PATTERN = re.compile(r"^(?P<indent>[ \t]*)def\s+\w+\s*\(", re.MULTILINE)
@@ -368,30 +525,75 @@ class KernelInterface(Generic[T]):
     def run(self, *args, grid, warmup, **kwargs):
         raise NotImplementedError("run not implemented")
 
-    def __getitem__(self, grid) -> T:
+    def _get_jit_cache_proxy(self, grid):
+        # Fast C proxy: bypasses Python run() entirely for cache hits.
+        # Only useful when dispatcher is available — without it the proxy
+        # does a redundant C cache lookup then falls back to run() anyway.
+        #
+        # Skip the proxy when the kernel reads module-level globals: the C proxy
+        # launches a cache hit without re-validating used_global_vals, so a
+        # changed global would be silently ignored. Routing such kernels through
+        # run() preserves the "Global variable ... has changed" RuntimeError.
+        #
+        # Also skip it whenever run() would do per-launch work the proxy bypasses
+        # — launch hooks, pre-run hooks, launch_metadata, or a stages-inspection
+        # hook — so those still fire (mirrors the run() c_cache fast-path guard).
+        if native_create_jit_proxy is not None and getattr(self, 'c_cache', False) \
+                and knobs.runtime.use_triton_dispatcher \
+                and _active_target_supports_triton_dispatcher() \
+                and not self.used_global_vals \
+                and not self.pre_run_hooks and not self.launch_metadata \
+                and not self.debug and not knobs.runtime.debug and not knobs.runtime.sanitize_overflow \
+                and not knobs.compilation.always_compile and not knobs.compilation.instrumentation_mode \
+                and not knobs.compilation.fpsan_homomorphic_casts \
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
+                and knobs.runtime.add_stages_inspection_hook is None \
+                and not callable(grid) and hasattr(self, '_fc_options_hash') and hasattr(self, 'params'):
+            cache = getattr(self, '_jit_proxy_cache', None)
+            if cache is None:
+                cache = {}
+                self._jit_proxy_cache = cache
+            grid_key = grid if isinstance(grid, tuple) else (grid, )
+            proxy = cache.get(grid_key)
+            if proxy is None:
+                grid_tuple = grid_key
+                extra_kwargs = getattr(self, '_fc_meta_kwargs', None)
+                proxy = native_create_jit_proxy(self, grid_tuple, self.params, self._fc_options_hash,
+                                                driver.active.get_current_stream, driver.active.get_current_device,
+                                                extra_kwargs)
+                if proxy is not None:
+                    cache[grid_key] = proxy
+                else:
+                    warnings.warn(
+                        f"[Triton] C JIT proxy creation returned None for kernel '{self._fn_name}', "
+                        f"falling back to Python dispatch (c_cache and dispatcher are enabled)",
+                        stacklevel=2,
+                    )
+            if proxy is not None:
+                return proxy
+        return None
+
+    def __getitem__(self: "KernelInterface[Callable[..., R]]", grid) -> Callable[..., R]:
         """
         A JIT function is launched with: fn[grid](*args, **kwargs).
         Hence JITFunction.__getitem__ returns a callable proxy that
         memorizes the grid.
         """
+        proxy = self._get_jit_cache_proxy(grid)
+        if proxy is not None:
+            # The C proxy binds kernel arguments and compilation options.
+            return proxy
         return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
         # return cast(T, functools.partial(cast(Callable, self.run), grid=grid))
 
 
 def serialize_specialization_data(name, signature, constants, attrs, options, key, target):
-
-    def _encode_constant(value):
-        if value.__class__.__name__ == "dtype":
-            return str(value)
-        if value.__class__.__name__ == "constexpr":
-            return {"constexpr": value.value}
-        if isinstance(value, JITFunction):
-            return {"jit_function": f"{value.module}:{value.fn.__qualname__}"}
-        if isinstance(value, type):
-            return {"class": f"{value.__module__}:{value.__qualname__}"}
-        return value
-
-    constants = {key: _encode_constant(value) for key, value in constants.items()}
+    constants = {
+        key: str(value) if value.__class__.__name__ == "dtype" else {"constexpr": value.value}
+        if value.__class__.__name__ == "constexpr" else {"jit_function": f"{value.module}:{value.fn.__qualname__}"}
+        if value.__class__.__name__ == "JITFunction" else value
+        for key, value in constants.items()
+    }
 
     import json
     obj = {
@@ -572,9 +774,6 @@ class JITCallable:
         from triton.language.core import constexpr_type
         return constexpr_type(self)
 
-    def _flatten_ir(self, handles: list[ir.value]) -> None:
-        pass
-
     def _unsafe_update_src(self, new_src):
         """
         The only method allowed to modify src.
@@ -620,6 +819,10 @@ def _replace_jit_callables(obj):
 
 
 def compute_cache_key(kernel_key_cache, specialization, options):
+    # TODO: Handle runtime knob swapping. This is currently too slow on the Python
+    # critial path.
+    # The original change was for testing, but we can invalidate caches explicitly if
+    # tests break.
     key = (tuple(specialization), str(options))
     cache_key = kernel_key_cache.get(key, None)
     if cache_key is not None:
@@ -641,6 +844,117 @@ def convert_to_tuple_if_list(item):
         item[i] = convert_to_tuple_if_list(nested_value)
 
     return tuple(item)
+
+
+def get_device_key(device, is_cpu_backend):
+    # Preserve the existing GPU cache shape (and its public test/debugging
+    # surface) while keeping CPU device 0 distinct from GPU device 0.
+    return f"cpu:{device}" if is_cpu_backend else device
+
+
+def _invalidate_fast_cache(jit_fn):
+    proxy_cache = getattr(jit_fn, "_jit_proxy_cache", None)
+    if proxy_cache is not None:
+        proxy_cache.clear()
+    if hasattr(jit_fn, "_fc_cache"):
+        delattr(jit_fn, "_fc_cache")
+
+
+_MISSING_CACHE_ENTRY = object()
+
+
+class _CacheReplacementMixin:
+    """Invalidate native entries when an existing cache value changes."""
+
+    def __setitem__(self, key, value):
+        previous = self.get(key, _MISSING_CACHE_ENTRY)
+        super().__setitem__(key, value)
+        if previous is not _MISSING_CACHE_ENTRY and previous is not value:
+            _invalidate_fast_cache(self._jit_fn)
+
+    def update(self, *args, **kwargs):
+        if len(args) > 1:
+            raise TypeError(f"update expected at most 1 argument, got {len(args)}")
+        if args:
+            other = args[0]
+            items = ((key, other[key]) for key in other.keys()) if hasattr(other, "keys") else other
+            for key, value in items:
+                self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+
+class _KernelCache(_CacheReplacementMixin, dict):
+    """Invalidate native entries when compiled kernels are removed or replaced."""
+
+    def __init__(self, jit_fn):
+        super().__init__()
+        self._jit_fn = jit_fn
+
+    def __reduce__(self):
+        return (dict, ())
+
+    def clear(self):
+        super().clear()
+        _invalidate_fast_cache(self._jit_fn)
+
+    def pop(self, key, *args):
+        result = super().pop(key, *args)
+        _invalidate_fast_cache(self._jit_fn)
+        return result
+
+    def popitem(self):
+        result = super().popitem()
+        _invalidate_fast_cache(self._jit_fn)
+        return result
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        _invalidate_fast_cache(self._jit_fn)
+
+
+class _DeviceCaches(_CacheReplacementMixin, defaultdict):
+    """Keep per-device compiled kernels consistent with native caches.
+
+    The C fast cache mirrors the compiled kernels held here, so callers that
+    clear the in-memory device caches to force a re-fetch/recompile (e.g. tests
+    exercising the disk cache + compilation listener) must not be silently
+    short-circuited by a stale C cache entry. Keeps the two caches consistent.
+    """
+
+    def __init__(self, jit_fn, default_factory):
+        super().__init__(default_factory)
+        self._jit_fn = jit_fn
+
+    def __reduce__(self):
+        # Return an EMPTY defaultdict for pickling/deepcopy.  The compiled
+        # kernels inside this cache contain _TritonDispatcher C objects whose
+        # kernel_params are interior pointers into arg_storage — deep-copying
+        # them produces dangling pointers and crashes.  An empty cache is fine
+        # for snapshots (e.g. torch._inductor's TritonBundler.deepcopy).
+        return (defaultdict, ())
+
+    def clear(self):
+        super().clear()
+        _invalidate_fast_cache(self._jit_fn)
+
+    def pop(self, key, *args):
+        result = super().pop(key, *args)
+        _invalidate_fast_cache(self._jit_fn)
+        return result
+
+    def popitem(self):
+        result = super().popitem()
+        _invalidate_fast_cache(self._jit_fn)
+        return result
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        _invalidate_fast_cache(self._jit_fn)
 
 
 class JITFunction(JITCallable, KernelInterface[T]):
@@ -666,7 +980,27 @@ class JITFunction(JITCallable, KernelInterface[T]):
         name = self.fn.__qualname__
         module = self.fn.__module__
         arg_reprs = ", ".join([f"{param.name}: {ty}" for param, ty in zip(self.params, key[1])])
-        repr = f"{name}[num_warps={options.num_warps}, num_ctas={options.num_ctas}, num_stages={options.num_stages}, enable_fp_fusion={options.enable_fp_fusion}, launch_cooperative_grid={options.launch_cooperative_grid}]({arg_reprs})"
+        # Build repr string, only including optional params when they're set
+        repr_parts = [
+            f"num_warps={options.num_warps}",
+            f"num_ctas={options.num_ctas}",
+            f"num_stages={options.num_stages}",
+        ]
+        # Use getattr to safely access backend-specific attributes
+        minRegAutoWS = getattr(options, 'minRegAutoWS', None)
+        maxRegAutoWS = getattr(options, 'maxRegAutoWS', None)
+        pingpongAutoWS = getattr(options, 'pingpongAutoWS', None)
+        if minRegAutoWS is not None:
+            repr_parts.append(f"minRegAutoWS={minRegAutoWS}")
+        if maxRegAutoWS is not None:
+            repr_parts.append(f"maxRegAutoWS={maxRegAutoWS}")
+        if pingpongAutoWS is not None:
+            repr_parts.append(f"pingpongAutoWS={pingpongAutoWS}")
+        repr_parts.extend([
+            f"enable_fp_fusion={options.enable_fp_fusion}",
+            f"launch_cooperative_grid={options.launch_cooperative_grid}",
+        ])
+        repr = f"{name}[{', '.join(repr_parts)}]({arg_reprs})"
         full_name = get_full_name(self.fn)
 
         specialization_data = serialize_specialization_data(full_name, signature, constants, configs[0], options, key,
@@ -679,6 +1013,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
             'num_warps': options.num_warps,
             'num_ctas': options.num_ctas,
             'num_stages': options.num_stages,
+            'minRegAutoWS': getattr(options, 'minRegAutoWS', None),
+            'maxRegAutoWS': getattr(options, 'maxRegAutoWS', None),
+            'pingpongAutoWS': getattr(options, 'pingpongAutoWS', None),
             'enable_fp_fusion': options.enable_fp_fusion,
             'launch_cooperative_grid': options.launch_cooperative_grid,
             'extern_libs': options.extern_libs,
@@ -711,11 +1048,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
         from ..compiler import CompiledKernel, compile, ASTSource, make_backend
         target = driver.active.get_current_target()
         backend = make_backend(target)
+        if self.c_cache:
+            self._fc_backend = target.backend
+            get_threshold = getattr(backend, "get_tensor_size_specialization_threshold", None)
+            self._fc_tensor_size_threshold = (get_threshold() if get_threshold else None) or 0
         self.CompiledKernel = CompiledKernel
         self.compile = compile
         self.ASTSource = ASTSource
         binder = create_function_from_signature(self.signature, self.params, backend)
-        return {}, {}, target, backend, binder
+        return _KernelCache(self), {}, target, backend, binder
 
     def _pack_args(self, backend, kwargs, bound_args, specialization, options):
         # options
@@ -741,27 +1082,132 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         return options, signature, constexprs, attrs
 
-    def run(self, *args, grid, warmup, **kwargs):
+    def run(self, *args, grid, warmup, _skip_fc=False, **kwargs):
+        # --- C FAST PATH (replaces Layer 1 identity check + Layer 1.5) ---
+        # Single C function call does: key computation + cache lookup + dispatcher launch.
+        # Hooks and nondefault runtime options require Python dispatch.
+        device = driver.active.get_current_device()
+        is_cpu_backend = getattr(driver.active, "is_cpu_backend", False) is True
+        device_key = get_device_key(device, is_cpu_backend)
+        self._fc_device_key = device_key
+        stream = driver.active.get_current_stream(device)
+        use_native_cache = (self.c_cache and not is_cpu_backend and not self.debug and not knobs.runtime.debug
+                            and not knobs.runtime.sanitize_overflow and not knobs.compilation.always_compile
+                            and not knobs.compilation.instrumentation_mode
+                            and not knobs.compilation.fpsan_homomorphic_casts
+                            and knobs.runtime.add_stages_inspection_hook is None)
+        if getattr(self, "_fc_backend", None) == "hip":
+            use_native_cache = use_native_cache and bool(self._fc_tensor_size_threshold) == knobs.amd.use_buffer_ops
+
+        # --- C FAST PATH (opt-in via @triton.jit(c_cache=True)) ---
+        # NOTE: This block is only reached when JITCacheProxy cannot be used
+        # (callable grid, first call, or C extension unavailable).
+        # Static-grid repeat calls go through JITCacheProxy directly.
+        if not _skip_fc and use_native_cache and not warmup \
+                and not self.pre_run_hooks and not knobs.compilation.always_compile \
+                and not self.debug and not knobs.runtime.debug and not knobs.runtime.sanitize_overflow \
+                and not knobs.compilation.instrumentation_mode and not knobs.compilation.fpsan_homomorphic_casts \
+                and not self.used_global_vals \
+                and knobs.runtime.add_stages_inspection_hook is None \
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
+                and not self.launch_metadata and knobs.runtime.use_triton_dispatcher:
+            _fc_args = _bind_fc_args(self.params, self._param_name_to_idx, args, kwargs)
+            _fc_opts = {name: value for name, value in kwargs.items() if name not in self._param_name_to_idx}
+            _fc_hash = _hash_fc_opts(_fc_opts) if _fc_opts else self._fc_options_hash
+            if _fc_args is not None:
+                if callable(grid):
+                    _fc_grid = grid(dict(zip(self.arg_names, _fc_args)))
+                else:
+                    _fc_grid = grid
+                result = native_fast_dispatch(self, _fc_args, self.params, _fc_hash, _fc_grid, stream, device_key)
+                if result is not None:
+                    # Verify globals haven't changed (cheap dict lookups).
+                    # used_global_vals tracks Python globals referenced in the kernel
+                    # body (e.g., module-level constants used as tl.constexpr). Their
+                    # values are baked into the compiled kernel at specialization time,
+                    # so if they change, the cached kernel is stale — fall through to
+                    # slow path which detects the mismatch and triggers recompilation.
+                    _globals_ok = True
+                    if self.used_global_vals:
+                        _not_present = object()
+                        for (name, _), (val, globals_dict) in self.used_global_vals.items():
+                            if globals_dict.get(name, _not_present) != val:
+                                _globals_ok = False
+                                break
+                    if _globals_ok:
+                        kernel = result
+                        if not getattr(kernel, '_dispatcher', None):
+                            if _CACHE_STATS_ON:
+                                _cache_stats_record(self._fn_name, "run_fast_py_fallback")
+                            if knobs.runtime.use_triton_dispatcher and _active_target_supports_triton_dispatcher():
+                                warnings.warn(
+                                    f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C "
+                                    f"dispatcher, falling back to Python launch",
+                                    stacklevel=2,
+                                )
+                            grid_size = len(_fc_grid) if isinstance(_fc_grid, (tuple, list)) else 1
+                            grid_0 = _fc_grid[0] if grid_size > 0 else 1
+                            grid_1 = _fc_grid[1] if grid_size > 1 else 1
+                            grid_2 = _fc_grid[2] if grid_size > 2 else 1
+                            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, None,
+                                       None, None, *_fc_args)
+                        elif _CACHE_STATS_ON:
+                            _cache_stats_record(self._fn_name, "run_fast_hit_c")
+                        return kernel
+        elif not _skip_fc and use_native_cache and not warmup:
+            reasons = []
+            if self.pre_run_hooks:
+                reasons.append("pre_run_hooks active")
+            if knobs.compilation.always_compile:
+                reasons.append("always_compile=True")
+            if self.used_global_vals:
+                reasons.append("used_global_vals non-empty")
+            if knobs.runtime.add_stages_inspection_hook is not None:
+                reasons.append("add_stages_inspection_hook active")
+            if knobs.runtime.launch_enter_hook:
+                reasons.append("launch_enter_hook active")
+            if knobs.runtime.launch_exit_hook:
+                reasons.append("launch_exit_hook active")
+            if self.launch_metadata:
+                reasons.append("launch_metadata set")
+            if reasons:
+                warnings.warn(
+                    f"[Triton] TRITON_ENABLE_C_CACHE: C fast path bypassed for kernel '{self._fn_name}': " +
+                    ", ".join(reasons),
+                    stacklevel=2,
+                )
+        _user_kwargs = dict(kwargs) if kwargs else {}
+        # A steady-state proxy fallback arrives without the winning config's
+        # compilation options, so restore the options saved when it was seeded.
+        _fc_meta = getattr(self, '_fc_meta_kwargs', None)
+        # Regular launches (including autotuner benchmarks) already carry a
+        # complete option set. Filling absent fields from a previous winner can,
+        # for example, attach a stale ctas_per_cga to a 1-CTA candidate.
+        has_explicit_options = any(k not in self._param_name_to_idx for k in _user_kwargs)
+        if _fc_meta and not has_explicit_options:
+            for k, v in _fc_meta.items():
+                if k not in kwargs:
+                    kwargs[k] = v
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
+        # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
+        kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
+                                                 False) or knobs.runtime.sanitize_overflow or kwargs["debug"]
         kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
         kwargs["fpsan_homomorphic_casts"] = knobs.compilation.fpsan_homomorphic_casts
-
-        # parse options
-        device = driver.active.get_current_device()
-        stream = driver.active.get_current_stream(device)
 
         # Execute pre run hooks with args and kwargs
         for hook in self.pre_run_hooks:
             hook(*args, **kwargs)
 
-        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
+        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device_key]
         # specialization is list[tuple[str, Any]], where first element of tuple is
         # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
 
         # add a cache field to the kernel specializations for kernel specific
         # pass pipelines
-        if knobs.runtime.add_stages_inspection_hook is not None:
+        has_custom_pipeline = knobs.runtime.add_stages_inspection_hook is not None
+        if has_custom_pipeline:
             inspect_stages_key, inspect_stages_hash = knobs.runtime.add_stages_inspection_hook()
             specialization.append(f'("custom_pipeline", {inspect_stages_hash})')
 
@@ -773,9 +1219,32 @@ class JITFunction(JITCallable, KernelInterface[T]):
             options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,
                                                                     options)
 
-            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+            # Capture kernel argument metadata for TLX benchmark generation
+            if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
+                try:
+                    from triton.tools.tlx_benchmark_gen import capture_kernel_args
+                    capture_kernel_args(bound_args, signature, constexprs, self.params, options, fn=self.fn)
+                except Exception:
+                    pass
+
+            kernel = self._do_compile(key, signature, device, device_key, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
+            # compile_iq: dump a collection task for the offline ACF factory.
+            # Gated by TRITON_COMPILE_IQ_COLLECT; fires on the compile (cache-miss) path
+            # where signature/constexprs are in scope. Never affects the user run.
+            if _compile_iq_collect_enabled():
+                try:
+                    from triton.magnon.collector import capture as _ciq_capture
+                    _ck = kernel.result() if hasattr(kernel, "result") else kernel
+                    _cg = grid(bound_args) if callable(grid) else grid
+                    _ciq_capture(jitfn=self, kernel=_ck, bound_args=bound_args, signature=signature,
+                                 constexprs=constexprs, grid=tuple(list(_cg) + [1, 1, 1])[:3])
+                except Exception:
+                    pass
+            _fc_needs_insert = use_native_cache and not has_custom_pipeline
+        else:
+            _fc_needs_insert = False
 
         # Check that used global values have not changed.
         not_present = object()
@@ -788,21 +1257,78 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # canonicalize grid
             if callable(grid):
                 grid = grid(bound_args)
+            if isinstance(grid, int):
+                grid = (grid, )
             grid_size = len(grid)
             grid_0 = grid[0]
             grid_1 = grid[1] if grid_size > 1 else 1
             grid_2 = grid[2] if grid_size > 2 else 1
-            # launch kernel
-            launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
-            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
-                       knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
+
+            # Capture actual grid values for TLX benchmark generation
+            if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
+                try:
+                    from triton.tools.tlx_benchmark_gen import capture_grid
+                    capture_grid((grid_0, grid_1, grid_2))
+                except Exception:
+                    pass
+
+            if hasattr(kernel, "result"):
+                kernel = kernel.result()
+            # Ensure module/function handles and the C dispatcher are built before we
+            # read `_dispatcher` below. Without this, the plain run path reads
+            # `_dispatcher` before `_init_handles()` (called lazily inside kernel.run)
+            # has built it, so TRITON_USE_C_DISPATCHER never engages on this path.
+            # `_init_handles` is idempotent (early-returns once module is loaded).
+            if hasattr(kernel, "_init_handles"):
+                kernel._init_handles()
+            # compile_iq free-win: if a tuned ACF candidate is pending, run the one-shot plain-vs-ACF
+            # competition with the real args before launching, and keep the winner (no-op/near-zero
+            # cost otherwise; suppressed while the autotuner is benchmarking). Read _disp afterward so
+            # a rebuilt dispatcher for the winning function is used.
+            if (getattr(kernel, "_compile_iq_acf_cubin", None) is not None
+                    and not getattr(_compile_iq_state, "suppressed", False)):
+                kernel._compile_iq_resolve(grid_0, grid_1, grid_2, stream, bound_args)
+            # launch kernel — prefer _TritonDispatcher (C direct cuLaunchKernelEx)
+            # when available and hooks are not needed. Instrumented kernels need
+            # the Python launcher (it appends sanitizer params and fires launch
+            # hooks); the dispatcher schema covers user args only.
+            _disp = getattr(kernel, '_dispatcher', None) if knobs.runtime.use_triton_dispatcher else None
+            if (_disp is not None and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
+                    and not knobs.compilation.instrumentation_mode):
+                if _CACHE_STATS_ON:
+                    _cache_stats_record(self._fn_name, "run_slow_c")
+                _vals = tuple(bound_args.values())
+                _indices = kernel._dispatch_arg_indices
+                _disp(grid_0, grid_1, grid_2, stream, *[_vals[i] for i in _indices])
+            else:
+                if _CACHE_STATS_ON:
+                    _cache_stats_record(self._fn_name, "run_slow_py_fallback")
+                if (knobs.runtime.use_triton_dispatcher and _disp is None
+                        and _active_target_supports_triton_dispatcher()):
+                    warnings.warn(
+                        f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
+                        f"falling back to Python launch",
+                        stacklevel=2,
+                    )
+                launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
+                           knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
+
+            # Populate C specialization cache for future calls (only on first compile).
+            if _fc_needs_insert:
+                _disp = getattr(kernel, '_dispatcher', None)
+                _ins_args = tuple(bound_args.values())
+                _ins_opts = {name: value for name, value in _user_kwargs.items() if name not in self._param_name_to_idx}
+                _ins_hash = _hash_fc_opts(_ins_opts) if _ins_opts else self._fc_options_hash
+                native_fast_dispatch_insert(self, _ins_args, self.params, _ins_hash, kernel, _disp,
+                                            getattr(kernel, '_dispatch_arg_indices', None), device_key)
         return kernel
 
     def repr(self, _):
         return self._fn_name if self._repr is None else self._repr(_)
 
     def __init__(self, fn, version=None, do_not_specialize=None, do_not_specialize_on_alignment=None, debug=None,
-                 noinline=None, repr=None, launch_metadata=None):
+                 noinline=None, repr=None, launch_metadata=None, c_cache=None):
         do_not_specialize = do_not_specialize if do_not_specialize else []
         do_not_specialize_on_alignment = do_not_specialize_on_alignment if do_not_specialize_on_alignment else []
 
@@ -813,6 +1339,20 @@ class JITFunction(JITCallable, KernelInterface[T]):
         self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
         self._repr = repr
         self.launch_metadata = launch_metadata
+        # C cache defaults ON (opt out with TRITON_ENABLE_C_CACHE=0). An explicit
+        # c_cache=True/False on @triton.jit always wins over the env default;
+        # c_cache=None (not specified) falls back to the env-controlled default.
+        if c_cache is None:
+            self.c_cache = knobs.runtime.enable_c_cache
+        else:
+            self.c_cache = c_cache
+        if any(param.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_POSITIONAL)
+               for param in self.signature.parameters.values()):
+            self.c_cache = False
+        if self.c_cache:
+            _ensure_torch_bridge()
+        # Register for simple deserialization of JITFunction constants
+        _triton_jit_function_registry[f"{self.module}:{self.fn.__qualname__}"] = self
 
         self.params = []
         for i, param in enumerate(self.signature.parameters.values()):
@@ -822,12 +1362,26 @@ class JITFunction(JITCallable, KernelInterface[T]):
             dns_oa = i in do_not_specialize_on_alignment or param.name in do_not_specialize_on_alignment
             self.params.append(KernelParam(i, param, dns, dns_oa))
 
+        # C cache defaults ON (opt out with TRITON_ENABLE_C_CACHE=0). An explicit
+        # c_cache=True/False on @triton.jit overrides the env-controlled default,
+        # except for signatures the native binders cannot validate correctly.
+        self.c_cache = knobs.nvidia.enable_c_cache if c_cache is None else c_cache
+        if any(param.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_POSITIONAL)
+               for param in self.signature.parameters.values()):
+            self.c_cache = False
+        if self.c_cache:
+            _ensure_torch_bridge()
+
         # Register for simple deserialization of JITFunction constants
         _triton_jit_function_registry[f"{self.module}:{self.fn.__qualname__}"] = self
 
         # cache of just-in-time compiled kernels
-        self.device_caches = defaultdict(self.create_binder)
+        self.device_caches = _DeviceCaches(self, self.create_binder)
 
+        # Options hash for C fast dispatch cache.
+        # Explicit compilation options receive their own hash.
+        # Autotuners replace this value with the selected configuration hash.
+        self._fc_options_hash = 0
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__
         self.kernel = None
@@ -837,6 +1391,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # TODO(jlebar): Remove uses of these fields outside this file, then
         # remove the fields here.
         self.arg_names = [p.name for p in self.params]
+        self._param_name_to_idx = {name: i for i, name in enumerate(self.arg_names)}
         self.constexprs = [p.num for p in self.params if p.is_constexpr]
 
         # Hooks that will be called prior to executing "run"
@@ -846,13 +1401,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
         import json
         import triton.language as tl
         device = driver.active.get_current_device()
+        is_cpu_backend = getattr(driver.active, "is_cpu_backend", False) is True
+        device_key = get_device_key(device, is_cpu_backend)
         deserialized_obj = json.loads(specialization_data)
         if deserialized_obj['name'] != self._fn_name:
             raise RuntimeError(
                 f"Specialization data is for {deserialized_obj['name']} but trying to preload for {self._fn_name}")
         constant_keys = map(tuple, deserialized_obj['constant_keys'])
         constant_vals = deserialized_obj['constant_vals']
-        _, _, target, backend, _ = self.device_caches[device]
+        _, _, target, backend, _ = self.device_caches[device_key]
         deserialized_target = deserialized_obj['target']
         # TODO: we could support loading a kernel signature serialized on a different target however
         # currently options are target specific so we would need to change that.
@@ -870,18 +1427,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     if jf_key in _triton_jit_function_registry:
                         return _triton_jit_function_registry[jf_key]
                     raise RuntimeError(f"Unable to resolve JITFunction {jf_key} for preload")
-                if 'class' in value:
-                    class_key = value['class']
-                    try:
-                        module_name, qualname = class_key.split(':', 1)
-                        cls = importlib.import_module(module_name)
-                        for name in qualname.split('.'):
-                            cls = getattr(cls, name)
-                    except (ImportError, AttributeError, ValueError) as e:
-                        raise RuntimeError(f"Unable to resolve class {class_key} for preload") from e
-                    if not isinstance(cls, type):
-                        raise RuntimeError(f"Expected class {class_key} for preload, got {type(cls).__name__}")
-                    return cls
             return convert_to_tuple_if_list(value)
 
         constexprs = {key: _decode_constant(value) for key, value in zip(constant_keys, constant_vals)}
@@ -901,14 +1446,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
             key,
             signature,
             device,
+            device_key,
             constexprs,
             options,
             attrs,
             warmup=True,
         )
 
-    def _do_compile(self, key, signature, device, constexprs, options, attrs, warmup):
-        kernel_cache, _, target, backend, _ = self.device_caches[device]
+    def _do_compile(self, key, signature, device, device_key, constexprs, options, attrs, warmup):
+        kernel_cache, _, target, backend, _ = self.device_caches[device_key]
 
         if self._call_hook(knobs.runtime.jit_cache_hook, key, signature, target, device, constexprs, options, [attrs],
                            warmup):
@@ -943,7 +1489,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                             [attrs], warmup)
         return kernel
 
-    def __call__(self: "JITFunction[Callable[P, R]]", *args: P.args, **kwargs: P.kwargs) -> R:
+    def __call__(self: "JITFunction[Callable[..., R]]", *args: Any, **kwargs: Any) -> R:
         raise RuntimeError("Cannot call @triton.jit'd outside of the scope of a kernel")
 
     if TYPE_CHECKING:
@@ -984,6 +1530,7 @@ def jit(
     do_not_specialize_on_alignment: Optional[Iterable[int | str]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
+    c_cache: Optional[bool] = None,
 ) -> Callable[[T], JITFunction[T]]:
     ...
 
@@ -998,6 +1545,7 @@ def jit(
     do_not_specialize_on_alignment: Optional[Iterable[int | str]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
+    c_cache: Optional[bool] = None,
 ) -> KernelInterface[T]:
     """
     Decorator for JIT-compiling a function using the Triton compiler.
@@ -1005,11 +1553,6 @@ def jit(
     :note: When a jit'd function is called, arguments are
         implicitly converted to pointers if they have a :code:`.data_ptr()` method
         and a `.dtype` attribute.
-
-    :note: Namedtuple argument classes can set ``__triton_do_not_specialize__``
-        to a tuple of field names. These fields and their nested tuple elements
-        skip value and alignment specialization. Explicit ``constexpr`` values
-        still specialize.
 
     :note: This function will be compiled and run on the GPU. It will only have access to:
 
@@ -1038,6 +1581,7 @@ def jit(
                 noinline=noinline,
                 repr=repr,
                 launch_metadata=launch_metadata,
+                c_cache=c_cache,
             )
 
     if fn is not None:
@@ -1072,12 +1616,11 @@ class MockTensor:
 
     def stride(self):
         strides = []
-        value = 1
+        stride = 1
         for size in reversed(self.shape):
-            strides.append(value)
-            value *= size
-        strides.reverse()
-        return tuple(strides)
+            strides.append(stride)
+            stride *= max(size, 1)
+        return tuple(reversed(strides))
 
     @staticmethod
     def data_ptr():

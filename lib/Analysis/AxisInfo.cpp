@@ -15,6 +15,7 @@
 
 #include <limits>
 #include <numeric>
+#include <type_traits>
 
 #define DEBUG_TYPE "axis-info"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -247,8 +248,9 @@ private:
   }
 
   ConstantInt evaluate(arith::CmpIOp op) const {
-    return evaluateBinary([&](const APInt &a, const APInt &b) {
-      return APInt(1, arith::applyCmpPredicate(op.getPredicate(), a, b));
+    return evaluateBinary([&](const APInt &a, const APInt &b) -> ConstantInt {
+      return ConstantInt(std::in_place, 1,
+                         arith::applyCmpPredicate(op.getPredicate(), a, b));
     });
   }
 
@@ -388,6 +390,20 @@ public:
   }
 };
 
+static AxisInfo
+getPassthroughAxisInfo(Operation *op,
+                       ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) {
+  if (operands.empty()) {
+    if (op->getNumResults() == 0)
+      return AxisInfo();
+    return AxisInfo::getPessimisticValueState(op->getResult(0));
+  }
+  auto tensorType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (tensorType && tensorType.getRank() != operands[0]->getValue().getRank())
+    return AxisInfo::getPessimisticValueState(op->getResult(0));
+  return operands[0]->getValue();
+}
+
 template <typename OpTy>
 class IdentityOpAxisInfoVisitor final : public AxisInfoVisitorImpl<OpTy> {
 public:
@@ -396,7 +412,20 @@ public:
   AxisInfo
   getAxisInfo(OpTy op,
               ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
-    return operands[0]->getValue();
+    return getPassthroughAxisInfo(op, operands);
+  }
+};
+
+class AxisInfoPassthroughVisitor final : public AxisInfoVisitor {
+public:
+  AxisInfo
+  getAxisInfo(Operation *op,
+              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+    return getPassthroughAxisInfo(op, operands);
+  }
+
+  bool match(Operation *op) override {
+    return op->hasTrait<mlir::OpTrait::AxisInfoPassthroughTrait>();
   }
 };
 
@@ -660,7 +689,13 @@ private:
     // the minimal constancy is gcd(d_lhs, d_rhs).
     // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
     // we need to use another gcd to get the actual constancy.
-    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
+    // Full-dimension contiguity is not required for unsigned division. A
+    // partially contiguous numerator still produces constant runs when the
+    // run boundaries are aligned to the divisor. Signed division cannot use
+    // this relaxation without a non-negativity proof because it truncates
+    // toward zero. Preserve the pre-existing full-dimension inference there.
+    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::DivUIOp>;
+    if ((isUnsigned || AxisInfoVisitor::isContiguousDim(lhs, shape, dim)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       constancy = std::max(constancy,
                            gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
@@ -1216,12 +1251,11 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
   // in the process of a PartialConversion, where UnrealizedConversionCast
   // may exist
   visitors.append<UnrealizedConversionCastOpAxisInfoVisitor>();
+  visitors.append<AxisInfoPassthroughVisitor>();
   visitors.append<IntegerCastOpAxisInfoVisitor<arith::ExtSIOp>,
                   IntegerCastOpAxisInfoVisitor<arith::ExtUIOp>,
                   IntegerCastOpAxisInfoVisitor<arith::TruncIOp>,
-                  IdentityOpAxisInfoVisitor<triton::AnnotateOp>,
                   IdentityOpAxisInfoVisitor<triton::gpu::ConvertLayoutOp>,
-                  IdentityOpAxisInfoVisitor<triton::gpu::ThreadHandoffOp>,
                   BitcastOpAxisInfoVisitor,
                   IdentityOpAxisInfoVisitor<triton::gluon::SetAutoLayoutOp>>();
   visitors.append<MakeRangeOpAxisInfoVisitor>();
@@ -1527,13 +1561,18 @@ unsigned ModuleAxisInfoAnalysis::getMaskAlignment(Value mask) {
   auto tensorTy = dyn_cast<RankedTensorType>(mask.getType());
   if (!tensorTy)
     return 1;
+  return getMaskAlignment(mask, gpu::getOrder(tensorTy)[0]);
+}
+
+unsigned ModuleAxisInfoAnalysis::getMaskAlignment(Value mask, unsigned axis) {
+  auto tensorTy = dyn_cast<RankedTensorType>(mask.getType());
+  if (!tensorTy || axis >= tensorTy.getRank())
+    return 1;
   auto *axisInfo = getAxisInfo(mask);
   if (!axisInfo)
     return 1;
-  auto maskOrder = gpu::getOrder(tensorTy);
-  auto alignment = std::max<unsigned>(axisInfo->getConstancy(maskOrder[0]), 1);
-  LDBG("getMaskAlignment maskOrder[0] " << maskOrder[0] << " alignment "
-                                        << alignment);
+  auto alignment = std::max<unsigned>(axisInfo->getConstancy(axis), 1);
+  LDBG("getMaskAlignment axis " << axis << " alignment " << alignment);
   LLVM_DEBUG({
     std::string axisStr;
     llvm::raw_string_ostream os(axisStr);
@@ -1600,4 +1639,33 @@ void ModuleAxisInfoAnalysis::update(CallOpInterface callOp,
   }
 }
 
+unsigned getAxisInfoVector(const AxisInfo &info, Type ptrType,
+                           ArrayRef<int64_t> shape, unsigned dim,
+                           int64_t threads, unsigned maxBits) {
+  unsigned bits = getPointeeBitWidth(ptrType);
+  uint64_t aligned =
+      std::max<int64_t>(info.getDivisibility(dim) / std::max(bits / 8, 1u), 1);
+  uint64_t perThread =
+      std::max<int64_t>(ShapedType::getNumElements(shape) / threads, 1);
+  // A run of contiguous elements can be NPOT, and must hold whole vectors.
+  uint64_t contiguity = std::min<int64_t>(info.getContiguity(dim), shape[dim]);
+  return std::min<uint64_t>({aligned, maxBits / bits,
+                             llvm::bit_floor(perThread),
+                             uint64_t(1) << llvm::countr_zero(contiguity)});
+}
+
 } // namespace mlir::triton
+
+namespace mlir {
+
+SmallVector<unsigned, 4>
+getOrderFromContiguity(const SmallVector<int64_t> &arr) {
+  SmallVector<unsigned, 4> ret(arr.size());
+  std::iota(ret.begin(), ret.end(), 0);
+  std::reverse(ret.begin(), ret.end());
+  std::stable_sort(ret.begin(), ret.end(),
+                   [&](unsigned x, unsigned y) { return arr[x] > arr[y]; });
+  return ret;
+}
+
+} // namespace mlir

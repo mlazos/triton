@@ -13,9 +13,11 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 
+#include <functional>
 #include <optional>
 
 #define DEBUG_TYPE "ttgpu_to_llvm"
@@ -52,48 +54,32 @@ namespace mlir::triton {
 
 class ModuleAxisInfoAnalysis;
 
-// Split the mixed attributes accepted by the old aggregate builders.
-template <typename Op> struct BuilderAttributes {
-  typename Op::Properties properties{};
-  SmallVector<NamedAttribute> discardableAttrs;
-};
-
-template <typename Op>
-BuilderAttributes<Op> splitBuilderAttributes(OpBuilder &builder, Location loc,
-                                             ArrayRef<NamedAttribute> attrs) {
-  BuilderAttributes<Op> result;
-  if constexpr (std::is_same_v<typename Op::Properties, EmptyProperties>) {
-    llvm::append_range(result.discardableAttrs, attrs);
-  } else {
-    Op::populateDefaultProperties(
-        OperationName(Op::getOperationName(), builder.getContext()),
-        result.properties);
-    LogicalResult converted = Op::setPropertiesFromAttr(
-        result.properties, builder.getDictionaryAttr(attrs),
-        [&]() { return emitError(loc, "failed to convert properties"); });
-    assert(succeeded(converted) && "failed to convert properties");
-    (void)converted;
-
-    auto properties = dyn_cast_or_null<DictionaryAttr>(
-        Op::getPropertiesAsAttr(builder.getContext(), result.properties));
-    for (NamedAttribute attr : attrs) {
-      StringRef name = attr.getName().getValue();
-      bool isProperty = properties && properties.contains(name);
-      if (name == "operand_segment_sizes")
-        isProperty |= properties && properties.contains("operandSegmentSizes");
-      if (name == "result_segment_sizes")
-        isProperty |= properties && properties.contains("resultSegmentSizes");
-      if (!isProperty)
-        result.discardableAttrs.push_back(attr);
-    }
-  }
-  return result;
-}
-
 // The address of the descriptor's logical origin in its memory space.
 Value getMemDescAddress(RewriterBase &rewriter, Location loc,
                         const LLVMTypeConverter *typeConverter,
                         gpu::MemDescType type, Value lowered);
+
+// Shared by backend-specific and generic local-load conversion patterns so a
+// named group produces one lane/warp rematerialization point even when its
+// loads take different lowering paths.
+class DistributedCoordinateGroups {
+public:
+  std::pair<Value, Value> getOrCreate(Operation *op, int64_t group,
+                                      bool rematerializeLane,
+                                      bool rematerializeWarp,
+                                      RewriterBase &rewriter,
+                                      const TargetInfoBase &targetInfo);
+
+private:
+  struct Entry {
+    Value lane;
+    Value warp;
+    bool laneRematerialized = false;
+    bool warpRematerialized = false;
+  };
+
+  llvm::DenseMap<Block *, llvm::DenseMap<int64_t, Entry>> groups;
+};
 
 struct TritonLLVMOpBuilder {
   TritonLLVMOpBuilder(Location loc, OpBuilder &builder)
@@ -374,6 +360,9 @@ constexpr int kProfileScratchBufferOffset = -1;
 constexpr int kGlobalScratchBufferOffset = -2;
 constexpr int kSharedMemoryOffset = -3;
 
+// Defined in triton/Analysis/Utility.h.
+struct MixedRadixSharedTiling;
+
 namespace triton {
 
 namespace gpu {
@@ -399,14 +388,46 @@ Value emitRedundantThreadPredicate(
     ConversionPatternRewriter &rewriter, Location loc,
     const TargetInfoBase &targetInfo);
 
-Value emitThreadPredicate(ThreadDomainAttr domain,
-                          ConversionPatternRewriter &rewriter, Location loc,
-                          const TargetInfoBase &targetInfo);
+// True iff every free-variable digit of `indices` is 0 (mixed radix), so each
+// output of `layout` is held by one thread.
+Value emitCanonicalLayoutOwnerPredicate(
+    Location loc, RewriterBase &rewriter, const LinearLayout &layout,
+    ArrayRef<std::pair<StringAttr, Value>> indices,
+    const llvm::MapVector<StringAttr, int32_t> &freeVariableMasks);
 
-// Thread-local memory operations already execute in their owner's branch.
-Value emitMemoryThreadPredicate(
-    Operation *op, const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
-    ConversionPatternRewriter &rewriter, const TargetInfoBase &targetInfo);
+// Calls `access` per `run` registers of a mixed-radix `regLayout` with the
+// first register, its offset through `toOffset` (the shared layout's
+// pseudoinverse) and the hardware indices that reach it.
+void forEachMixedRadixSharedRun(
+    Location loc, RewriterBase &rewriter, const LinearLayout &regLayout,
+    const LinearLayout &toOffset, int32_t run,
+    function_ref<void(int32_t, Value, ArrayRef<std::pair<StringAttr, Value>>)>
+        access);
+
+// Moves mixed-radix `inVals` from `srcLayout` to `dstLayout` via scratch at
+// `smemBase`: its thread stores each element once, then each destination
+// register loads it, in vector runs. A `tiling` reuses one scratch tile;
+// `transferTile`, if set, moves each tile in place of that transfer.
+SmallVector<Value> transferMixedRadixThroughSharedMemory(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    const LinearLayout &srcLayout, const LinearLayout &dstLayout,
+    ArrayRef<Value> inVals, Type elemTy, Value smemBase,
+    const llvm::MapVector<StringAttr, int32_t> &srcFreeVariableMasks,
+    bool blockScope,
+    std::optional<std::pair<Value, Value>> distributedCoordinates =
+        std::nullopt,
+    const MixedRadixSharedTiling *tiling = nullptr,
+    function_ref<SmallVector<Value>(const LinearLayout &, const LinearLayout &,
+                                    ArrayRef<Value>)>
+        transferTile = nullptr);
+
+// Splits `layout` at the non-binary digits that follow the binary ones of
+// `inDim`: layout(x + w * o) == sub(x) + slabs[o] for x < w, the radix-2 size
+// of `inDim`. Returns sub; fails if any other input digit is non-binary or a
+// table is not in odd-part form.
+FailureOr<LinearLayout>
+splitOddOuterDigits(const LinearLayout &layout, StringAttr inDim,
+                    SmallVectorImpl<SmallVector<int32_t>> &slabs);
 
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);
@@ -720,12 +741,37 @@ LowerLdStCallback makeSharedStoreEmitter(const TargetInfoBase &targetInfo,
 LowerLdStCallback makeSharedLoadEmitter(const TargetInfoBase &targetInfo,
                                         Operation *localLoadOp = nullptr);
 
-// Lower an ld/st-like operation using a layout and instruction callback.
-// This is a close cousin of lowerLdStMatrix in MemoryOpToLLVM.cpp, but
-// ldmatrix.trans makes that path more specialized. An empty valsArray emits
-// loads and returns their values; otherwise it emits stores. `paddingShifts`
-// describes shared-memory padding, and `cvt` maps (register, lane, warp, block)
-// to (offset[, partition]).
+// Scalar stores reuse shared addressing and the unique lane/warp predicate.
+using ScalarSharedStoreEmitter =
+    std::function<void(RewriterBase &, Location, Value /*ptr*/, Value /*ctaId*/,
+                       Value /*value*/, Value /*pred*/)>;
+
+// Close cousin of lowerLdStMatrix in MemoryOpToLLVM.cpp
+// We might want to merge them at some point, but having to support
+// ldmatrix.trans makes the code in lowerLdStMatrix a bit specific
+// Lowers to st when valsArray is nonempty, and to ld when it is empty,
+// and returns the output values.
+// `paddingShifts` encodes shared memory padding if any.
+SmallVector<Value> lowerLdStShared(
+    Location loc, MLIRContext *ctx, LinearLayout cvt,
+    ArrayRef<Value> valsArray, // Input for store, output for load
+    Type llvmElemTy, ArrayRef<Value> smemBases,
+    ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
+    uint64_t maskSpanAffineOffset, Value affineBlockOffset,
+    uint64_t maskSpanAffineBlock, RewriterBase &rewriter,
+    const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
+    Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
+    std::optional<Value> barrierPtr = {},
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {},
+    ScalarSharedStoreEmitter scalarStoreEmitter = {});
+
+// Lower an ld/st-like operation given a layout and a callback that creates the
+// PTX instruction Lowers to st when valArrays is empty, and to ld when it is
+// not, and returns the output values.
+// calcPaddedOffset is a lambda that takes a base offset (mlir::Value)
+// and computes a new offset (mlir::Value) by applying padding based on
+// shared memory layout.
+// cvt: Maps (reg, lane, warp, block) → (offset[, partition]).
 SmallVector<Value>
 lowerLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
           ArrayRef<Value> valsArray, // Input for store, output for load
@@ -735,16 +781,29 @@ lowerLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
           Value affineBlockOffset, uint64_t maskSpanAffineBlock, Value laneId,
           Value warpId, RewriterBase &rewriter,
           const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems,
-          LowerLdStCallback lowerInst);
+          LowerLdStCallback lowerInst, std::optional<Value> barrierPtr = {});
 
 // Lower local_load/local_store via ld.shared/st.shared
+SmallVector<Value> lowerLocalLdSt(
+    Location loc, MLIRContext *ctx,
+    LinearLayout cvt,          // Map from registers to offset
+    ArrayRef<Value> valsArray, // Input for store, empty for load
+    Type llvmElemTy, triton::gpu::MemDescType srcTy, SharedMemoryObject smemObj,
+    RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
+    std::optional<Value> barrierPtr = {},
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {},
+    ScalarSharedStoreEmitter scalarStoreEmitter = {},
+    LowerLdStCallback lowerInst = {});
+
+// The callback form is used by target-independent lowering when the target
+// supplies its own load or store emission.
 SmallVector<Value>
-lowerLocalLdSt(Location loc, MLIRContext *ctx,
-               LinearLayout cvt,          // Map from registers to offset
-               ArrayRef<Value> valsArray, // Input for store, empty for load
-               Type llvmElemTy, triton::gpu::MemDescType srcTy,
-               SharedMemoryObject smemObj, RewriterBase &rewriter,
-               const TargetInfoBase &targetInfo, LowerLdStCallback lowerInst);
+lowerLocalLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
+               ArrayRef<Value> valsArray, Type llvmElemTy,
+               triton::gpu::MemDescType srcTy, SharedMemoryObject smemObj,
+               RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+               LowerLdStCallback lowerInst);
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter);
@@ -753,7 +812,8 @@ SmallVector<Value> unpackUniqueTensorElements(Location loc, Value llvmStruct,
                                               RewriterBase &rewriter);
 
 /// Unpack the values in \p llvmStruct into a vector using the layout from
-/// \p originalType.
+/// \p originalType. Preserve a full-register ABI; if a target-specific ABI
+/// stores only unique registers, restore its broadcast dimensions.
 SmallVector<Value> unpackTensorElements(Location loc, Value llvmStruct,
                                         RewriterBase &rewriter,
                                         Type originalType);
@@ -766,8 +826,9 @@ Value packUniqueTensorElements(Location loc,
                                ValueRange resultVals, RewriterBase &rewriter,
                                Type type);
 
-/// Pack the values in \p resultVals into an llvm struct using the layout from
-/// \p type.
+/// Pack values using the tensor layout from \p type. Preserve broadcast
+/// registers when the converted ABI materializes the full register tuple, and
+/// remove them only for an ABI that stores unique registers.
 Value packTensorElements(Location loc, const LLVMTypeConverter *typeConverter,
                          ValueRange resultVals, RewriterBase &rewriter,
                          Type type);
@@ -796,20 +857,21 @@ emitPredicated(RewriterBase &rewriter, Location loc, Value pred,
                llvm::function_ref<SmallVector<Value>()> bodyBuilder);
 
 /// Insert CTA or cluster barriers around an atomic operation according to its
-/// acquire/release semantics and any ordering already provided by result
-/// staging.
+/// acquire/release semantics. `emitBarrierAfter` may be false when result
+/// staging already emits the required barrier after the atomic instruction.
 void insertAtomicOrderingBarriers(Operation *op, MemSemantic memOrdering,
-                                  RewriterBase &rewriter,
+                                  bool emitBarrierAfter, RewriterBase &rewriter,
                                   const TargetInfoBase &targetInfo);
 
-void shuffleFromCanonicalLane(Location loc, MutableArrayRef<Value> values,
-                              uint32_t laneMask,
-                              ConversionPatternRewriter &rewriter,
-                              const TargetInfoBase &targetInfo);
+/// Whether atomic result broadcast barrier is sufficient for acquire ordering.
+/// Must run after scratch allocation.
+bool atomicResultHasOrderingBarrier(Operation *op);
 
-Value broadcastScalarResult(Operation *op, Value resultVal,
-                            ConversionPatternRewriter &rewriter,
-                            Value threadPred, const TargetInfoBase &targetInfo);
+Value broadcastScalarAtomicResult(Operation *op, Type valueElemTy,
+                                  Value resultVal,
+                                  ConversionPatternRewriter &rewriter,
+                                  TritonLLVMOpBuilder &b, Value threadPred,
+                                  const TargetInfoBase &targetInfo);
 
 llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx);
 
@@ -825,14 +887,6 @@ void makeAllWarpGroupsIsolatedFromAbove(Operation *op);
 
 // Set the correct loop annotation on LLVM branch ops.
 void fixUpLoopAnnotation(ModuleOp mod);
-
-// Use storePred is supplied to skip selected producer lanes.
-SmallVector<Value> convertLayoutViaSharedMemory(
-    Location loc, ConversionPatternRewriter &rewriter,
-    const LinearLayout &srcLayout, const LinearLayout &dstLayout,
-    ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
-    Operation *sourceOp, const TargetInfoBase &targetInfo,
-    Value storePred = {});
 
 void transferSwizzlingLocalMem(triton::gpu::ConvertLayoutOp op, Value src,
                                const TargetInfoBase &targetInfo,
@@ -861,15 +915,17 @@ createIfBlock(RewriterBase &b, Location loc, Value cnd);
 
 // Broadcast canonical owners' results to redundant threads and CTAs. Both the
 // input and returned values contain only unique registers.
-SmallVector<Value> broadcastTensorResult(Operation *op,
-                                         ConversionPatternRewriter &rewriter,
-                                         ArrayRef<Value> uniqueResultVals,
-                                         Value threadPred,
-                                         const TargetInfoBase &targetInfo);
+SmallVector<Value>
+broadcastTensorResult(Operation *op, RankedTensorType tensorTy,
+                      ConversionPatternRewriter &rewriter,
+                      ArrayRef<Value> uniqueResultVals, Type valueElemTy,
+                      TritonLLVMOpBuilder &b, Value threadPred,
+                      const TargetInfoBase &targetInfo);
 
 /// Synchronize an atomic result, then replace the op.
 void finalizeAtomicResults(Operation *op, ConversionPatternRewriter &rewriter,
-                           SmallVector<Value> &resultVals, Value threadPred,
+                           SmallVector<Value> &resultVals, Type valueElemTy,
+                           TritonLLVMOpBuilder &b, Value threadPred,
                            const TargetInfoBase &targetInfo,
                            const LLVMTypeConverter *typeConverter);
 

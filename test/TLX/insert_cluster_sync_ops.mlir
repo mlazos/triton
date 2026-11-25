@@ -1,0 +1,551 @@
+// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar=compute-capability=100 --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-optimize-mbarrier-arrivals --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm=compute-capability=100 --verify-diagnostics %s| FileCheck %s
+
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+// CHECK: module attributes {
+// CHECK-SAME: tlx.cluster_sync_kernel_init = true
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tlx_bar_init
+  tt.func public @tlx_bar_init() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: nvvm.mapa
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+
+    %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    ttng.arrive_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tlx_bar_init_ws_partition
+  tt.func public @tlx_bar_init_ws_partition() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: nvvm.mapa
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttg.warp_specialize(%0) attributes {warpGroupStartIds = array<i32: 4>}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg3: !ttg.memdesc<1xi64, #shared, #smem, mutable>) num_warps(1) {
+      %true = arith.constant true
+      %false = arith.constant false
+      %c0_i32_0 = arith.constant 0 : i32
+      %7 = ttg.memdesc_index %arg3[%c0_i32_0] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %8 = ttng.map_to_remote_buffer %7, %c0_i32_0 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+      ttng.arrive_barrier %8, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+      ttg.warp_return
+    } : (!ttg.memdesc<1xi64, #shared, #smem, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tlx_bar_init_ws_default
+  tt.func public @tlx_bar_init_ws_default() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: nvvm.mapa
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttg.warp_specialize()
+    default {
+      %true = arith.constant true
+      %false = arith.constant false
+      %c0_i32_0 = arith.constant 0 : i32
+      %7 = ttg.memdesc_index %0[%c0_i32_0] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %8 = ttng.map_to_remote_buffer %7, %c0_i32_0 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+      ttng.arrive_barrier %8, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tlx_bar_init_for_block
+  tt.func public @tlx_bar_init_for_block() attributes {noinline = false} {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    %c0_i32 = arith.constant 0 : i32
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %c1_i32 = arith.constant 1 : i32
+    %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK-NEXT: nvvm.cluster.arrive.relaxed aligned
+    // CHECK-NEXT: nvvm.cluster.wait aligned
+    // CHECK: nvvm.mapa
+    ttng.init_barrier %2, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %c0_i32_0 = arith.constant 0 : i32
+    %c300_i32 = arith.constant 300 : i32
+    %c1_i32_1 = arith.constant 1 : i32
+
+    scf.for %arg6 = %c0_i32_0 to %c300_i32 step %c1_i32_1  : i32 {
+      %8 = ttg.memdesc_index %0[%arg6] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %c0_i32_3 = arith.constant 0 : i32
+      %9 = ttng.map_to_remote_buffer %8, %c0_i32_3 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+      ttng.arrive_barrier %9, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    }
+    %true = arith.constant true
+    %false = arith.constant false
+    tt.return
+  }
+}
+
+// -----
+
+// Test that cluster sync is placed after the last barrier init, even when the
+// last init is for a local-only barrier. The first barrier is used remotely
+// (via map_to_remote_buffer), the second is used locally only.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @mixed_remote_local_bar_sync_after_last
+  tt.func public @mixed_remote_local_bar_sync_after_last() attributes {noinline = false} {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    %c0_i32 = arith.constant 0 : i32
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %c1_i32 = arith.constant 1 : i32
+    %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // The second init is for a local-only barrier, but cluster sync should
+    // still be placed after it (i.e., after the last init).
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: nvvm.mapa
+    ttng.init_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+
+    // First barrier used remotely
+    %3 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    ttng.arrive_barrier %3, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    // Second barrier used locally only
+    ttng.arrive_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that a local-only barrier init in a non-entry block is allowed when
+// remote barriers exist elsewhere in the module. The remote barrier is in the
+// entry block, but the local init inside the WS region does not participate in
+// kernel-entry cluster synchronization.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  tt.func public @local_bar_init_non_first_block_with_remote() attributes {noinline = false} {
+    // Remote barrier setup in the first block
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %c0_i32 = arith.constant 0 : i32
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    ttg.warp_specialize(%0)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: !ttg.memdesc<1xi64, #shared, #smem, mutable>) num_warps(4) {
+      // Local-only barrier init in a WS partition should be allowed.
+      %3 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %c0 = arith.constant 0 : i32
+      %4 = ttg.memdesc_index %3[%c0] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttng.init_barrier %4, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttng.arrive_barrier %4, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttg.warp_return
+    } : (!ttg.memdesc<1xi64, #shared, #smem, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  tt.func public @tlx_bar_init_ws_non_first_block() attributes {noinline = false} {
+    ttg.warp_specialize()
+    default {
+      %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %c0_i32 = arith.constant 0 : i32
+      %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %9 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %0 = tt.get_program_id x : i32
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Test that cluster sync is inserted after barrier init for clustered kernels
+// using cluster-dim-x (without paired CTA MMA attribute).
+// This exercises the tlxIsClustered API for cluster sync insertion.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @clustered_bar_init_sync
+  tt.func public @clustered_bar_init_sync() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: nvvm.mapa
+    ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+
+    %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    ttng.arrive_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that tc_gen5_commit with descs triggers cluster sync after init_barrier.
+// The descs indicate multicast across the cluster, so the barrier signal reaches other CTAs.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared2d = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tc_gen5_commit_descs_bar_init
+  tt.func public @tc_gen5_commit_descs_bar_init() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %desc = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared2d, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.tc_gen5_commit %1 descs %desc : !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<128x64xf16, #shared2d, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that async_clc_try_cancel triggers cluster sync after init_barrier.
+// The CLC try_cancel always multicasts the barrier signal to all CTAs in the cluster.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @clc_try_cancel_bar_init
+  tt.func public @clc_try_cancel_bar_init() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %2 = ttg.local_alloc : () -> !ttg.memdesc<1xui128, #shared, #smem, mutable>
+    ttng.async_clc_try_cancel %1, %2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xui128, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// The core Triton CLC scheduler materializes clc_try_cancel after barrier
+// allocation. Its multicast completion has the same cluster-init requirement.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @core_clc_try_cancel_bar_init
+  tt.func public @core_clc_try_cancel_bar_init() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %bars = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %bar = ttg.memdesc_index %bars[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %result = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    ttng.clc_try_cancel %result, %bar : !ttg.memdesc<2xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that async_tma_copy_global_to_local with multicast_targets triggers cluster
+// sync after init_barrier. The multicast bitmask causes the barrier signal to be
+// sent to multiple CTAs in the cluster.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tma_multicast_bar_init
+  tt.func public @tma_multicast_bar_init(%desc: !tt.tensordesc<128x64xbf16, #nvmma>, %alloc: !ttg.memdesc<128x64xbf16, #nvmma, #smem, mutable>, %x: i32, %mcast: i32, %pred: i1) attributes {noinline = false} {
+    %barrier = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    // CHECK-COUNT-1: mbarrier.init.shared::cta.b64
+    // CHECK-COUNT-1: nvvm.cluster.arrive.relaxed aligned
+    // CHECK-COUNT-1: nvvm.cluster.wait aligned
+    // CHECK-COUNT-1: cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster
+    ttng.init_barrier %barrier, 1 : !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%x, %x] %alloc, %barrier, %pred, %mcast {multicast} : !tt.tensordesc<128x64xbf16, #nvmma>, !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<128x64xbf16, #nvmma, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that tc_gen5_commit WITHOUT descs does NOT trigger cluster sync.
+// The barrier signal stays local, so no cluster bootstrap is needed.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tc_gen5_commit_no_two_ctas_no_sync
+  tt.func public @tc_gen5_commit_no_two_ctas_no_sync() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK-NOT: nvvm.cluster.arrive
+    // CHECK-NOT: nvvm.cluster.wait
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.tc_gen5_commit %1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that async_tma_copy_global_to_local WITHOUT multicast_targets does NOT
+// trigger cluster sync, even in a clustered kernel.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tma_no_multicast_no_sync
+  tt.func public @tma_no_multicast_no_sync(%desc: !tt.tensordesc<128x64xbf16, #nvmma>, %alloc: !ttg.memdesc<128x64xbf16, #nvmma, #smem, mutable>, %x: i32, %pred: i1) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK-NOT: nvvm.cluster.arrive
+    // CHECK-NOT: nvvm.cluster.wait
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%x, %x] %alloc, %1, %pred : !tt.tensordesc<128x64xbf16, #nvmma>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<128x64xbf16, #nvmma, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// NOTE: the two `tmem_copy_barrier_*` tests were removed by #9987 (Remove barrier
+// from TMEMCopy). tmem_copy no longer carries a barrier operand, so it no longer
+// emits a tcgen05.commit / cluster sync of its own; paired-CTA synchronization is
+// carried by the subsequent tcgen05 MMA's barrier instead. The tc_gen5_mma
+// cluster-sync coverage below is unaffected.
+
+// -----
+
+// Test that tc_gen5_mma with multiple barriers in paired CTA MMA mode triggers
+// cluster sync. The MMA's commit will multicast barrier signals to other CTAs
+// in 2cta mode. Both barriers must be initialized before the cluster sync.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 2>
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tc_gen5_mma_barrier_paired_cta
+  tt.func public @tc_gen5_mma_barrier_paired_cta(
+      %a: !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<128x256xf8E5M2, #shared1, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x256xf16, #tmem, #ttng.tensor_memory, mutable>,
+      %useAcc: i1, %pred: i1, %barrierPred: i1) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: tcgen05.mma
+    ttng.init_barrier %2, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %1[%barrierPred], %2[%barrierPred] {is_async, two_ctas} :
+       !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<128x256xf8E5M2, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x256xf16, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that tc_gen5_mma with barrier but WITHOUT paired CTA MMA does NOT trigger
+// cluster sync, even in a clustered kernel.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 2>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tc_gen5_mma_barrier_no_paired_cta_no_sync
+  tt.func public @tc_gen5_mma_barrier_no_paired_cta_no_sync(
+      %a: !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<128x256xf8E5M2, #shared1, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x256xf16, #tmem, #ttng.tensor_memory, mutable>,
+      %useAcc: i1, %pred: i1, %barrierPred: i1) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    // CHECK-NOT: nvvm.cluster.arrive
+    // CHECK-NOT: nvvm.cluster.wait
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %1[%barrierPred] {is_async} :
+       !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<128x256xf8E5M2, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x256xf16, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that tc_gen5_mma_scaled with barrier in paired CTA MMA mode triggers
+// cluster sync. The scaled MMA's commit multicasts barrier signals in 2cta mode.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tc_gen5_mma_scaled_barrier_paired_cta
+  tt.func public @tc_gen5_mma_scaled_barrier_paired_cta(
+      %a: !ttg.memdesc<128x64xf8E4M3FN, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<64x128xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
+      %useAcc: i1, %pred: i1, %barrierPred: i1) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed aligned
+    // CHECK: nvvm.cluster.wait aligned
+    // CHECK: tcgen05.mma
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e4m3 rhs = e4m3, %1[%barrierPred] {is_async, two_ctas} :
+       !ttg.memdesc<128x64xf8E4M3FN, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<64x128xf8E4M3FN, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
+       !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
+       !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test that tc_gen5_mma_scaled with barrier but WITHOUT paired CTA MMA does NOT
+// trigger cluster sync, even in a clustered kernel.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @tc_gen5_mma_scaled_barrier_no_paired_cta_no_sync
+  tt.func public @tc_gen5_mma_scaled_barrier_no_paired_cta_no_sync(
+      %a: !ttg.memdesc<128x64xf8E4M3FN, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<64x128xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
+      %useAcc: i1, %pred: i1, %barrierPred: i1) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    // CHECK-NOT: nvvm.cluster.arrive
+    // CHECK-NOT: nvvm.cluster.wait
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e4m3 rhs = e4m3, %1[%barrierPred] {is_async} :
+       !ttg.memdesc<128x64xf8E4M3FN, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<64x128xf8E4M3FN, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
+       !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>,
+       !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+
+// -----
+
+// Test that ensureEarlyBarInit moves all init_barriers before tcgen5_global_alloc,
+// even when some are on each side of it. The second init_barrier and its dep
+// (memdesc_index) are after tcgen5_global_alloc and must be reordered.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @reorder_multiple_bar_inits_before_tcgen5_alloc
+  // CHECK: mbarrier.init.shared::cta.b64
+  // CHECK: mbarrier.init.shared::cta.b64
+  // CHECK: nvvm.cluster.arrive.relaxed aligned
+  // CHECK: nvvm.cluster.wait aligned
+  // CHECK: ttng.tcgen5_global_alloc
+  tt.func public @reorder_multiple_bar_inits_before_tcgen5_alloc() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.tcgen5_global_alloc {tensor_memory_size = 128 : i32, two_ctas = true}
+    %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %3 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    ttng.arrive_barrier %3, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    tt.return
+  }
+}

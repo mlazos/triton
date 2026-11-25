@@ -15,7 +15,14 @@ def _create_driver() -> DriverBase:
             raise RuntimeError(f"Backend device '{selected}' is not active.")
         return driver()
     else:
-        active_drivers = [x.driver for x in backends.values() if x.driver.is_active()]
+        # Prefer an active GPU driver, falling back to CPU when none are active.
+        active_drivers = [
+            backend.driver for name, backend in backends.items() if name != "cpu" and backend.driver.is_active()
+        ]
+        if not active_drivers:
+            cpu_backend = backends.get("cpu")
+            if cpu_backend is not None and cpu_backend.driver.is_active():
+                active_drivers.append(cpu_backend.driver)
         if len(active_drivers) != 1:
             raise RuntimeError(f"{len(active_drivers)} active drivers ({active_drivers}). There should only be one.")
         return active_drivers[0]()
@@ -33,17 +40,49 @@ class DriverConfig:
             self._default = _create_driver()
         return self._default
 
+    # Facebook begin
+    # add setter and deleter for active property
+    # to unblock internal use case of setting patch
+    # with patch("xxx.triton.runtime.driver.active")
+    # otherwise we can revert https://github.com/triton-lang/triton/pull/7770
     @property
     def active(self) -> DriverBase:
         if self._active is None:
             self._active = self.default
         return self._active
 
+    @active.setter
+    def active(self, value: DriverBase) -> None:
+        self._active = value
+
+    @active.deleter
+    def active(self) -> None:
+        self._active = None
+
+    # Facebook end
+
     def set_active(self, driver: DriverBase) -> None:
         self._active = driver
 
     def reset_active(self) -> None:
         self._active = self.default
+
+    def set_active_to_cpu(self):
+        if "cpu" not in backends:
+            raise RuntimeError("CPU backend is unavailable")
+        self._active = backends["cpu"].driver()
+
+    def set_active_to_gpu(self):
+        active_gpus = [(name, backend.driver)
+                       for name, backend in backends.items()
+                       if backend.driver.is_active() and name != "cpu"]
+        if len(active_gpus) != 1:
+            raise RuntimeError(f"{len(active_gpus)} active GPU drivers ({active_gpus}). There should only be one GPU.")
+        self._active = active_gpus[0][1]()
+        return active_gpus[0][0]
+
+    def get_active_gpus(self):
+        return [name for name, backend in backends.items() if backend.driver.is_active() and name != "cpu"]
 
 
 driver = DriverConfig()

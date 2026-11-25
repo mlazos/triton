@@ -1,3 +1,6 @@
+#include <optional>
+
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Analysis/CallGraph.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
@@ -34,6 +37,29 @@ static int32_t minRegistersForRegion(Region &region, bool instrumented,
   return instrumented || regionUsesAssertOrPrint(region)
              ? std::max(minRegisters, kMinRegistersForAssertOrPrint)
              : minRegisters;
+}
+
+// A module with exactly one AutoWS-generated WarpSpecializeOp can use direct
+// warp-ID dispatch. Require the AutoWS tag so manual TLX is not opted in
+// implicitly; TLX requests this lowering via async_tasks(exclusive=True).
+static void enableSingleWarpSpecializeForAutoWS(ModuleOp mod) {
+  if (mod->hasAttr(AttrSingleWarpSpecializeName))
+    return;
+
+  SmallVector<WarpSpecializeOp> wsOps;
+  mod.walk([&](WarpSpecializeOp op) { wsOps.push_back(op); });
+  if (wsOps.size() != 1)
+    return;
+
+  bool hasAutoWSTag = false;
+  wsOps.front()->walk([&](Operation *op) {
+    if (!op->hasAttr(kWarpSpecializeTagAttrName))
+      return WalkResult::advance();
+    hasAutoWSTag = true;
+    return WalkResult::interrupt();
+  });
+  if (hasAutoWSTag)
+    setHasSingleWarpSpecialize(mod, true);
 }
 
 // Given a `ttg.warp_specialize` with a certain number of existing warps, pad it
@@ -73,11 +99,18 @@ static void padToMaxWarpGroups(WarpSpecializeOp op, int numExtraWarpGroups) {
   }
   op.setPartitionNumWarps(partitionNumWarps);
 
-  // Set the requested registers to low for the padded partitions that do
-  // nothing.
+  // Set the requested registers as low as legally possible for the padded
+  // partitions that do nothing. `nvvm.setmaxregister` requires the per-thread
+  // register count to be in [24, 256] (a multiple of 8) on all sm_90+ targets
+  // (Hopper and Blackwell), so 24 is the floor. Using a below-minimum value
+  // (e.g. 16) is only masked when a padding partition shares a warp group with
+  // a real partition requesting >= 24 (the warp group's request is the max over
+  // its members); when it does not, the illegal value reaches `setmaxregister`
+  // and lowering fails the verifier.
+  constexpr int32_t kMinLegalRegisters = 24;
   if (auto reqRegs = op.getRequestedRegisters()) {
     SmallVector<int32_t> newReqRegs(*reqRegs);
-    newReqRegs.append(paddingPartitionSizes.size(), 16);
+    newReqRegs.append(paddingPartitionSizes.size(), kMinLegalRegisters);
     op.setRequestedRegisters(newReqRegs);
   }
 
@@ -127,6 +160,7 @@ struct AllocateWarpGroups
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     bool laterInstrumentation = instrumented.getValue();
+    enableSingleWarpSpecializeForAutoWS(mod);
 
     // First determine the maximum number of extra warps.
     int maxExtraWarps = 0;
@@ -153,14 +187,42 @@ struct AllocateWarpGroups
       SmallVector<std::pair<unsigned, int32_t>> idxAndSize;
       for (auto [i, size] : llvm::enumerate(arr))
         idxAndSize.emplace_back(i, size);
-      llvm::sort(idxAndSize,
-                 [&](auto lhs, auto rhs) { return lhs.second > rhs.second; });
 
+      // If user-provided warpGroupStartIds exist, they cover only the
+      // original (non-padding) partitions. Respect the user-provided IDs
+      // for those partitions and assign IDs to padding partitions after.
       SmallVector<int32_t> startIds(arr.size());
-      int startId = baseNumWarps;
-      for (auto [i, size] : idxAndSize) {
-        startIds[i] = startId;
-        startId += size;
+      if (auto existingIds = op.getWarpGroupStartIds();
+          existingIds && existingIds->size() < arr.size()) {
+        // User provided IDs for the first N partitions. Compute the max
+        // warp used by those, then assign padding partitions after.
+        int maxWarp = 0;
+        for (auto [id, numWarps] :
+             llvm::zip(*existingIds, arr.take_front(existingIds->size())))
+          maxWarp = std::max(maxWarp, (int)(id + numWarps));
+
+        // Copy user-provided IDs.
+        for (unsigned i = 0; i < existingIds->size(); ++i)
+          startIds[i] = (*existingIds)[i];
+
+        // Assign padding partitions sequentially after the real ones.
+        int startId = maxWarp;
+        for (unsigned i = existingIds->size(); i < arr.size(); ++i) {
+          startIds[i] = startId;
+          startId += arr[i];
+        }
+      } else {
+        // No user-provided IDs (or they cover all partitions already).
+        // Sort by size descending (stable to preserve order for equal sizes).
+        llvm::stable_sort(idxAndSize, [&](auto lhs, auto rhs) {
+          return lhs.second > rhs.second;
+        });
+
+        int startId = baseNumWarps;
+        for (auto [i, size] : idxAndSize) {
+          startIds[i] = startId;
+          startId += size;
+        }
       }
       op.setWarpGroupStartIds(startIds);
     });
@@ -174,30 +236,27 @@ struct AllocateWarpGroups
 
     bool needsRegisterOptimization = false;
     mod.walk([&](WarpSpecializeOp op) {
-      if (op.getRequestedRegisters())
+      if (op.getRequestedRegisters() || op.getDefaultRequestedRegisters())
         needsRegisterOptimization = true;
     });
 
     if (!needsRegisterOptimization)
       return;
 
-    // Determine the maximum number of registers per thread. This may have
-    // been set by the user.
     int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
-    int maxnreg;
+    std::optional<int> userMaxnreg;
     if (auto maxnregAttr =
-            mod->getAttrOfType<IntegerAttr>(AttrMaxRegistersName)) {
-      maxnreg = maxnregAttr.getInt();
-    } else {
-      // Assume the user wants to use all 64K registers.
-      maxnreg = (64 * 1024) / (baseNumWarps + numExtraWarpGroups * 4) /
-                threadsPerWarp;
-      maxnreg = maxnreg / 8 * 8;
-    }
+            mod->getAttrOfType<IntegerAttr>(AttrMaxRegistersName))
+      userMaxnreg = maxnregAttr.getInt();
+    // Launch allocation assumed when neither the user nor fully explicit
+    // partition requests determine it: the whole 64K register file.
+    int fallbackMaxnreg =
+        (64 * 1024) / (baseNumWarps + numExtraWarpGroups * 4) / threadsPerWarp;
+    fallbackMaxnreg = fallbackMaxnreg / 8 * 8;
 
     struct WarpGroupInfo {
       SmallVector<Region *> partitions;
-      int maxRequestedRegs = 0;
+      int maxRequestedRegs = -1;
       unsigned numWarps = 0;
     };
     struct WarpGroupPartition {
@@ -207,6 +266,10 @@ struct AllocateWarpGroups
       int numWarps;
     };
 
+    // The launch register count is a single module attribute and must cover
+    // every warp-specialize op, so it is the max over all ops.
+    int launchMaxnreg = -1;
+
     // Compute register allocation for each warp specialize op.
     mod.walk([&](WarpSpecializeOp op) {
       ArrayRef<int32_t> arr = op.getPartitionNumWarps();
@@ -214,15 +277,24 @@ struct AllocateWarpGroups
 
       // Require that an estimate has been set and that we have even warpgroups.
       auto regsAttr = op.getRequestedRegisters();
-      if (!regsAttr || op.getTotalPartitionWarps() % 4 != 0)
+      auto defaultRegsAttr = op.getDefaultRequestedRegisters();
+      if ((!regsAttr && !defaultRegsAttr) ||
+          op.getTotalPartitionWarps() % 4 != 0)
         return;
+
+      SmallVector<int32_t> requestedRegisters(arr.size(), -1);
+      if (regsAttr)
+        llvm::copy(*regsAttr, requestedRegisters.begin());
 
       // Group the partitions into warpgroups.
       SmallVector<WarpGroupPartition> orderedPartitions;
-      for (auto [startId, partition, estRegs, numWarps] :
-           llvm::zip(startIds, op.getPartitionRegions(), *regsAttr, arr)) {
-        int minRegs = minRegistersForRegion(*partition, laterInstrumentation,
-                                            std::max(estRegs, kMinRegisters));
+      for (auto [startId, partition, estRegs, numWarps] : llvm::zip(
+               startIds, op.getPartitionRegions(), requestedRegisters, arr)) {
+        // Preserve beta's -1 unspecified sentinel: clamp only explicitly
+        // requested (positive) estimates up to NVVM's legal minimum.
+        int minRegs = minRegistersForRegion(
+            *partition, laterInstrumentation,
+            estRegs > 0 ? std::max(estRegs, kMinRegisters) : estRegs);
         orderedPartitions.push_back({startId, partition, minRegs, numWarps});
       }
       llvm::sort(orderedPartitions,
@@ -230,55 +302,110 @@ struct AllocateWarpGroups
 
       // Iterate over the partitions and assign them to warp groups. Determine
       // the maximum number of requested registers per warp group.
+      // A requested value of -1 is a sentinel meaning "give me an even share
+      // of leftover registers." When computing the per-warp-group max, -1
+      // values are skipped; a warp group is sentinel only if all its
+      // partitions are -1 (maxRequestedRegs stays at the initial -1).
       SmallVector<WarpGroupInfo> warpGroups;
       for (auto [startId, partition, estRegs, numWarps] : orderedPartitions) {
         if (startId % 4 == 0) {
           warpGroups.push_back(WarpGroupInfo{});
         }
         warpGroups.back().partitions.push_back(partition);
-        // Round up the nearest multiple of 8.
-        int estRegsCeil8 = llvm::divideCeil(estRegs, 8) * 8;
-        warpGroups.back().maxRequestedRegs =
-            std::max<int>(warpGroups.back().maxRequestedRegs, estRegsCeil8);
+        if (estRegs > 0) {
+          int estRegsCeil8 = llvm::divideCeil(estRegs, 8) * 8;
+          warpGroups.back().maxRequestedRegs =
+              std::max<int>(warpGroups.back().maxRequestedRegs, estRegsCeil8);
+        }
         warpGroups.back().numWarps += numWarps;
       }
 
-      // Compute the register deficit over the partition warp groups.
-      int registerBudget = maxnreg * baseNumWarps * threadsPerWarp;
+      SmallVector<int32_t> maxnregsPerPartition(1 + arr.size());
+
+      int totalWarps = baseNumWarps;
+      for (const WarpGroupInfo &wg : warpGroups)
+        totalWarps += wg.numWarps;
+      int totalThreads = totalWarps * threadsPerWarp;
+
+      int defaultRegs = -1;
+      if (defaultRegsAttr)
+        defaultRegs = minRegistersForRegion(
+            op.getDefaultRegion(), laterInstrumentation, *defaultRegsAttr);
+
+      // When every partition (default included) requests registers
+      // explicitly, the requested total determines the launch allocation:
+      // sum(num_warps * registers) over all warp groups, spread over all
+      // threads and rounded up to a multiple of 8.
+      bool allExplicit = defaultRegsAttr && *defaultRegsAttr > 0 && regsAttr;
+      for (int32_t regs : requestedRegisters)
+        allExplicit = allExplicit && regs > 0;
+      int computedMaxnreg = fallbackMaxnreg;
+      if (allExplicit) {
+        int totalRequestedRegs = defaultRegs * baseNumWarps * threadsPerWarp;
+        for (const WarpGroupInfo &wg : warpGroups)
+          totalRequestedRegs +=
+              wg.maxRequestedRegs * (int)wg.numWarps * threadsPerWarp;
+        int avgRegs = llvm::divideCeil(totalRequestedRegs, totalThreads);
+        computedMaxnreg = std::clamp<int>(llvm::divideCeil(avgRegs, 8) * 8, 24,
+                                          std::max(24, fallbackMaxnreg));
+        if (userMaxnreg && *userMaxnreg != computedMaxnreg)
+          op.emitWarning()
+              << "ttg.maxnreg is inconsistent with fully specified partition "
+                 "register counts: the partitions request "
+              << totalRequestedRegs << " registers in total ("
+              << computedMaxnreg
+              << " per thread at launch), but ttg.maxnreg=" << *userMaxnreg
+              << " was provided; the provided value takes precedence";
+      }
+      int maxnreg = userMaxnreg
+                        ? *userMaxnreg
+                        : (allExplicit ? computedMaxnreg : fallbackMaxnreg);
+      int remainingRegs = maxnreg * totalThreads;
+      int sharingThreads = 0;
+      if (defaultRegsAttr) {
+        remainingRegs -= defaultRegs * baseNumWarps * threadsPerWarp;
+      } else {
+        sharingThreads += baseNumWarps * threadsPerWarp;
+      }
+
       for (const WarpGroupInfo &wg : warpGroups) {
         assert(wg.numWarps % 4 == 0);
-        registerBudget +=
-            (maxnreg - wg.maxRequestedRegs) * wg.numWarps * threadsPerWarp;
+        if (wg.maxRequestedRegs > 0)
+          remainingRegs -= wg.maxRequestedRegs * wg.numWarps * threadsPerWarp;
+        else
+          sharingThreads += wg.numWarps * threadsPerWarp;
       }
-      if (registerBudget <= 0)
+      if (remainingRegs < 0)
         return;
 
-      // Determine the number of extra registers that we can distribute to the
-      // default warp group.
-      int leftover = registerBudget / (baseNumWarps * threadsPerWarp);
-      // Round down to the nearest multiple of 8.
-      leftover = leftover / 8 * 8;
-      if (leftover < minRegistersForRegion(op.getDefaultRegion(),
-                                           laterInstrumentation, kMinRegisters))
-        return; // too few registers
-
-      // Generate setmaxnreg in each partition according to its warp group.
-      SmallVector<int32_t> maxnregsPerPartition(1 + arr.size());
-      for (const WarpGroupInfo &wg : warpGroups) {
-        for (Region *region : wg.partitions) {
-          maxnregsPerPartition[1 + region->getRegionNumber()] =
-              wg.maxRequestedRegs;
-        }
+      int sharedRegs = -1;
+      if (sharingThreads > 0) {
+        sharedRegs = remainingRegs / sharingThreads;
+        sharedRegs = sharedRegs / 8 * 8;
+        int minSharedRegs = kMinRegisters;
+        if (defaultRegs < 0)
+          minSharedRegs = minRegistersForRegion(
+              op.getDefaultRegion(), laterInstrumentation, minSharedRegs);
+        if (sharedRegs < minSharedRegs)
+          return;
       }
-      // Set the register usage for the default warp group.
-      maxnregsPerPartition.front() = leftover;
-      op.setActualRegisters(maxnregsPerPartition);
 
-      // Set the initial max number of registers. This is needed for PTXAS to
-      // cooperate.
-      mod->setAttr(AttrMaxRegistersName,
-                   Builder(op.getContext()).getI32IntegerAttr(maxnreg));
+      maxnregsPerPartition.front() = defaultRegs > 0 ? defaultRegs : sharedRegs;
+      for (const WarpGroupInfo &wg : warpGroups) {
+        int regs = wg.maxRequestedRegs > 0 ? wg.maxRequestedRegs : sharedRegs;
+        for (Region *region : wg.partitions)
+          maxnregsPerPartition[1 + region->getRegionNumber()] = regs;
+      }
+
+      op.setActualRegisters(maxnregsPerPartition);
+      launchMaxnreg = std::max(launchMaxnreg, maxnreg);
     });
+
+    // Set the initial max number of registers. This is needed for PTXAS to
+    // cooperate.
+    if (launchMaxnreg > 0)
+      mod->setAttr(AttrMaxRegistersName,
+                   Builder(mod.getContext()).getI32IntegerAttr(launchMaxnreg));
   }
 };
 } // namespace

@@ -79,7 +79,7 @@ def DotOpInterface : OpInterface<"DotOpInterface"> {
         auto bShape = bTy.getShape();
         auto cShape = cTy.getShape();
         return cShape[cShape.size() - 2] == aShape[aShape.size() - 2] &&
-               cShape[cShape.size() - 1] == bShape[aShape.size() - 1];
+               cShape[cShape.size() - 1] == bShape[bShape.size() - 1];
       }]>
   ];
 
@@ -205,6 +205,29 @@ def AtomicOpInterface : OpInterface<"AtomicOpInterface"> {
       /*defaultImplementation=*/[{
         return $_op.getSem();
       }]
+    >
+  ];
+}
+
+def MixedRadixLayoutOpInterface : OpInterface<"MixedRadixLayoutOpInterface"> {
+  let description = [{
+    An op whose lowering takes an exact NPOT mixed-radix layout unless
+    getMixedRadixUnsupportedReason names a reason. Ops that take every exact
+    layout carry MixedRadixLayoutTrait instead.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns why the lowering can't yet take `layout`, the mixed-radix layout
+        of the first NPOT operand, or std::nullopt. The pad pass pads the
+        connected component of such an op and the verifier emits the reason.
+      }],
+      /*retType=*/"std::optional<std::string>",
+      /*methodName=*/"getMixedRadixUnsupportedReason",
+      /*args=*/(ins "const ::mlir::triton::LinearLayout &":$layout)
     >
   ];
 }

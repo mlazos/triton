@@ -29,6 +29,7 @@ namespace {
 
 enum class ShflKind : uint32_t {
   bfly = 0,
+  up = 1,
   idx = 2,
 };
 
@@ -120,6 +121,12 @@ Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
     return b.bitcast(vec, val.getType());
   }
 
+  auto mod = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
+  Value threadId = getThreadId(rewriter, loc);
+
+  unsigned iWarpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+  Value warpSize = b.i32_val(iWarpSize);
+  Value laneId = b.urem(threadId, warpSize);
   auto bpermute = [&](Value lane) {
     // Multiple lineId by 4. (More on permute instruction semantics:
     // https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/instinct-mi200-cdna2-instruction-set-architecture.pdf#page=180
@@ -147,7 +154,7 @@ Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
     uint32_t mask = strideInt;
     if (mask == 0)
       return val;
-    assert(mask < triton::gpu::lookupThreadsPerWarp(rewriter) &&
+    assert(mask < iWarpSize &&
            "shuffle_xor expects a mask within the wave size");
 
     auto makeDppCtrl = [](DppCtrl base, uint32_t arg) {
@@ -209,8 +216,14 @@ Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
       }
       return result;
     } else {
-      return bpermute(b.xor_(getLaneId(rewriter, loc), b.i32_val(mask)));
+      return bpermute(b.xor_(laneId, b.i32_val(mask)));
     }
+  }
+  case ShflKind::up: {
+    Value mask = b.icmp_slt(laneId, i);
+    Value delta = b.sub(laneId, i);
+    Value index = b.select(mask, laneId, delta);
+    return bpermute(index);
   }
   case ShflKind::idx:
     return bpermute(i);
@@ -243,6 +256,13 @@ Value shuffleXor(Location loc, RewriterBase &rewriter, Value val, int i,
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   return shuffleCommon(loc, rewriter, isaFamily, val, b.i32_val(i), i,
                        ShflKind::bfly, b.i32_val(0x1f));
+}
+
+Value shuffleUp(Location loc, RewriterBase &rewriter, Value val, int i,
+                ISAFamily isaFamily) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  return shuffleCommon(loc, rewriter, isaFamily, val, b.i32_val(i), i,
+                       ShflKind::up, b.i32_val(0x0));
 }
 
 Value shuffleIdx(Location loc, RewriterBase &rewriter, Value val, int i,
@@ -291,37 +311,49 @@ Value permute(Location loc, RewriterBase &rewriter, Value x, Value y,
 //      | .wt |   T      | X
 // -----+-----+----------+---------
 std::pair<bool, bool>
-getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm,
-                                  MemoryOp op) {
+getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm, MemoryOp op,
+                                  triton::EvictionPolicy evict) {
+  bool nonTemporal = false;
   switch (op) {
   case MemoryOp::Load: {
     switch (cm) {
     case triton::CacheModifier::CA:
-      return std::make_pair(false, false);
+      nonTemporal = false;
+      break;
     case triton::CacheModifier::CG:
-      return std::make_pair(false, true);
     case triton::CacheModifier::CS:
-      return std::make_pair(false, true);
+      nonTemporal = true;
+      break;
     case triton::CacheModifier::CV:
       return std::make_pair(true, true);
     default:
-      return std::make_pair(false, false);
+      nonTemporal = false;
+      break;
     }
+    break;
   }
   case MemoryOp::Store: {
     switch (cm) {
-    case triton::CacheModifier::CG:
-      return std::make_pair(false, false);
     case triton::CacheModifier::CS:
-      return std::make_pair(false, true);
+      nonTemporal = true;
+      break;
     case triton::CacheModifier::WT:
       return std::make_pair(true, true);
     default:
-      return std::make_pair(false, false);
+      nonTemporal = false;
+      break;
     }
+    break;
   }
   }
-  return std::make_pair(false, false);
+  // An explicit eviction policy overrides the modifier's temporal hint, but
+  // never weakens the cache bypass (.cv/.wt) handled above.
+  if (evict == triton::EvictionPolicy::EVICT_FIRST)
+    nonTemporal = true;
+  else if (evict == triton::EvictionPolicy::EVICT_LAST)
+    nonTemporal = false;
+  // NB: .cv/.wt return early above, so volatile is always false here.
+  return std::make_pair(false, nonTemporal);
 }
 
 Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
@@ -336,23 +368,14 @@ Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
     return arith::IndexCastOp::create(rewriter, loc, i32_ty, blockId);
   }
   // For multiple CTAs the cluster id is the program id
-  Type resType = rewriter.getI32Type();
-  Value clusterIdx = nullptr;
-  switch (axis) {
-  case ProgramIDDim::X: {
-    clusterIdx = ROCDL::ClusterIdXOp::create(rewriter, loc, resType);
-    break;
-  }
-  case ProgramIDDim::Y: {
-    clusterIdx = ROCDL::ClusterIdYOp::create(rewriter, loc, resType);
-    break;
-  }
-  case ProgramIDDim::Z: {
-    clusterIdx = ROCDL::ClusterIdZOp::create(rewriter, loc, resType);
-    break;
-  }
-  }
-  return clusterIdx;
+  std::array intrinsics = {"llvm.amdgcn.cluster.id.x",
+                           "llvm.amdgcn.cluster.id.y",
+                           "llvm.amdgcn.cluster.id.z"};
+  auto axisUInt = unsigned(axis);
+  assert(axisUInt < intrinsics.size());
+  return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsics[axisUInt],
+                                         {rewriter.getI32Type()}, {})
+      .getResult(0);
 }
 
 // For multicast memory operations (e.g., cluster.load.async.to.lds), we need a
@@ -456,19 +479,19 @@ Value emitCtaMulticastMask(RewriterBase &rewriter, Location loc, Value groupId,
 
 Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
              Value pred, Value falseVal, Value multicastMask,
-             triton::CacheModifier cm, bool isVolatile,
-             bool forceNoAliasAsyncLoads) {
+             triton::CacheModifier cm, triton::EvictionPolicy evict,
+             bool isVolatile, bool forceNoAliasAsyncLoads) {
   return triton::amdgpu::MaskedLoadOp::create(
              rewriter, loc, elemTy, ptr, pred, falseVal, multicastMask, cm,
-             isVolatile, forceNoAliasAsyncLoads)
+             evict, isVolatile, forceNoAliasAsyncLoads)
       .getResult();
 }
 
 void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
-             Value pred, triton::CacheModifier cm,
+             Value pred, triton::CacheModifier cm, triton::EvictionPolicy evict,
              bool forceNoAliasAsyncLoads) {
   triton::amdgpu::MaskedStoreOp::create(rewriter, loc, ptr, val, pred, cm,
-                                        forceNoAliasAsyncLoads);
+                                        evict, forceNoAliasAsyncLoads);
 }
 
 // Create the auxiliary/cachepolicy value of ROCDL::RawPtrBufferLoad/StoreOp
@@ -494,9 +517,8 @@ void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
 // Atomic | N/A |  0  |  1  | x  | Setting sc0 returns the pre-op value
 //        | N/A |  1  |  0  | x  | Setting sc1 performs a system-scope atomic
 // -------+-----+-----+-----+----+--
-static int32_t
-getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(triton::CacheModifier cm,
-                                          bool isLoad) {
+static int32_t getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(
+    triton::CacheModifier cm, triton::EvictionPolicy evict, bool isLoad) {
   const int sc0Bit = 0b1, ntBit = 0b10, sc1Bit = 0b10000;
   int32_t aux = 0;
   switch (cm) {
@@ -524,6 +546,13 @@ getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(triton::CacheModifier cm,
     break;
   default:
     aux = 0;
+  }
+  // Never let an eviction policy override a .cv/.wt cache bypass.
+  if (cm != triton::CacheModifier::CV && cm != triton::CacheModifier::WT) {
+    if (evict == triton::EvictionPolicy::EVICT_FIRST)
+      aux |= ntBit;
+    else if (evict == triton::EvictionPolicy::EVICT_LAST)
+      aux &= ~ntBit;
   }
   return aux;
 }
@@ -571,6 +600,7 @@ getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(triton::CacheModifier cm,
 //   DLC=1, SLC=1, GLC=1  -> non-temporal: bypass GL1, stream GL2,
 //                           skip MALL                             (.cs/.cv/.wt)
 static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
+                                                  triton::EvictionPolicy evict,
                                                   bool isLoad) {
   const int glcBit = 0b1, slcBit = 0b10, dlcBit = 0b100;
   int32_t aux = 0;
@@ -599,6 +629,15 @@ static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
     break;
   default:
     aux = 0;
+  }
+  // SLC/DLC steer L2/MALL streaming without touching the L1 bypass (GLC),
+  // which stays under the cache modifier's control.
+  // Never let an eviction policy override a .cv/.wt cache bypass.
+  if (cm != triton::CacheModifier::CV && cm != triton::CacheModifier::WT) {
+    if (evict == triton::EvictionPolicy::EVICT_FIRST)
+      aux |= slcBit | dlcBit;
+    else if (evict == triton::EvictionPolicy::EVICT_LAST)
+      aux &= ~(slcBit | dlcBit);
   }
   return aux;
 }
@@ -650,6 +689,7 @@ static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
 //        | .wt |  SYS  | WB | behavior for CDNA5, bypasses all caches
 // -------+-----+-------+----+-
 static int32_t getCtrlBitsForCacheModifierOn_GFX12(triton::CacheModifier cm,
+                                                   triton::EvictionPolicy evict,
                                                    bool isLoad,
                                                    bool cacheBypassAvailable) {
   const int scopeShift = 3;
@@ -658,6 +698,7 @@ static int32_t getCtrlBitsForCacheModifierOn_GFX12(triton::CacheModifier cm,
   const int scopeSys = 3 << scopeShift;
   const int THRegular = 0;
   const int THNonTemp = 1;
+  const int THHighTemp = 2;
   const int THLastUse = 3;
   const int THWriteBack = 3;
   int aux = -1;
@@ -686,6 +727,15 @@ static int32_t getCtrlBitsForCacheModifierOn_GFX12(triton::CacheModifier cm,
   default:
     aux = 0;
   }
+  // An explicit eviction policy overrides the temporal hint but never weakens
+  // a cache bypass (TH=3 with system scope).
+  const int scopeMask = 0x3 << scopeShift;
+  if ((aux & 0x7) != THLastUse) {
+    if (evict == triton::EvictionPolicy::EVICT_FIRST)
+      aux = (aux & scopeMask) | THNonTemp;
+    else if (evict == triton::EvictionPolicy::EVICT_LAST)
+      aux = (aux & scopeMask) | THHighTemp;
+  }
   return aux;
 }
 
@@ -701,104 +751,28 @@ static int32_t getDefaultCtrlBitsForCacheModifier(triton::CacheModifier cm) {
 // .wb: write-back, writes back data at all cache levels
 // .wt: write-through, write data directly to system memory
 int32_t getCtrlBitsForCacheModifierOnTarget(
-    triton::CacheModifier cm, bool isLoad,
+    triton::CacheModifier cm, triton::EvictionPolicy evict, bool isLoad,
     const mlir::triton::AMD::TargetInfo &targetInfo) {
   switch (targetInfo.getISAFamily()) {
   case ISAFamily::CDNA3:
   case ISAFamily::CDNA4:
-    return getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(cm, isLoad);
+    return getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(cm, evict, isLoad);
   case ISAFamily::RDNA3:
   case ISAFamily::RDNA4m:
-    return getCtrlBitsForCacheModifierOnRDNA3(cm, isLoad);
+    return getCtrlBitsForCacheModifierOnRDNA3(cm, evict, isLoad);
   case ISAFamily::RDNA4:
-    return getCtrlBitsForCacheModifierOn_GFX12(cm, isLoad, /*$ bypass*/ false);
+    return getCtrlBitsForCacheModifierOn_GFX12(cm, evict, isLoad,
+                                               /*$ bypass*/ false);
   case ISAFamily::CDNA5:
-    return getCtrlBitsForCacheModifierOn_GFX12(cm, isLoad, /*$ bypass*/ true);
+    return getCtrlBitsForCacheModifierOn_GFX12(cm, evict, isLoad,
+                                               /*$ bypass*/ true);
   default:
     return getDefaultCtrlBitsForCacheModifier(cm);
   }
 }
 
-FailureOr<int32_t>
-getBufferLoadStoreCtrlBits(Operation *op, Attribute cachePolicy,
-                           std::optional<triton::MemSyncScope> scope,
-                           bool isLoad,
-                           const mlir::triton::AMD::TargetInfo &targetInfo) {
-  const bool isGfx9 = llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
-                                         targetInfo.getISAFamily());
-  const bool isGfx12 = llvm::is_contained({ISAFamily::RDNA4, ISAFamily::CDNA5},
-                                          targetInfo.getISAFamily());
-  const bool isCDNA5 = targetInfo.getISAFamily() == ISAFamily::CDNA5;
-  int32_t aux = 0;
-  if (auto gfx9Policy =
-          dyn_cast_if_present<triton::amdgpu::CachePolicyGfx9Attr>(
-              cachePolicy)) {
-    if (!isGfx9)
-      return op->emitOpError(
-          "the gfx9 cache policy is only supported on CDNA3 and CDNA4");
-    const int ntBit = 0b10;
-    if (gfx9Policy.getNontemporal())
-      aux |= ntBit;
-  } else if (auto gfx12Policy =
-                 dyn_cast_if_present<triton::amdgpu::CachePolicyGfx12Attr>(
-                     cachePolicy)) {
-    if (!isGfx12)
-      return op->emitOpError(
-          "the gfx12 cache policy is only supported on RDNA4 and CDNA5");
-    // TH[2:0] holds the temporal hint, whose values match the enum's.
-    aux |= static_cast<int32_t>(gfx12Policy.getTemporal());
-  } else {
-    auto cm = getCacheModifier(cachePolicy);
-    if (failed(cm))
-      return op->emitOpError(
-          "target cache policy is not supported on AMD targets");
-    aux = getCtrlBitsForCacheModifierOnTarget(*cm, isLoad, targetInfo);
-  }
-  if (!scope)
-    return aux;
-  if (isGfx9) {
-    // gfx9 encodes the scope of a non-atomic access in SC[1:0]: none = wave,
-    // SC0 = workgroup, SC1 = agent, SC0|SC1 = system.
-    const int sc0Bit = 0b1, sc1Bit = 0b10000;
-    switch (*scope) {
-    case triton::MemSyncScope::CTA:
-      return aux | sc0Bit;
-    case triton::MemSyncScope::GPU:
-      return aux | sc1Bit;
-    case triton::MemSyncScope::SYSTEM:
-      return aux | sc0Bit | sc1Bit;
-    }
-  } else if (isGfx12) {
-    // gfx12 encodes it in SCOPE[4:3]: CU, SE, device or system. As in LLVM's
-    // memory model, the CU scope, the default, covers a workgroup on CDNA5,
-    // where it runs on one WGP, and on RDNA4 in CU mode. In RDNA4's WGP mode,
-    // its waves can run on both CUs of a WGP, each with its own L0 cache, so
-    // it needs the SE scope.
-    const int scopeShift = 3;
-    const int scopeSE = 1 << scopeShift, scopeDev = 2 << scopeShift,
-              scopeSys = 3 << scopeShift;
-    switch (*scope) {
-    case triton::MemSyncScope::CTA:
-      return isCDNA5 || targetInfo.isCuMode() ? aux : aux | scopeSE;
-    case triton::MemSyncScope::GPU:
-      return aux | scopeDev;
-    case triton::MemSyncScope::SYSTEM:
-      return aux | scopeSys;
-    }
-  } else {
-    return op->emitOpError("scope on buffer loads and stores is only "
-                           "supported on CDNA3, CDNA4, CDNA5 and RDNA4");
-  }
-  return op->emitOpError("unsupported scope on a buffer load or store");
-}
-
 Type getPointerTypeWithShape(Value basePtr, Value offset) {
   Type basePtrType = basePtr.getType();
-  // Accesses through a buffer descriptor behave like ones through a global
-  // pointer to its element type.
-  if (auto desc = dyn_cast<triton::amdgpu::BufferDescType>(basePtrType))
-    basePtrType = triton::PointerType::get(desc.getElementType(),
-                                           triton::PtrAddrSpace::Global);
   auto offsetType = cast<RankedTensorType>(offset.getType());
   return offsetType.cloneWith(std::nullopt, basePtrType);
 }
@@ -830,8 +804,17 @@ unsigned getContiguity(Value ptr, Value offset,
   // FIXME (Alex): this should not be needed anymore because it's done inside
   // getContiguity, but we have an order issues with LL, so we keep this
   // until the LL order issue is fixed
+  SmallVector<unsigned> contigPerThread;
+  if (auto llAttr =
+          dyn_cast<triton::gpu::LinearEncodingTrait>(tensorTy.getEncoding())) {
+    contigPerThread = llAttr.getContigPerThread();
+  } else {
+    auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
+    auto fallbackAttr = triton::gpu::LinearEncodingAttr::get(
+        tensorTy.getContext(), std::move(linearLayout));
+    contigPerThread = fallbackAttr.getContigPerThread();
+  }
   auto order = triton::gpu::getOrder(tensorTy);
-  auto contigPerThread = triton::gpu::getContigPerThread(tensorTy);
   assert(order[0] < contigPerThread.size() &&
          "Unexpected contigPerThread size");
   contiguity = std::min(contiguity, contigPerThread[order[0]]);
@@ -849,11 +832,26 @@ unsigned getVectorSize(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass) {
   return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
 }
 
+unsigned
+getVectorSizeIgnoringAlignment(Value ptr,
+                               ModuleAxisInfoAnalysis &axisAnalysisPass) {
+  auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+  if (!tensorTy)
+    return 1;
+  auto order = triton::gpu::getOrder(tensorTy);
+  unsigned contiguity = triton::gpu::getContigPerThread(tensorTy)[order[0]];
+  if (auto *axisInfo = axisAnalysisPass.getAxisInfo(ptr))
+    contiguity =
+        std::min<unsigned>(contiguity, axisInfo->getContiguity(order[0]));
+  unsigned pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
+  return std::min<unsigned>(128 / pointeeBitWidth,
+                            std::max<unsigned>(contiguity, 1));
+}
+
 unsigned getVectorSize(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass) {
   auto contiguity = getContiguity(ptr, offset, axisAnalysisPass);
-  auto pointeeBitWidth =
-      triton::getPointeeBitWidth(getPointerTypeWithShape(ptr, offset));
+  auto pointeeBitWidth = triton::getPointeeBitWidth(ptr.getType());
   return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
 }
 
@@ -898,6 +896,142 @@ canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
   return divideLeft(srcToSharedLayout, coalescedLayout).has_value();
 }
 
+FailureOr<LinearLayout> splitDirectToLdsCopy(
+    const LinearLayout &srcLayout, const LinearLayout &sharedLayout,
+    SmallVectorImpl<int32_t> &slabOffsets, std::string &reason) {
+  MLIRContext *ctx = (*sharedLayout.getInDimNames().begin()).getContext();
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  StringAttr kOffset = StringAttr::get(ctx, "offset");
+  SmallVector<SmallVector<int32_t>> srcSlabs, sharedSlabs;
+  FailureOr<LinearLayout> srcBin =
+      triton::gpu::splitOddOuterDigits(srcLayout, kReg, srcSlabs);
+  FailureOr<LinearLayout> sharedBin =
+      triton::gpu::splitOddOuterDigits(sharedLayout, kOffset, sharedSlabs);
+  if (failed(srcBin) || failed(sharedBin)) {
+    reason = "its odd digits are not the outermost registers and offsets";
+    return failure();
+  }
+  auto outDims = to_vector(srcBin->getOutDimNames());
+  for (StringAttr dim : outDims) {
+    if (srcBin->getOutDimSize(dim) > sharedBin->getOutDimSize(dim)) {
+      reason = "a register slab is larger than a shared slab";
+      return failure();
+    }
+  }
+  if (!sharedBin->isSurjective()) {
+    reason = "its shared slab is not surjective";
+    return failure();
+  }
+  LinearLayout cvt = srcBin->invertAndCompose(*sharedBin);
+  SmallVector<int32_t> srcSpan(outDims.size(), 0);
+  for (const auto &[inDim, inDimBases] : srcBin->getBases())
+    for (const auto &basis : inDimBases)
+      for (auto [i, value] : llvm::enumerate(basis))
+        srcSpan[i] |= value;
+  int32_t cvtSpan = 0;
+  for (const auto &[inDim, inDimBases] : cvt.getBases())
+    for (const auto &basis : inDimBases)
+      cvtSpan |= basis[cvt.getOutDimIndex(kOffset)];
+
+  // A slab o fits when its origin is a shared slab origin plus a binary
+  // offset whose bits miss those of every address inside the slab.
+  LinearLayout inverse = sharedBin->pseudoinvert();
+  int32_t slabSize = sharedBin->getInDimSize(kOffset);
+  SmallVector<int32_t> offsets;
+  for (ArrayRef<int32_t> origin : srcSlabs) {
+    std::optional<int32_t> slabOffset;
+    for (auto [o, sharedOrigin] : llvm::enumerate(sharedSlabs)) {
+      SmallVector<std::pair<StringAttr, int32_t>> rest;
+      for (auto [i, dim] : llvm::enumerate(outDims)) {
+        int32_t r = origin[i] - sharedOrigin[sharedLayout.getOutDimIndex(dim)];
+        if (r < 0 || r >= sharedBin->getOutDimSize(dim) || (r & srcSpan[i]))
+          break;
+        rest.push_back({dim, r});
+      }
+      if (rest.size() != outDims.size())
+        continue;
+      SmallVector<std::pair<StringAttr, int32_t>> ins;
+      for (auto [dim, value] : inverse.apply(rest))
+        ins.push_back({dim, dim == kOffset ? value : 0});
+      int32_t off = ins[inverse.getOutDimIndex(kOffset)].second;
+      auto image = sharedBin->apply(ins);
+      bool fits = (off & cvtSpan) == 0;
+      for (auto [dim, value] : rest)
+        fits &= image[sharedBin->getOutDimIndex(dim)].second == value;
+      if (!fits)
+        continue;
+      slabOffset = slabSize * static_cast<int32_t>(o) + off;
+      break;
+    }
+    if (!slabOffset) {
+      reason = "a register slab does not start a shared slab";
+      return failure();
+    }
+    offsets.push_back(*slabOffset);
+  }
+  slabOffsets.assign(offsets.begin(), offsets.end());
+  return cvt;
+}
+
+std::optional<std::string> getNpotDirectToLdsUnsupportedReason(
+    const triton::AMD::TargetInfo &targetInfo, const LinearLayout &srcLayout,
+    unsigned elemBitWidth, Attribute dstEnc, ArrayRef<int64_t> dstAllocShape,
+    unsigned &vectorSize) {
+  MLIRContext *ctx = dstEnc.getContext();
+  auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(dstEnc);
+  LinearLayout sharedLayout =
+      paddedEnc ? paddedEnc.getLinearComponent()
+                : triton::gpu::toLinearLayout(dstAllocShape, dstEnc);
+  SmallVector<int32_t> slabOffsets;
+  std::string reason;
+  FailureOr<LinearLayout> cvt =
+      splitDirectToLdsCopy(srcLayout, sharedLayout, slabOffsets, reason);
+  if (failed(cvt))
+    return reason;
+  // Swizzling moves source pointers between lanes, so each slab has to start
+  // where its unswizzled slab does.
+  auto swizzledEnc = dyn_cast<triton::gpu::SwizzledSharedEncodingAttr>(dstEnc);
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1) {
+    auto flatEnc = triton::gpu::SwizzledSharedEncodingAttr::get(
+        ctx, swizzledEnc.getVec(), 1, 1, swizzledEnc.getOrder(),
+        swizzledEnc.getCGALayout());
+    SmallVector<int32_t> flatOffsets;
+    cvt = splitDirectToLdsCopy(
+        srcLayout, triton::gpu::toLinearLayout(dstAllocShape, flatEnc),
+        flatOffsets, reason);
+    if (failed(cvt))
+      return reason;
+    if (flatOffsets != slabOffsets)
+      return std::string("a swizzled slab starts away from its flat slab");
+  }
+  unsigned vec = vectorSize;
+  if (paddedEnc)
+    vec = std::min(vec, paddedEnc.getMinInterval() /
+                            (targetInfo.supportsDirectToLdsScatter()
+                                 ? 1
+                                 : targetInfo.getWarpSize()));
+  unsigned contig = cvt->getNumConsecutiveInOut();
+  if (fitToValidDirectToLdsVecSize(vec, elemBitWidth, targetInfo) == 0 ||
+      vec < contig)
+    return "its loads are narrower than its " + std::to_string(contig) +
+           "-element LDS run";
+  if (!targetInfo.supportsDirectToLdsLoadBitWidth(contig * elemBitWidth))
+    return "its " + std::to_string(contig * elemBitWidth) +
+           "-bit LDS run is not a direct-to-LDS load width";
+  if (!canCoalesceWriteIntoSharedMemory(ctx, *cvt, targetInfo.getWarpSize()))
+    return std::string("its lanes do not write contiguous LDS");
+  auto shifts = getPaddedSharedShifts(dstEnc, elemBitWidth,
+                                      /*offsetInBytes=*/true);
+  for (int32_t offset : slabOffsets) {
+    uint32_t bytes = applyPadding(offset * elemBitWidth / 8, shifts);
+    if (bytes % 16 != 0)
+      return "a slab starts at LDS byte " + std::to_string(bytes) +
+             ", which is not 16-byte aligned";
+  }
+  vectorSize = contig;
+  return std::nullopt;
+}
+
 // On architectures supporting scattering into LDS we are only constraint by the
 // minimal vector size. On architectures not support scattering, e.g. gfx9,
 // direct to LDS loads do not support per lane shared offsets. We need to ensure
@@ -921,9 +1055,20 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
     if (failureReason)
       *failureReason = std::move(reason);
   };
+  LinearLayout srcLayout = triton::gpu::toLinearLayout(srcTy);
+  if (!srcLayout.isRadix2()) {
+    auto npotReason = getNpotDirectToLdsUnsupportedReason(
+        targetInfo, srcLayout, tt::getPointeeBitWidth(srcTy), dstEnc,
+        dstAllocShape, vectorSize);
+    if (npotReason) {
+      setReason(*npotReason);
+      return false;
+    }
+    return true;
+  }
 
   // For padded encodings restrict vec by the min interval
-  auto paddedEnc = triton::gpu::getPaddedEncoding(dstEnc);
+  auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(dstEnc);
   if (paddedEnc) {
     unsigned maxAllowedVecSize = paddedEnc.getMinInterval();
     // Without scattering support, padding can only be inserted at warp
@@ -968,11 +1113,9 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
     return true;
 
   // Compute the blocked -> shared linear layout to check preconditions
-  LinearLayout srcLayout = triton::gpu::toLinearLayout(srcTy);
   LinearLayout sharedLayout;
   if (paddedEnc) {
-    sharedLayout =
-        triton::gpu::toLinearLayoutIgnoringPadding(dstAllocShape, dstEnc);
+    sharedLayout = paddedEnc.getLinearComponent();
   } else {
     sharedLayout = triton::gpu::toLinearLayout(dstAllocShape, dstEnc);
 

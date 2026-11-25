@@ -8,12 +8,17 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TargetFeatures.h"
 
 #include "nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
+#include "tlx/dialect/include/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+
 #include "llvm/Support/ErrorHandling.h"
 
 namespace ttn = mlir::triton::nvgpu;
+namespace ttg = mlir::triton::gpu;
 using ttn::Constraints;
 using ttn::OperandsAndConstraints;
 
@@ -213,7 +218,13 @@ public:
       return success();
     }
 
+    // If this is inside a warp specialize op, compute the relative thread ID
+    // within the warp group.
     Value tid = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
+    if (std::optional<int> startId =
+            getWarpGroupStartThreadId(rewriter.getInsertionBlock()))
+      tid = LLVM::SubOp::create(rewriter, loc, tid, b.i32_val(*startId));
+
     Value warpId = b.udiv(tid, b.i32_val(32));
     auto func = op->getParentOfType<FunctionOpInterface>();
     if (auto offset = func->getAttrOfType<IntegerAttr>(
@@ -526,17 +537,28 @@ public:
   }
 };
 
+static bool hasWarpSpecializeOp(LLVM::LLVMFuncOp func) {
+  return func
+      .walk([](ttg::WarpSpecializeOp) { return WalkResult::interrupt(); })
+      .wasInterrupted();
+}
+
 static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
                            std::string exclusive, size_t size, Value pred,
-                           bool twoCTAs) {
+                           bool twoCTAs, int smemOffset = 0) {
   PTXBuilder ptxBuilder;
   Location loc = func.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value sharedMem = mlir::LLVM::getStackPointer(rewriter, func);
-  if (twoCTAs) {
+  if (twoCTAs && !hasWarpSpecializeOp(func)) {
     auto ctx = func->getContext();
     NVVM::ClusterArriveOp::create(rewriter, loc, UnitAttr::get(ctx));
     NVVM::ClusterWaitOp::create(rewriter, loc, UnitAttr::get(ctx));
+  }
+  if (smemOffset > 0) {
+    auto ptrTy = sharedMem.getType();
+    sharedMem = LLVM::GEPOp::create(rewriter, loc, ptrTy, i8_ty, sharedMem,
+                                    b.i32_val(smemOffset));
   }
   std::string ptxString = "@$0 tcgen05.alloc" + exclusive +
                           ".cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
@@ -547,20 +569,11 @@ static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
   allocOp(
       {ptxBuilder.newOperand(pred, "b"), ptxBuilder.newOperand(sharedMem, "r")},
       /*onlyAttachMLIRArgs=*/true);
+  auto voidTy = void_ty(func->getContext());
   ptxBuilder.launch(rewriter, loc, void_ty(func->getContext()));
   NVVM::BarrierOp::create(rewriter, loc);
-  // Allocations of at least 512 columns always start at column zero. Avoid
-  // reading back the base address in that case. The barrier above is still
-  // needed to ensure that the allocation completes before other warps use it.
-  Value address;
-  if (size >= 512) {
-    address = b.i32_val(0);
-  } else {
-    address = b.load(i32_ty, sharedMem);
-    // Do not let another shared-memory use overwrite the allocation result
-    // until every thread has read it.
-    NVVM::BarrierOp::create(rewriter, loc);
-  }
+  Value address = b.load(i32_ty, sharedMem);
+  NVVM::BarrierOp::create(rewriter, loc);
   address = b.inttoptr(ptr_ty(func.getContext(), 6), address);
   return address;
 }
@@ -576,14 +589,35 @@ static void createRelinquishAlloc(IRRewriter &rewriter, Location loc,
 }
 
 void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, std::string exclusive,
-                 size_t size, Value pred, bool twoCTAs) {
+                 size_t size, Value pred, bool twoCTAs, bool tlxPairedMMA) {
   func.walk([&](LLVM::ReturnOp ret) {
     OpBuilder b(ret);
     auto ctx = ret->getContext();
     auto loc = ret.getLoc();
-    // Multi-CTA kernels already synchronize the cluster before every return.
-    if (!twoCTAs) {
-      // Warp-specialized groups may reach different copies of this barrier.
+    auto voidTy = void_ty(ctx);
+    bool hasWarpSpecialize = hasWarpSpecializeOp(func);
+    if (tlxPairedMMA) {
+      // TLX paired MMA: do a cluster sync before tmem de-alloc. This works
+      // even in WS mode because the WS lowering inserts matching cluster
+      // arrives for the non-default warps right before their warp_return
+      // (gated by the cluster_sync_kernel_cleanup mod attr set below).
+      if (!tlx::hasUserPostWsSync(func)) {
+        // if user declares they'll handle the post WS sync, compiler skips it.
+        // Otherwise, compiler inserts a cluster sync here
+        NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
+        NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
+        // mark mod attr so that WS lowering is aware of this cluster sync point
+        tlx::setClusterSyncKernelCleanupOnMod(func, true);
+      }
+    } else if (twoCTAs && !hasWarpSpecialize) {
+      NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
+      NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
+    } else {
+      // Non-TLX 2-CTA AutoWS: this code runs only in the default warp group's
+      // exit path. Workers are in the switch loop and cannot participate in a
+      // cluster-wide barrier, so use a CTA-level barrier instead.
+      // Warp-specialized groups may reach different copies of this barrier,
+      // so it must not require all threads to reach the same instruction.
       NVVM::BarrierOp::create(b, loc, Value{}, Value{}, /*aligned=*/false);
     }
     PTXBuilder ptxBuilder;
@@ -601,7 +635,9 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, std::string exclusive,
   });
 }
 
-static Value initTensorMemory(LLVM::LLVMFuncOp func) {
+static Value initTensorMemory(LLVM::LLVMFuncOp func,
+                              Operation *insertionPoint = nullptr,
+                              int smemOffset = 0) {
   auto mod = func->getParentOfType<ModuleOp>();
   assert(mod->hasAttr("ttg.tensor_memory_size"));
   size_t size = cast<IntegerAttr>(mod->getAttr("ttg.tensor_memory_size"))
@@ -610,7 +646,10 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
   if (size == 0)
     return Value();
   IRRewriter rewriter(func.getContext());
-  rewriter.setInsertionPointToStart(&func.front());
+  if (insertionPoint)
+    rewriter.setInsertionPoint(insertionPoint);
+  else
+    rewriter.setInsertionPointToStart(&func.front());
   auto ctx = mod.getContext();
   auto loc = func.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -618,28 +657,31 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
   if (mod->hasAttr("ttg.target"))
     computeCapability = getNVIDIAComputeCapability(mod);
   triton::nvidia_gpu::TargetFeatures targetFeatures(computeCapability);
-  // A proper error will be raised by the frontend, but to allow compilation to
   auto tmemMaxSize = targetFeatures.getMaxTMEMColumns();
+  // A proper error will be raised by the frontend, but to allow compilation to
   // continue we emit a trap.
   if (size > tmemMaxSize) {
     LLVM::Trap::create(rewriter, loc);
     return LLVM::UndefOp::create(rewriter, loc, ptr_ty(ctx, 6));
   }
 
+  bool isTlxPairedMMA = tlx::tlxEnablePairedMMA(mod);
+  bool useTwoCTAs =
+      mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || isTlxPairedMMA;
+
   std::string exclusive =
       size == tmemMaxSize && targetFeatures.supportsExclusiveTMEMAlloc()
           ? ".exclusive"
           : "";
-  bool useTwoCTAs = mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod);
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));
-  Value alloc =
-      createTMAlloc(rewriter, func, exclusive, size, pred, useTwoCTAs);
+  Value alloc = createTMAlloc(rewriter, func, exclusive, size, pred, useTwoCTAs,
+                              smemOffset);
   createRelinquishAlloc(rewriter, loc, pred, useTwoCTAs);
   // TODO: pred will have a long liverange, we need to check if this is a
   // problem and how it can be fixed.
-  freeTMAlloc(func, alloc, exclusive, size, pred, useTwoCTAs);
+  freeTMAlloc(func, alloc, exclusive, size, pred, useTwoCTAs, isTlxPairedMMA);
   return alloc;
 }
 
@@ -653,16 +695,62 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
     assert(kernel == baseOp->getParentOfType<LLVM::LLVMFuncOp>() &&
            "TODO: add support for function calls using tmem.");
   });
-  if (baseOps.empty())
+  // Find TCGen5GlobalAllocOp — it marks where tcgen05.alloc should be inserted.
+  triton::nvidia_gpu::TCGen5GlobalAllocOp tcgen5Alloc;
+  mod.walk([&](triton::nvidia_gpu::TCGen5GlobalAllocOp op) {
+    tcgen5Alloc = op;
+    if (!kernel)
+      kernel = op->getParentOfType<LLVM::LLVMFuncOp>();
+    return WalkResult::interrupt();
+  });
+  if (baseOps.empty() && !tcgen5Alloc)
     return;
   // TODO: Handle cases of matmul used in noinline functions.
   assert(triton::isKernel(kernel));
-  Value newBase = initTensorMemory(kernel);
+
+  Operation *insertionPoint =
+      tcgen5Alloc ? tcgen5Alloc.getOperation() : nullptr;
+  int smemOffset = 0;
+  if (tcgen5Alloc) {
+    if (auto offsetAttr =
+            tcgen5Alloc->getAttrOfType<IntegerAttr>("allocation.offset"))
+      smemOffset = offsetAttr.getInt();
+  }
+  Value newBase = initTensorMemory(kernel, insertionPoint, smemOffset);
+  if (tcgen5Alloc)
+    tcgen5Alloc->erase();
+
   if (!newBase)
     return;
   for (auto baseOp : baseOps) {
     baseOp->getResult(0).replaceAllUsesWith(newBase);
     baseOp->erase();
+  }
+}
+
+// Every TMEM access creates its own warp_id, and its shfl.sync uniform hint is
+// convergent, so LLVM never hoists it: each loop iteration recomputes tid ->
+// warp id -> shfl on the latency path right after the barrier wait that guards
+// the access. warp_id is pure and constant per partition, so compute it once at
+// the entry of its partition (or function) instead.
+void hoistWarpIds(ModuleOp mod) {
+  SmallVector<ttg::WarpIdOp> warpIds;
+  mod.walk([&](ttg::WarpIdOp op) { warpIds.push_back(op); });
+  DenseMap<std::pair<Block *, unsigned>, ttg::WarpIdOp> canonical;
+  for (ttg::WarpIdOp op : warpIds) {
+    Region *region = op->getParentRegion();
+    while (!isa<FunctionOpInterface, ttg::WarpSpecializePartitionsOp,
+                ttg::WarpSpecializeOp>(region->getParentOp()))
+      region = region->getParentRegion();
+    Block *entry = &region->front();
+    auto [it, inserted] =
+        canonical.try_emplace({entry, unsigned(op.getOmitUniformHint())}, op);
+    if (inserted) {
+      op->moveBefore(entry, entry->begin());
+    } else {
+      op.replaceAllUsesWith(it->second.getResult());
+      op->erase();
+    }
   }
 }
 
@@ -679,6 +767,7 @@ public:
     ModuleOp mod = getOperation();
     RewritePatternSet patterns(context);
 
+    hoistWarpIds(mod);
     patterns.add<ClusterCTAIdOpPattern, WGMMAOpPattern, LoadAcquireOpPattern,
                  WGMMAWaitGroupOpPattern, WarpIdOpPattern>(context);
 

@@ -1,0 +1,328 @@
+- `tlx.thread_id(axis)` **[sm90+]**
+
+    Returns the id of the current thread instance along the given `axis`.
+
+- `tlx.dtype_of(v)` **[sm90+]**
+
+    Returns the dtype of a tensor or tensor descriptor.
+
+- `tlx.size_of(dtype)` **[sm90+]**
+
+    Returns the size in bytes of a given Triton dtype. This is useful for dynamically computing memory sizes based on dtype, especially in barrier synchronization code.
+
+    Example:
+    ```python
+    # Instead of hardcoding size values
+    tlx.barrier_expect_bytes(barrier, 2 * BLOCK_M * BLOCK_K)  # Assumes float16
+
+    # Use size_of for dtype-aware computation
+    tlx.barrier_expect_bytes(barrier,
+                           tlx.size_of(tlx.dtype_of(desc)) * BLOCK_M * BLOCK_K)
+    ```
+
+- `tlx.clock64()` **[sm90+]**
+
+    Returns the current 64-bit hardware clock value. E.g,
+    ```
+        start = tlx.clock64()
+        # ... kernel code ...
+        end = tlx.clock64()
+        elapsed = end - start  # Number of clock cycles elapsed
+    ```
+
+- `tlx.stoch_round(src, dst_dtype, rand_bits)` **[sm100]**
+
+    Performs hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions on Blackwell GPUs (compute capability ≥ 100). Uses PTX `cvt.rs.satfinite` instructions for probabilistic rounding.
+
+    **Why Use Stochastic Rounding:**
+    - Reduces bias in low-precision training/inference by randomly rounding up or down
+    - Improves numerical accuracy compared to deterministic rounding (e.g., round-to-nearest-even)
+    - Particularly beneficial when accumulating many small updates in FP8/FP16
+
+    **Performance Characteristics:**
+    - Hardware-accelerated: Uses native Blackwell instructions (cvt.rs.satfinite)
+    - Minimal overhead: Similar throughput to deterministic rounding
+    - Memory bandwidth: Requires additional random bits (uint32 per element)
+
+    Parameters:
+    - `src`: Source FP32 tensor
+    - `dst_dtype`: Destination dtype (FP8 E5M2, FP8 E4M3FN, BF16, or FP16)
+    - `rand_bits`: Random bits (uint32 tensor) for entropy, same shape as src
+      - **Important:** Use `n_rounds=7` with `tl.randint4x()` for sufficient entropy
+      - Fewer rounds may result in biased rounding behavior
+      - Different seeds produce different rounding decisions for better statistical properties
+
+    Example:
+    ```python
+        # Generate random bits for entropy
+        # n_rounds=7 provides sufficient randomness for unbiased stochastic rounding
+        offsets = tl.arange(0, BLOCK_SIZE // 4)
+        r0, r1, r2, r3 = tl.randint4x(seed, offsets, n_rounds=7)
+        rbits = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(x.shape)
+
+        # Apply stochastic rounding
+        y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
+    ```
+
+## AMD packed dot2
+
+> `tlx.amd_packed_dot2` currently requires **[gfx950]**.
+
+```python
+tlx.amd_packed_dot2(lhs, rhs, acc, input_dtype)
+```
+
+Compute one two-element floating-point dot product for every packed register
+element:
+
+```text
+result = lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc
+```
+
+`lhs` and `rhs` are block tensors of `tl.uint32`. Each element stores two
+adjacent 16-bit inputs: bits 0–15 hold element 0 and bits 16–31 hold element 1.
+Because the storage type does not describe the packed values,
+`input_dtype` is required and must be `tl.float16` or `tl.bfloat16`.
+`acc` is an FP32 block tensor. All three operands must have identical shapes;
+the result is an FP32 tensor with that same shape and resolved layout.
+
+| Argument | Contract |
+|----------|----------|
+| `lhs`, `rhs` | Same-shaped `tl.uint32` block tensors containing packed pairs |
+| `acc` | FP32 block tensor with the same shape as `lhs` and `rhs` |
+| `input_dtype` | Required constexpr: `tl.float16` or `tl.bfloat16` |
+
+The operation is register-level and does not broadcast operands. Broadcast
+before the call when one packed input is shared:
+
+```python
+pairs = tl.arange(0, BLOCK_K // 2)
+a = tl.load(a_ptr.to(tl.pointer_type(tl.uint32)) + pairs)
+b = tl.load(b_ptr.to(tl.pointer_type(tl.uint32)) + offsets)
+a = tl.broadcast_to(a[None, :], b.shape)
+
+products = tlx.amd_packed_dot2(
+    b,
+    a,
+    tl.zeros(b.shape, tl.float32),
+    input_dtype=tl.bfloat16,
+)
+result = tl.sum(products, axis=1)
+```
+
+The lowering preserves the operation as an LLVM-visible DOT:
+
+| `input_dtype` | LLVM intrinsic |
+|-----------------|----------------|
+| `tl.float16` | `llvm.amdgcn.fdot2` |
+| `tl.bfloat16` | `llvm.amdgcn.fdot2.f32.bf16` |
+
+LLVM therefore tracks the DOT's register dependencies and inserts wait states
+only when the schedule requires them. Do not wrap this operation in inline
+assembly or add a handwritten `s_nop`.
+
+This is an intra-lane packed arithmetic operation. It is distinct from
+`tlx.amd_dot`, which computes a matrix product through MFMA instructions and
+uses distributed matrix/dot-operand layouts.
+
+## AMD scaled FP4 conversion
+
+> `tlx.amd_scaled_upcast_fp4` and `tlx.amd_scaled_downcast_fp4` require **[gfx950, gfx1250]**.
+
+```python
+tlx.amd_scaled_upcast_fp4(x, scale, dtype=tl.bfloat16, axis=-1)
+tlx.amd_scaled_downcast_fp4(x, scale, axis=-1)
+```
+
+Convert between packed E2M1 (FP4) values and BF16, F16 or FP32 with one E8M0
+scale per block of values, the MX block-scaled format. The conversion
+instruction applies the scale, so no separate multiply or divide is needed.
+
+| Argument | Contract |
+|----------|----------|
+| `x` (upcast) | `tl.uint8` block tensor, two E2M1 values per byte along `axis` (the even element in the low nibble) |
+| `x` (downcast) | FP32, BF16 or F16 block tensor |
+| `scale` | Raw E8M0 bytes (value `2^(byte - 127)`), with the unpacked shape except along `axis`, where each scale covers a multiple of 8 consecutive values (32 for MXFP4) |
+| `dtype` (upcast) | Constexpr `tl.bfloat16` (default) or `tl.float16` |
+| `axis` | Constexpr axis of the packed pairs and the scale blocks; default the last |
+
+`amd_scaled_upcast_fp4` returns `x`'s shape with `axis` doubled and computes
+`value * scale` exactly. `amd_scaled_downcast_fp4` returns a `tl.uint8` tensor
+with `axis` halved; it computes `value / scale` and rounds to nearest even,
+saturating at ±6.
+
+```python
+# MXFP4 weights: 32 values per E8M0 scale along K.
+w_packed = tl.load(w_ptr + offs_n[:, None] * (K // 2) + offs_kp[None, :])  # [BLOCK_N, BLOCK_K // 2] uint8
+w_scale = tl.load(s_ptr + offs_n[:, None] * (K // 32) + offs_ks[None, :])  # [BLOCK_N, BLOCK_K // 32] uint8
+w = tlx.amd_scaled_upcast_fp4(w_packed, w_scale, dtype=tl.bfloat16)        # [BLOCK_N, BLOCK_K] bf16
+```
+
+The backend selects the instruction for the target:
+
+| Target | Upcast | Downcast |
+|--------|--------|----------|
+| gfx1250 | `v_cvt_scale_pk8_{bf16,f16}_fp4` (8 values) | `v_cvt_scalef32_pk8_fp4_{f32,bf16,f16}` (8 values) |
+| gfx950 | `v_cvt_scalef32_pk_{bf16,f16}_fp4` (2 values) | `v_cvt_scalef32_pk_fp4_{f32,bf16,f16}` (2 values) |
+
+Both lowerings read one scale per group of 8 values, so a scale block smaller
+than 8 is rejected at compile time.
+
+## Rubin packed x4 arithmetic
+
+> `tlx.packed_add4`, `tlx.packed_sub4`, `tlx.packed_mul4`, and `tlx.packed_fma4` require **[sm107+]**.
+
+These operations apply one Rubin packed-arithmetic instruction to four low-precision lanes at a time. Operands must be block tensors containing FP8 E4M3/E5M2 values or packed FP4 E2M1 values represented as `tl.int8`.
+
+| API | Operation and result |
+|-----|----------------------|
+| `tlx.packed_add4(lhs, rhs, dtype=None)` | Add `lhs` to the FP8 `rhs`; the result has the type and shape of `rhs` |
+| `tlx.packed_sub4(lhs, rhs, dtype=None)` | Subtract the FP8 `rhs` from `lhs`; the result has the type and shape of `rhs` |
+| `tlx.packed_mul4(lhs, rhs, dtype=None)` | Multiply FP8 or packed-FP4 inputs and produce an FP8 result |
+| `tlx.packed_fma4(lhs, rhs, acc, dtype=None)` | Multiply FP8 or packed-FP4 inputs and add the FP8 accumulator; the result has the type and shape of `acc` |
+
+`dtype` may be omitted when an FP8 result-typed operand, such as `rhs` or `acc`, determines it. Multiplying two packed-FP4 operands requires an explicit FP8 result `dtype`. For mixed FP4/FP8 operations, the packed-FP4 tensor has exactly one dimension at half the corresponding FP8 extent. For an all-FP4 `packed_mul4`, packing is inferred along the final dimension and the logical result doubles that dimension.
+
+```python
+# fp4_values contains two packed E2M1 values per int8 element.
+mixed = tlx.packed_mul4(fp4_values, fp8_values, dtype=tl.float8e4nv)
+acc = tlx.packed_fma4(fp4_values, fp8_values, fp8_acc)
+
+# An all-FP4 multiply needs an explicit FP8 result type.
+product = tlx.packed_mul4(fp4_lhs, fp4_rhs, dtype=tl.float8e5)
+```
+
+The frontend lowers these APIs to `ttng.packed_arith`; the SM107 backend then emits the corresponding `add`, `sub`, `mul`, or `fma` x4 PTX instruction.
+
+- `tlx.vote_ballot_sync(mask, pred)` **[sm90+]**
+
+    Collects a predicate from each thread in the warp and returns a 32-bit
+    mask where each bit represents the predicate value from the corresponding
+    lane. Only threads specified by `mask` participate in the vote.
+    ```
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+    ```
+
+- `tlx.warp_all(pred)` / `tlx.warp_any(pred)` **[sm90+, gfx942+]**
+
+    Reduce one distributed predicate per physical lane to a warp-uniform
+    scalar `i1`. Non-boolean inputs are compared with zero first. `warp_all`
+    is true only if every lane contributes true; `warp_any` is true if at
+    least one lane contributes true.
+
+    These are physical-lane votes, not logical tensor-axis reductions.
+    `tl.all` and `tl.max` reduce a tensor dimension and retain tensor layout
+    semantics, whereas these operations produce a scalar suitable for a
+    uniform branch. The predicate must distribute exactly one element per
+    lane; compilation fails if its resolved layout gives a lane zero or
+    multiple elements.
+
+    ```python
+    all_safe = tlx.warp_all(per_lane_safe)
+    any_active = tlx.warp_any(per_lane_active)
+    ```
+
+    Prefer these semantic reductions when code only needs an all/any result.
+    They do not expose a hardware ballot bit mask.
+
+- `tlx.warp_predicate(predicate, inits, body, args=(), wave_uniform=False)` **[sm100, AMD]**
+
+    Executes `body(*inits, *args)` with the hardware execution mask restricted
+    to lanes where `predicate` is true. Active lanes receive the values returned
+    by `body`; inactive lanes keep their corresponding values from `inits`. A
+    single carried tensor is returned directly, while multiple carried tensors
+    are returned as a tuple.
+
+    A scalar predicate controls its physical lane. For a tensor predicate, the
+    elements owned by each lane are OR-reduced to form that lane's execution
+    bit. Unlike `tlx.warp_all` and `tlx.warp_any`, this does not make the
+    predicate uniform across the wave.
+
+    ```python
+    @triton.jit
+    def scale_active(acc, scale):
+        return acc * scale
+
+    acc = tlx.warp_predicate(
+        active,
+        acc,
+        scale_active,
+        args=(scale,),
+    )
+    ```
+
+    `body` must be an `@triton.jit` function that returns the same number and
+    types of tensors as `inits`. It must contain straight-line computation and
+    no cross-wave synchronization. Reductions, dots, and layout shuffles are
+    allowed only with `wave_uniform=True`, which asserts that every lane in a
+    wave observes the same predicate. Cross-warp reductions, nested dynamic
+    control flow, and other nested regions are unsupported.
+
+    On NVIDIA, the predicate must be a scalar with `wave_uniform=True`, such
+    as the result of `tlx.warp_any`, and `inits` must be empty, so each warp
+    runs or skips the whole body for its effects on tensor memory. The body
+    may contain register math and tensor memory loads and stores; anything
+    else, including mbarrier arrives and waits, is rejected. So is a body
+    that would need a CTA barrier, for example because two warps access the
+    same tensor memory words. A per-warp rescale of a tensor memory
+    accumulator looks like this:
+
+    ```python
+    @triton.jit
+    def rescale(acc, alpha):
+        tlx.local_store(acc, tlx.local_load(acc) * alpha[:, None])
+
+    # Each warp rescales its rows if any of them needs it.
+    tlx.warp_predicate(tlx.warp_any(alpha < 1.0), (), rescale,
+                       args=(acc, alpha), wave_uniform=True)
+    ```
+
+- `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` **[sm90+]** issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
+  Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.
+
+  | Level | PTX | Description |
+  |-------|-----|-------------|
+  | `"L1"` | `prefetch.global.L1` | Prefetch into L1 and L2 cache |
+  | `"L2"` | `prefetch.global.L2` | Prefetch into L2 cache only (default) |
+
+  Example:
+  ```python
+  offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+  mask = offsets < n_elements
+  tlx.prefetch(input_ptr + offsets, level="L2", mask=mask)
+  x = tl.load(input_ptr + offsets, mask=mask)
+
+  ...
+  # desc_in can be host side descriptor or device side like this:
+  desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+  tlx.prefetch(desc_in, tensormap=True)
+  ```
+
+## `tlx.assume_uniform`
+
+Assert that a scalar holds the same value in every lane of the wave.
+
+```python
+value = tlx.assume_uniform(value)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `value` | scalar pointer, or 16/32/64-bit int or float | Value asserted to be wave-uniform. Narrower types are not supported. |
+
+**Returns**: `value`, unchanged.
+
+The main use is buffer operations, which keep their base pointer in the scalar (SGPR) resource descriptor, so it has to be wave-uniform. When the backend cannot prove that it is — most commonly because the pointer was loaded from memory — it falls back to a per-lane waterfall loop around every access. `tlx.assume_uniform` tells the backend to take uniformity as given:
+
+```python
+base = tl.load(ptr_array + gid).to(tl.pointer_type(tl.float16))
+base = tlx.assume_uniform(base)
+data = tlx.buffer_load(base, offsets)
+```
+
+Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.readfirstlane` — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.

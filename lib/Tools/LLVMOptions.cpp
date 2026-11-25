@@ -86,23 +86,21 @@ Registry &registry() {
 }
 
 void applySettings(Registry &reg, Settings settings) {
-  // Allocate before mutating any options so allocation failure cannot leave
-  // the process-wide registry partially overridden.
-  std::vector<std::string> arguments{"triton"};
-  arguments.reserve(settings.size() + 1);
-  for (const auto &[name, value] : settings)
-    arguments.push_back("--" + name + "=" + value);
-  std::vector<const char *> argv;
-  argv.reserve(arguments.size());
-  for (const std::string &argument : arguments)
-    argv.push_back(argument.c_str());
-
   // getRegisteredOptions() only exposes cl::opt. The command-line parser also
   // handles TableGen library options, including codegen's start/stop passes,
   // and owns any argument strings retained by those options. Keep ignoring
   // unknown options, which may differ between LLVM revisions.
-  llvm::cl::ParseCommandLineOptions(argv.size(), argv.data(), "",
-                                    &llvm::nulls());
+  //
+  // Parse each setting on its own so a malformed value only drops that
+  // setting. A single batch parse flags the whole batch on any one bad
+  // value, and its diagnostics would otherwise be lost.
+  for (const auto &[name, value] : settings) {
+    std::string argument = "--" + name + "=" + value;
+    const char *argv[] = {"triton", argument.c_str()};
+    std::string diagnostics;
+    llvm::raw_string_ostream stream(diagnostics);
+    (void)llvm::cl::ParseCommandLineOptions(2, argv, "", &stream);
+  }
   reg.active = std::move(settings);
 }
 

@@ -1,29 +1,5 @@
 // RUN: triton-opt %s -test-print-alignment -split-input-file -verify-diagnostics=only-expected -o /dev/null
 
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  tt.func @thread_handoff_alignment(%index: i32) {
-    %zero = arith.constant 0 : i32
-    %stride = arith.constant 256 : i32
-    %owner = ttg.thread_predicate <31, 3>
-    %selected = scf.if %owner -> (i32) {
-      %value = ttg.thread_scope -> (i32) {
-        %offset = arith.muli %index, %stride : i32
-        ttg.thread_yield %offset : i32
-      }
-      scf.yield %value : i32
-    } else {
-      scf.yield %zero : i32
-    }
-    // expected-remark @below {{contiguity = [1], divisibility = [256], constancy = [1]}}
-    %broadcast = ttg.thread_handoff %selected <31, 3> -> <0, 0> : i32
-    // expected-remark @below {{contiguity = [1], divisibility = [256], constancy = [128]}}
-    %values = tt.splat %broadcast : i32 -> tensor<128xi32>
-    tt.return
-  }
-}
-
-// -----
-
 tt.func @cast() {
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = 1}}
   %cst = arith.constant 1 : i32
@@ -35,6 +11,14 @@ tt.func @cast() {
   // no integer constant.
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [128], constant_value = <none>}}
   %1 = tt.bitcast %cst_tensor : tensor<128xi32> -> tensor<128xf32>
+  tt.return
+}
+
+// -----
+
+tt.func @require_layout(%arg0: tensor<128xi32> {tt.contiguity = 16 : i32, tt.divisibility = 4 : i32, tt.constancy = 2 : i32}) {
+  // expected-remark @below {{contiguity = [16], divisibility = [4], constancy = [2], constant_value = <none>}}
+  %0 = ttg.require_layout %arg0 : tensor<128xi32> -> tensor<128xi32>
   tt.return
 }
 
@@ -62,6 +46,14 @@ tt.func @integer_cast_constants() {
 
 // -----
 
+tt.func @release_layout(%arg0: tensor<128xi32> {tt.contiguity = 16 : i32, tt.divisibility = 4 : i32, tt.constancy = 2 : i32}) {
+  // expected-remark @below {{contiguity = [16], divisibility = [4], constancy = [2], constant_value = <none>}}
+  %0 = ttg.release_layout %arg0 : tensor<128xi32> -> tensor<128xi32>
+  tt.return
+}
+
+// -----
+
 tt.func @wide_integer_cast_constants() {
   %minus_one = arith.constant -1 : i64
   // expected-remark @below {{constant_value = -1}}
@@ -73,6 +65,16 @@ tt.func @wide_integer_cast_constants() {
   %round_trip = arith.trunci %unsigned : i128 to i64
   // expected-remark @below {{constant_value = -1}}
   %narrow = arith.trunci %signed : i128 to i8
+  tt.return
+}
+
+// -----
+
+tt.func @tlx_layout_boundaries(%arg0: tensor<128xi32> {tt.contiguity = 16 : i32, tt.divisibility = 4 : i32, tt.constancy = 2 : i32}) {
+  // expected-remark @below {{contiguity = [16], divisibility = [4], constancy = [2], constant_value = <none>}}
+  %0 = tlx.require_layout %arg0 : tensor<128xi32> -> tensor<128xi32>
+  // expected-remark @below {{contiguity = [16], divisibility = [4], constancy = [2], constant_value = <none>}}
+  %1 = tlx.release_layout %0 : tensor<128xi32> -> tensor<128xi32>
   tt.return
 }
 
@@ -543,6 +545,49 @@ tt.func @rem_unit_contiguity(
   %scalar_signed = arith.remsi %scalar_lhs, %scalar_rhs : i32
   // expected-remark @below {{contiguity = [1], divisibility = [4]}}
   %scalar_unsigned = arith.remui %scalar_lhs, %scalar_rhs : i32
+  tt.return
+}
+
+// -----
+
+// NOTE: unsigned remui no longer keeps partial-group contiguity (upstream
+// PR11546 soundness test pins unit below); %within_group collapses. Re-derive
+// the D122462298 MI350 relaxation in rem_partial_groups-compatible form if
+// paged-decode perf regresses.
+tt.func @partial_div_rem_groups() {
+  // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
+  %n = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 64}}
+  %c64 = arith.constant dense<64> : tensor<128xi32>
+  // Two contiguous groups of [0, ..., 63].
+  // expected-remark @below {{contiguity = [64], divisibility = [64], constancy = [1], constant_value = <none>}}
+  %token = arith.remui %n, %c64 : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [8], constancy = [128], constant_value = 8}}
+  %c8 = arith.constant dense<8> : tensor<128xi32>
+  // [0 x 8, 1 x 8, ..., 7 x 8] repeated twice.
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  %group = arith.divui %token, %c8 : tensor<128xi32>
+  // Eight [0, ..., 7] runs exist, but partial-group inference is disabled:
+  // unit result (see NOTE above).
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %within_group = arith.remui %token, %c8 : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
+// Signed div/rem must not apply the partial-group relaxation. These facts can
+// describe local runs such as [-4, -3, -2, -1, 8, 9, 10, 11], for which
+// truncation toward zero produces neither four equal quotients nor a
+// four-element contiguous remainder run.
+tt.func @signed_partial_div_rem_is_conservative(
+    %lhs: tensor<8xi32> {tt.contiguity = 4 : i32, tt.divisibility = 4 : i32, tt.constancy = 1 : i32}) {
+  // expected-remark @below {{contiguity = [1], divisibility = [4], constancy = [8], constant_value = 4}}
+  %four = arith.constant dense<4> : tensor<8xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %quotient = arith.divsi %lhs, %four : tensor<8xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %remainder = arith.remsi %lhs, %four : tensor<8xi32>
   tt.return
 }
 
@@ -1425,6 +1470,17 @@ tt.func @unrealized_conversion_cast(%arg0: tensor<128x128xi32> {tt.contiguity = 
   %3 = builtin.unrealized_conversion_cast %2 : !llvm.struct<(i32, i32, i32, i32)> to tensor<128x128xi32>
   // expected-remark @below {{contiguity = [1, 1], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
   %4 = tt.trans %3 {order = array<i32: 1, 0>} : tensor<128x128xi32> -> tensor<128x128xi32>
+  tt.return
+}
+
+// -----
+
+// An unrealized conversion cast can materialize a value without an input.
+// AxisInfo must return a pessimistic state with the result rank instead of
+// indexing an empty operand lattice.
+tt.func @empty_unrealized_conversion_cast() {
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
+  %0 = "builtin.unrealized_conversion_cast"() : () -> tensor<4x8xi32>
   tt.return
 }
 

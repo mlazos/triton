@@ -47,19 +47,13 @@ lowerTMALoad(Operation *op, RankedTensorType tensorType, Value desc,
   Value barrierAlloc =
       gpu::LocalAllocOp::create(rewriter, loc, barrierMemDescType);
   InitBarrierOp::create(rewriter, loc, barrierAlloc, 1);
-  auto shapePerCTA = getShapePerCTA(encoding, tensorType.getShape());
-  int sizeInBytes = product(shapePerCTA) *
-                    getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+  int sizeInBytes = getDescriptorLoadBytes(op, tensorType, desc);
   Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
   triton::nvidia_gpu::BarrierExpectOp::create(rewriter, loc, barrierAlloc,
                                               sizeInBytes, pred);
   createLoad(desc, barrierAlloc, alloc, pred);
   Value phase = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
   WaitBarrierOp::create(rewriter, loc, barrierAlloc, phase);
-  // Conservatively synchronize CTAs for two-CTA MMA, since these completion
-  // barriers are per-CTA.
-  if (getModuleTwoCTAs(op))
-    ClusterBarrierOp::create(rewriter, loc);
   InvalBarrierOp::create(rewriter, loc, barrierAlloc);
   replaceUsesWithLocalLoad(rewriter, op->getResult(0), alloc);
   op->erase();
@@ -114,7 +108,32 @@ static void lowerTMAStore(Operation *op, mlir::TypedValue<RankedTensorType> src,
   gpu::MemDescType memDescType = gpu::MemDescType::get(
       tensorType.getShape(), tensorType.getElementType(), encoding,
       sharedMemorySpace, /*mutableMemory=*/false);
-  Value alloc = gpu::LocalAllocOp::create(rewriter, loc, memDescType, src);
+  // If there is a local_load for src and there are no intervening instructions,
+  // then we can safely reuse the allocation being loaded from as the source of
+  // the TMA store.
+  Value alloc;
+  if (auto localLoad =
+          dyn_cast_or_null<gpu::LocalLoadOp>(src.getDefiningOp())) {
+    bool interfere = false;
+    if (localLoad->getBlock() == op->getBlock()) {
+      for (Operation *it = localLoad->getNextNode(); it && it != op;
+           it = it->getNextNode()) {
+        // Check op cannot update SMEM
+        if (isa<gpu::LocalStoreOp, DescriptorLoadOp>(it)) {
+          interfere = true;
+          break;
+        }
+      }
+    }
+
+    if (!interfere) {
+      alloc = localLoad.getSrc();
+    }
+  }
+
+  if (!alloc) {
+    alloc = gpu::LocalAllocOp::create(rewriter, loc, memDescType, src);
+  }
   triton::nvidia_gpu::FenceAsyncSharedOp::create(rewriter, loc, false);
   createStore(desc, alloc);
   triton::nvidia_gpu::TMAStoreWaitOp::create(rewriter, loc, 0,
@@ -157,7 +176,6 @@ struct TMAScatterLowering : public OpRewritePattern<DescriptorScatterOp> {
                                 PatternRewriter &rewriter) const override {
     Value xOffsets =
         sextI16ToI32Indices(op.getXOffsets(), rewriter, op.getLoc());
-
     auto createStore = [&](Value desc, Value alloc) {
       triton::nvidia_gpu::AsyncTMAScatterOp::create(
           rewriter, op.getLoc(), desc, xOffsets, op.getYOffset(), alloc);
@@ -174,15 +192,25 @@ public:
   LogicalResult matchAndRewrite(MakeTensorDescOp op,
                                 PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto alloc = triton::gpu::GlobalScratchAllocOp::create(
-        rewriter, loc, getPointerType(rewriter.getI8Type()), TMA_SIZE_BYTES,
-        TMA_ALIGN, UnitAttr());
-    if (failed(createTMADesc(alloc, op, rewriter))) {
+
+    Value descPtr;
+    // If desc_ptr is provided, use it directly without creating global scratch
+    if (op.getDescPtr()) {
+      descPtr = op.getDescPtr();
+    } else {
+      // Create global scratch allocation when desc_ptr is not provided
+      auto alloc = triton::gpu::GlobalScratchAllocOp::create(
+          rewriter, loc, getPointerType(rewriter.getI8Type()), TMA_SIZE_BYTES,
+          TMA_ALIGN, UnitAttr());
+      descPtr = alloc.getResult();
+    }
+
+    if (failed(createTMADesc(descPtr, op, rewriter))) {
       return failure();
     }
-    TensormapFenceproxyAcquireOp::create(rewriter, loc, alloc.getResult());
-    auto newDesc = ReinterpretTensorDescOp::create(rewriter, loc, op.getType(),
-                                                   alloc.getResult());
+    TensormapFenceproxyAcquireOp::create(rewriter, loc, descPtr);
+    auto newDesc =
+        ReinterpretTensorDescOp::create(rewriter, loc, op.getType(), descPtr);
     rewriter.replaceOp(op, newDesc);
     return success();
   }

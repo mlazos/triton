@@ -24,15 +24,8 @@ constexpr int numMemTypes = getMaxEnumValForMemType() + 1;
 constexpr int MAX_NUM_BASE_THREADS = 16;
 
 namespace CommitKind {
-enum Kind {
-  None = -1,
-  AsyncCp = 0,
-  Wgmma,
-  TmaStore,
-  AsyncCpRead,
-  NumCommitKinds
-};
-} // namespace CommitKind
+enum Kind { None = -1, AsyncCp = 0, Wgmma, TmaStore, NumCommitKinds };
+}
 
 // -- ConSan capture-count constants -----------------------------------------
 // Each constant corresponds to specific passToWarpSpecialize() calls in
@@ -110,8 +103,6 @@ TypedValue<RankedTensorType> createConstIntTensor(OpBuilder &builder,
                                                   RankedTensorType tensorType,
                                                   bool isSigned = false);
 uint32_t getMemDescLength(Value buf);
-// Permute a CTA bitset by XORing each CTA ID with the translation.
-uint32_t translateXorMask(uint32_t mask, uint32_t translation, int numCTAs);
 FuncOp getEntryPoint(ModuleOp module);
 
 inline Value maybeAnd(ImplicitLocOpBuilder &b, Value lhs, Value rhs) {
@@ -143,18 +134,6 @@ struct BufferStateCandidates {
   bool unknown = false;
 };
 
-struct BufferAccessRegion {
-  uint32_t candidateCTAs;
-  unsigned issuer;
-  triton::BufferRegion region;
-
-  bool operator<(const BufferAccessRegion &other) const {
-    return std::tie(region.baseOffset, candidateCTAs, issuer, region) <
-           std::tie(other.region.baseOffset, other.candidateCTAs, other.issuer,
-                    other.region);
-  }
-};
-
 // Map from IR region to ConSan auxiliary data.
 //
 // Aux data is created in the entry function and then either rematerialized or
@@ -171,16 +150,12 @@ struct AuxDataMap {
     int tmaThreadOffset = -1;
     int tcThreadOffset = -1;
     int clcThreadOffset = -1;
-    int asyncCopyMbarrierArriveThreadOffset = -1;
     int totalNumThreads = 1;
     int numThreadSlots = 1;
 
     bool hasTMAThreads() const { return tmaThreadOffset >= 0; }
     bool hasTCThreads() const { return tcThreadOffset >= 0; }
     bool hasCLCThreads() const { return clcThreadOffset >= 0; }
-    bool hasAsyncCopyMbarrierArriveThreads() const {
-      return asyncCopyMbarrierArriveThreadOffset >= 0;
-    }
   };
 
   struct RegionToValueMap {
@@ -205,7 +180,8 @@ struct AuxDataMap {
   //   C = CTAs in the cluster.
   //   Cbar, Cbuf, Cthr, Cmask = CTA dimensions qualifying barriers, buffers,
   //       threads, and thread masks respectively. Each has extent C.
-  //   B = tracked buffers for one memory type, power-of-two padded.
+  //   D = packed buffer descriptors for one memory type, power-of-two padded.
+  //   B = analysis-selected buffer state lanes, power-of-two padded.
   //   K = tracked mbarriers and virtual cluster rendezvous slots,
   //       power-of-two padded.
   //   T = logical ConSan thread bit slots used by this module, power-of-two
@@ -220,6 +196,10 @@ struct AuxDataMap {
   //   tensor  = distributed tensor value.
   //   scratch = pointer to shared-cluster global scratch memory.
 
+  // tensor, <D x i64>
+  // Per-memory-type packed buffer descriptors. Each i64 stores the 32-bit base
+  // offset and 32-bit length of one shared-memory or tensor-memory region.
+  RegionToValueMap buffers[numMemTypes];
   // tensor, <K x i64>
   // Packed descriptors for tracked mbarrier allocations. Barriers are shared
   // memory descriptors.
@@ -280,11 +260,11 @@ struct AuxDataMap {
   triton::BufferStatePlan bufferStatePlans[numMemTypes];
   SmallVector<triton::BufferRegion> bufferRegions[numMemTypes];
   DenseMap<Value, BufferStateCandidates> bufferCandidates[numMemTypes];
-  // Operation-specific footprints retain the correlation between an issuing
-  // CTA, each physical target, and the selected descriptor candidate.
-  DenseMap<std::pair<Operation *, Value>, SmallVector<BufferAccessRegion>>
-      bufferAccessRegions;
 
+  // Beta compatibility: legacy FunctionBuilder entry points still consume
+  // packed descriptors and an optional alias expansion matrix.
+  // tensor, <D x D x i1>
+  RegionToValueMap aliasMatrices[numMemTypes];
   // Shared-memory state lanes occupied by each physical mbarrier. Virtual
   // cluster barriers have no storage and therefore do not appear here.
   SmallVector<llvm::SmallBitVector> barrierBufferMasks;
@@ -301,7 +281,6 @@ struct AuxDataMap {
   // barriers outside warp specialization share the entry-region slot; each
   // warp-specialize region has its own slot.
   DenseMap<Region *, int> clusterBarrierSlots;
-
   // scratch, <Cbar x K x Cthr x i32>
   // Deadlock-detection bitfield. Each base thread uses two bits: waiting flag
   // and stored phase.
@@ -317,6 +296,7 @@ struct AuxDataMap {
   // present; TMA/TC/CLC peer ranges are added only when the module uses them.
   ThreadLayout threadLayout;
 
+  bool hasAsyncCopyReads = false;
   bool hasAsyncProxyFenceTracking = false;
 
   LogicalResult populateAndPassToWarpSpecialize(ModuleOp module,
@@ -326,16 +306,12 @@ struct AuxDataMap {
 
   int getClusterBarrierSlot(Operation *op) const;
 
-  // Resolve a registered access to its candidate index and shared state mask.
-  std::pair<unsigned, const llvm::SmallBitVector &>
-  getBufferAccessState(const BufferAccessRegion &access,
-                       const BufferStateCandidates &candidates) const;
-
 private:
-  LogicalResult
-  getBuffersAndBarriers(ModuleOp module, triton::FuncOp entryPoint,
-                        SmallVector<triton::BufferRegion> &barrierRegions,
-                        const ConSanTargetHooks &hooks);
+  LogicalResult getBuffersAndBarriers(
+      ModuleOp module, triton::FuncOp entryPoint,
+      SmallVector<SmallVector<triton::BufferRegion>, 2> &descriptorRegions,
+      SmallVector<triton::BufferRegion> &barrierRegions,
+      const ConSanTargetHooks &hooks);
   void passToWarpSpecialize(triton::FuncOp func, ValueType value,
                             RegionToValueMap &map, int &captureCounter,
                             int64_t &captureBytes);

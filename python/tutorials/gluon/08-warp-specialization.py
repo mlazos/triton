@@ -53,12 +53,12 @@ t7 = importlib.import_module("07-persistence")
 
 def is_hopper_or_newer():
     target = triton.runtime.driver.active.get_current_target()
-    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] >= 9
+    return target.is_cuda_backend() and torch.cuda.get_device_capability()[0] >= 9
 
 
 def is_blackwell():
     target = triton.runtime.driver.active.get_current_target()
-    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] == 10
+    return target.is_cuda_backend() and torch.cuda.get_device_capability()[0] == 10
 
 
 if __name__ == "__main__" and not is_hopper_or_newer():
@@ -521,6 +521,7 @@ def matmul_epilogue_partition(p, SchedulerImpl: gl.constexpr):
         # the TMEM loads with the SMEM stores to avoid spilling.
         mbarrier.wait(acc_ready_bars.index(acc_state.index), acc_state.phase)
         acc = p.acc_bufs.index(acc_state.index).load()
+        acc_state = acc_state.next()
 
         accs = _split_n(acc, p.SUBTILE_FACTOR)
         for i in gl.static_range(len(accs)):
@@ -532,7 +533,6 @@ def matmul_epilogue_partition(p, SchedulerImpl: gl.constexpr):
                 mbarrier.arrive(acc_empty_bars.index(acc_state.index), count=1)
             fence_async_shared()
             tma.async_store(p.c_desc, [off_m, off_n + SPLIT_N * i], acc_smem)
-        acc_state = acc_state.next()
     # Overlap the last store with the wait, then wait for the last store here.
     tma.store_wait(pendings=0)
 

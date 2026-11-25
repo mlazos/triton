@@ -135,6 +135,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   // CHECK-LABEL: @tmem_copy_subslice
   tt.func public @tmem_copy_subslice() {
     // CHECK: ttg.global_scratch_alloc
+    // CHECK: ttg.barrier global_read|global_write
     // CHECK-NOT: ttng.tmem_copy
     // CHECK-NOT: ttng.tmem_subslice
     %src = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #shared, #smem, mutable>

@@ -95,6 +95,21 @@ struct ProxyFenceFunctionAnalysis
       return;
     }
 
+    // An autoWS release whose buffer another partition refills with TMA. That
+    // async write is in a different region, so the frontiers here never see
+    // the hazard; fence the generic reads before the release unconditionally.
+    // The release may have been promoted to a named barrier by now.
+    if (isa<ArriveBarrierOp, NamedBarrierArriveOp>(op) &&
+        op->hasAttr(kFenceGenericReadsAttrName)) {
+      uint8_t scope = scopes & kClusterScope ? kClusterScope : kCTAScope;
+      if (!isa_and_nonnull<FenceAsyncSharedOp>(op->getPrevNode())) {
+        builder->setInsertionPoint(op);
+        FenceAsyncSharedOp::create(*builder, op->getLoc(),
+                                   scope == kClusterScope);
+      }
+      state->fenceGeneric(scope);
+    }
+
     if (auto call = dyn_cast<CallOpInterface>(op)) {
       auto effects = getCallSummary(
           call, *funcMap,
@@ -110,11 +125,21 @@ struct ProxyFenceFunctionAnalysis
     }
 
     ProxyBlockInfo effects;
+    // Beta ordering: barrier invalidation writes its backing shared memory.
+    // If a later async op reuses those bytes as payload, the invalidation
+    // needs the same proxy ordering as any other generic write. Other barrier
+    // effects stay excluded: they synchronize the barrier, not payload bytes.
+    bool isInvalBarrier = isa<InvalBarrierOp>(op);
+    // Beta safety net: treat TMA-load shared reads as async even if the
+    // effect description omits the async-proxy kind.
+    bool isTmaLoad = isa<AsyncTMACopyGlobalToLocalOp>(op);
     for (const MemoryAccess &access : getMemoryAccesses(op)) {
-      if (!access.isShared() || access.isShared(gpu::SharedKind::Barrier))
+      if (!access.isShared() ||
+          (access.isShared(gpu::SharedKind::Barrier) && !isInvalBarrier))
         continue;
 
-      bool async = access.isShared(gpu::SharedKind::Async);
+      bool async = access.isShared(gpu::SharedKind::Async) ||
+                   (isTmaLoad && access.isRead);
       uint8_t accessScopes = async ? getProxyFenceScope(op) : scopes;
       ProxyBlockInfo::Frontier &frontier =
           async ? effects.async : effects.generic;
@@ -151,7 +176,10 @@ struct ProxyFenceInsertionPass
     ModuleOp module = getOperation();
     uint8_t scopes = 0;
     module.walk([&](Operation *op) {
-      if (hasSharedAccess(op, gpu::SharedKind::Async))
+      // Include TMA loads even if their effect description omits the
+      // async-proxy kind (beta safety net).
+      if (hasSharedAccess(op, gpu::SharedKind::Async) ||
+          isa<AsyncTMACopyGlobalToLocalOp>(op))
         scopes |= getProxyFenceScope(op) | kCTAScope;
       return scopes & kClusterScope ? WalkResult::interrupt()
                                     : WalkResult::advance();

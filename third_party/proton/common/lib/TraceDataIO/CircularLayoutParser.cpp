@@ -40,8 +40,13 @@ bool CircularLayoutParser::parseMetadata() {
   uint32_t preamble = decoder.decode<I32Entry>()->value;
   if (preamble == 0)
     return false;
-  if (preamble != kPreamble)
+  if (preamble != kPreamble) {
+    if (std::getenv("PROTON_DISABLE_PREAMBLE_CHECK")) {
+      std::cerr << "Warning: Invalid preamble" << std::endl;
+      return false;
+    }
     throw PreambleException("Invalid preamble");
+  }
   auto &bt = result->blockTraces.emplace_back();
   bt.blockId = decoder.decode<I32Entry>()->value;
   bt.procId = decoder.decode<I32Entry>()->value;
@@ -134,7 +139,9 @@ void CircularLayoutParser::parseSegment(
 
           if (activeProfileEvent.first->cycle >
               activeProfileEvent.second->cycle) {
-            throw ClockOverflowException("Clock overflow");
+            if (!std::getenv("PROTON_ENABLE_MPP_STORE_BARRIER_INFO_PASS")) {
+              throw ClockOverflowException("Clock overflow");
+            }
           }
           trace.profileEvents.push_back(activeProfileEvent);
         } else {

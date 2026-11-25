@@ -3,9 +3,13 @@ add_triton_library(TritonAMDGPUTransforms
   BlockPingpong.cpp
   CanonicalizePointers.cpp
   CoalesceAsyncCopy.cpp
+  CoalesceBufferOps.cpp
   ConSanAMD.cpp
   ConvertToBufferOps.cpp
   ConvertToTensorOps.cpp
+  DotDecomposeAndSchedule.cpp
+  SchedGroupBarrierScheduler.cpp
+  LowerBarrierOps.cpp
   OptimizeBufferOpPtr.cpp
   OptimizeDescriptorEncoding.cpp
   OptimizeEpilogue.cpp
@@ -33,6 +37,7 @@ add_triton_library(TritonAMDGPUTransforms
   TritonAMDGPUIR
   TritonAMDGPUTransformsIncGen
   TritonGPUIR
+  TritonGPUModuloCore
   TritonAMDUtils
   TritonAMDAnalysis
   TritonInstrumentTransforms

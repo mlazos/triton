@@ -124,16 +124,14 @@ private:
                 this->getTypeConverter()->packFunctionResults(resultTypes)))
         return nullptr;
     }
-    auto attrs = splitBuilderAttributes<LLVM::CallOp>(rewriter, callOp.getLoc(),
-                                                      callOp->getAttrs());
-    auto newCallOp = LLVM::CallOp::create(
-        rewriter, callOp.getLoc(),
-        packedResult ? TypeRange(packedResult) : TypeRange(), promotedOperands,
-        attrs.properties, attrs.discardableAttrs);
-    newCallOp.getProperties().setOpBundleSizes(
-        rewriter.getDenseI32ArrayAttr({}));
-    newCallOp.getProperties().setOperandSegmentSizes(
-        {static_cast<int>(promotedOperands.size()), 0});
+    auto newCallOp = LLVM::CallOp::create(rewriter, callOp.getLoc(),
+                                          packedResult ? TypeRange(packedResult)
+                                                       : TypeRange(),
+                                          promotedOperands, callOp->getAttrs());
+    newCallOp.getProperties().op_bundle_sizes =
+        rewriter.getDenseI32ArrayAttr({});
+    newCallOp.getProperties().operandSegmentSizes = {
+        static_cast<int32_t>(promotedOperands.size()), 0};
     return newCallOp;
   }
 

@@ -72,7 +72,7 @@ def empty(*size, dtype: torch.dtype | None = None, device: torch.device | str | 
     device_index = torch.cuda.current_device() if dev.index is None else dev.index
     dev = torch.device("cuda", device_index)
 
-    with torch.cuda.use_mem_pool(_get_mem_pool(shadow_granularity, write_once), device=device_index):
+    with torch.cuda.use_mem_pool(_get_mem_pool(shadow_granularity, write_once)):
         return torch.empty(shape, dtype=dtype, device=dev)
 
 
@@ -229,6 +229,7 @@ class GSanSymmetricMemoryHandle:
         if channel != 0:
             raise NotImplementedError("Only channel=0 is supported in GSan symmetric memory.")
         _ = timeout_ms
+        dist.barrier(group=self._group)
         if self._world_size > 1:
             if self._barrier_handle is None:
                 raise RuntimeError("GSan symmetric-memory barrier counter is unavailable.")

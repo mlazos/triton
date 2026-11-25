@@ -27,10 +27,13 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "tlx/dialect/include/IR/Dialect.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_INITIALIZEWSCLUSTERBARRIERS
@@ -115,9 +118,9 @@ static Value getClusterBarrierMbarPtr(Location loc, RewriterBase &rewriter,
 }
 
 template <typename EmitFn>
-void lowerClusterSyncForAllWarps(Location loc, OpBuilder &rewriter,
-                                 int defaultNumWarps, int totalNumWarps,
-                                 EmitFn emit) {
+void lowerClusterSyncForWarpCounts(Location loc, OpBuilder &rewriter,
+                                   int defaultNumWarps, int totalNumWarps,
+                                   EmitFn emit) {
   int workerNumWarps = totalNumWarps - defaultNumWarps;
   if (workerNumWarps == 0) {
     emit(rewriter);
@@ -160,6 +163,88 @@ void lowerClusterSyncForAllWarps(Location loc, OpBuilder &rewriter,
   }
 }
 
+template <typename EmitFn>
+LogicalResult lowerClusterSyncForAllWarps(Operation *op,
+                                          ConversionPatternRewriter &rewriter,
+                                          EmitFn emit) {
+  auto loc = op->getLoc();
+  FailureOr<int> workerNumWarps = NVIDIA::getClusterSyncDispatchWarps(op);
+  if (failed(workerNumWarps))
+    return rewriter.notifyMatchFailure(op, "invalid contextual num-warps");
+
+  rewriter.setInsertionPoint(op);
+  if (*workerNumWarps == 0) {
+    emit(rewriter);
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+  SmallVector<int32_t> partitionNumWarps;
+  for (int remainingWarps = *workerNumWarps; remainingWarps > 0;) {
+    int32_t partitionWarps =
+        llvm::bit_floor(static_cast<uint32_t>(remainingWarps));
+    partitionNumWarps.push_back(partitionWarps);
+    remainingWarps -= partitionWarps;
+  }
+
+  auto wsOp = triton::gpu::WarpSpecializeOp::create(rewriter, loc, TypeRange{},
+                                                    partitionNumWarps);
+  SmallVector<int32_t> startIds;
+  int startId = *triton::gpu::maybeLookupNumWarps(op);
+  for (int32_t partitionWarps : partitionNumWarps) {
+    startIds.push_back(startId);
+    startId += partitionWarps;
+  }
+  wsOp.setWarpGroupStartIds(startIds);
+
+  Block *defaultBlock = rewriter.createBlock(&wsOp.getDefaultRegion());
+  rewriter.setInsertionPointToEnd(defaultBlock);
+  emit(rewriter);
+  triton::gpu::WarpYieldOp::create(rewriter, loc, TypeRange(), ValueRange());
+
+  Block *partitionHolder = rewriter.createBlock(&wsOp.getPartitionOpHolder());
+  rewriter.setInsertionPointToStart(partitionHolder);
+  auto partitions = triton::gpu::WarpSpecializePartitionsOp::create(
+      rewriter, loc, ValueRange(),
+      /*numPartitionRegions=*/partitionNumWarps.size());
+  for (Region &partitionRegion : partitions.getPartitionRegions()) {
+    Block *partitionBlock = rewriter.createBlock(&partitionRegion);
+    rewriter.setInsertionPointToEnd(partitionBlock);
+    emit(rewriter);
+    triton::gpu::WarpReturnOp::create(rewriter, loc);
+  }
+
+  rewriter.eraseOp(op);
+  return success();
+}
+
+struct ClusterArriveOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterArriveOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::ClusterArriveOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::ClusterArriveOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return lowerClusterSyncForAllWarps(op, rewriter, [&](OpBuilder &b) {
+      createClusterArrive(b, op.getLoc(), op.getRelaxed());
+    });
+  }
+};
+
+struct ClusterWaitOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterWaitOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::ClusterWaitOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::ClusterWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return lowerClusterSyncForAllWarps(
+        op, rewriter, [&](OpBuilder &b) { createClusterWait(b, op.getLoc()); });
+  }
+};
+
 struct ClusterBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterBarrierOp> {
   ClusterBarrierOpConversion(LLVMTypeConverter &typeConverter,
@@ -174,21 +259,10 @@ struct ClusterBarrierOpConversion
     auto mbarOffset = op->getAttrOfType<IntegerAttr>(
         triton::nvidia_gpu::kClusterBarrierMbarOffsetAttrName);
     if (!mbarOffset) {
-      auto mod = op->getParentOfType<ModuleOp>();
-      int defaultNumWarps = triton::gpu::lookupNumWarps(op);
-      int totalNumWarps = defaultNumWarps;
-      if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps"))
-        totalNumWarps = attr.getInt();
-
-      rewriter.setInsertionPoint(op);
-      lowerClusterSyncForAllWarps(op.getLoc(), rewriter, defaultNumWarps,
-                                  totalNumWarps, [&](OpBuilder &b) {
-                                    createClusterArrive(b, op.getLoc(),
-                                                        op.getRelaxed());
-                                    createClusterWait(b, op.getLoc());
-                                  });
-      rewriter.eraseOp(op);
-      return success();
+      return lowerClusterSyncForAllWarps(op, rewriter, [&](OpBuilder &b) {
+        createClusterArrive(b, op.getLoc(), op.getRelaxed());
+        createClusterWait(b, op.getLoc());
+      });
     }
 
     auto loc = op.getLoc();
@@ -216,7 +290,7 @@ struct ClusterBarrierOpConversion
     Value pred = b.icmp_eq(threadId, b.i32_val(0));
     int numCTAs = triton::gpu::lookupNumCTAs(op);
     bool relaxed = op.getRelaxed() && targetInfo.getPtxVersion() >= 86;
-    if (targetInfo.getTargetFeatures().supportsMbarMulticast()) {
+    if (targetInfo.supportsMbarrierMulticast()) {
       Value ctaId = NVVM::ClusterId::create(rewriter, loc, i32_ty);
       // Exclude the issuing CTA: the mbarriers expect numCTAs - 1 arrivals.
       Value allCTAsMask = b.i32_val((1u << numCTAs) - 1);
@@ -241,6 +315,61 @@ struct ClusterBarrierOpConversion
 
 private:
   const NVIDIA::TargetInfo &targetInfo;
+};
+
+struct ClusterSize1DOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterSize1DOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::ClusterSize1DOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::ClusterSize1DOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    rewriter.replaceOpWithNewOp<NVVM::ClusterDim>(op, i32_ty);
+    return success();
+  }
+};
+
+// lower MapToRemoteBufferOp
+struct MapToRemoteBufferOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::MapToRemoteBufferOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::MapToRemoteBufferOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::MapToRemoteBufferOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto srcSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getSrc(),
+        typeConverter->convertType(op.getSrc().getType().getElementType()),
+        rewriter);
+    auto srcSmemPtr = srcSmemObj.getBase();
+
+    auto ptrTy = cast<LLVM::LLVMPointerType>(srcSmemPtr.getType());
+    assert(ptrTy.getAddressSpace() == 3 &&
+           "Invalid src llvm addr space for MapToRemoteBufferOp");
+
+    // The result pointer is referring to a memory buffer living in a CTA
+    // cluster, so it has a different memory space. NVVM::MapaOp verifies its
+    // src and result ptr type, so we need to construct the result ptr type
+    // from typeConverter output here
+    LLVM::LLVMStructType convertedRetTy =
+        cast<LLVM::LLVMStructType>(typeConverter->convertType(op.getType()));
+    Type convertedPtrTy = convertedRetTy.getBody()[0];
+
+    // map an SMEM ptr in mem space 3 to a ptr in mem space 7
+    auto remotePtr = NVVM::MapaOp::create(rewriter, loc, convertedPtrTy,
+                                          srcSmemPtr, adaptor.getCtaRank());
+
+    // everything stays the same except base ptr comparing to srcSmemObj
+    auto dstSmemObj = SharedMemoryObject(
+        remotePtr, srcSmemObj.getBaseElemType(), srcSmemObj.getOffsets());
+    auto retVal = getStructFromSharedMemoryObject(loc, dstSmemObj, rewriter);
+    rewriter.replaceOp(op, retVal);
+    return success();
+  }
 };
 
 struct InitializeWSClusterBarriers
@@ -300,18 +429,77 @@ struct InitializeWSClusterBarriers
     int totalNumWarps = defaultNumWarps;
     if (auto attr = mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps"))
       totalNumWarps = attr.getInt();
-    lowerClusterSyncForAllWarps(loc, rewriter, defaultNumWarps, totalNumWarps,
-                                [&](OpBuilder &b) {
-                                  createClusterArrive(b, loc,
-                                                      /*relaxed=*/true);
-                                  createClusterWait(b, loc);
-                                });
+    lowerClusterSyncForWarpCounts(
+        loc, rewriter, defaultNumWarps, totalNumWarps, [&](OpBuilder &b) {
+          createClusterArrive(b, loc, /*relaxed=*/true);
+          createClusterWait(b, loc);
+        });
   }
 };
+
 } // namespace
+
+FailureOr<int>
+mlir::triton::NVIDIA::getClusterSyncDispatchWarps(Operation *op) {
+  // Emit the cluster sync directly (no warp_specialize wrapping) when either:
+  //  (a) it is already inside a warp_specialize region (e.g. the user placed
+  //      cluster_barrier() inside each async_task so every warp group
+  //      participates). The warp split already happened, so every warp of the
+  //      current region executes it; wrapping again would form an illegal
+  //      nested ttg.warp_specialize. OR
+  //  (b) this operation carries the designated bootstrap marker -- the
+  //      entry-block cluster sync inserted by maybeInsertClusterSync. For that
+  //      sync, ConvertWarpSpecializeToLLVM already emits the non-default warps'
+  //      "@!isDefault barrier.cluster.arrive" at WS entry. Wrapping here too
+  //      would double-count worker participation: the extra worker arrive
+  //      imbalances the cluster barrier (deadlock) and adds a spurious worker
+  //      wait.
+  if (op->getParentOfType<triton::gpu::WarpSpecializeOp>() ||
+      mlir::triton::tlx::isClusterSyncBootstrap(op))
+    return 0;
+
+  auto defaultNumWarps = triton::gpu::maybeLookupNumWarps(op);
+  if (!defaultNumWarps)
+    return failure();
+  int totalNumWarps = *defaultNumWarps;
+  if (auto mod = op->getParentOfType<ModuleOp>())
+    if (auto totalNumWarpsAttr =
+            mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps"))
+      totalNumWarps = totalNumWarpsAttr.getInt();
+  int workerNumWarps = totalNumWarps - *defaultNumWarps;
+  if (workerNumWarps < 0)
+    return failure();
+  return workerNumWarps;
+}
+
+bool mlir::triton::NVIDIA::needsSyntheticWarpSpecialize(ModuleOp mod) {
+  return mod
+      .walk([](Operation *op) {
+        if (isa<triton::nvidia_gpu::ClusterArriveOp,
+                triton::nvidia_gpu::ClusterWaitOp,
+                triton::nvidia_gpu::ClusterBarrierOp>(op)) {
+          FailureOr<int> workerNumWarps = getClusterSyncDispatchWarps(op);
+          if (succeeded(workerNumWarps) && *workerNumWarps > 0)
+            return WalkResult::interrupt();
+        }
+        // runClusterBarrierMbarAllocator backs these with mbarriers that
+        // InitializeWSClusterBarriers initializes behind an all-warp
+        // rendezvous in a synthetic region at kernel entry.
+        if (op->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
+            triton::nvidia_gpu::needsClusterBarrier(op))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
 
 void mlir::triton::NVIDIA::populateClusterOpsToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit, const NVIDIA::TargetInfo &targetInfo) {
+  patterns.add<ClusterArriveOpConversion>(typeConverter, benefit);
+  patterns.add<ClusterWaitOpConversion>(typeConverter, benefit);
+  patterns.add<ClusterSize1DOpConversion>(typeConverter, benefit);
+  patterns.add<MapToRemoteBufferOpConversion>(typeConverter, benefit);
   patterns.add<ClusterBarrierOpConversion>(typeConverter, benefit, targetInfo);
+  return;
 }

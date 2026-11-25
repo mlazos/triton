@@ -3,13 +3,6 @@
 
 include "mlir/Pass/PassBase.td"
 
-def TritonGPUOptimizeThreadRegions : Pass<"tritongpu-optimize-thread-regions", "mlir::ModuleOp"> {
-  let summary = "Execute scalar protocols and their consumers on their owning threads";
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-                           "mlir::scf::SCFDialect", "mlir::arith::ArithDialect"];
-}
-
 def TritonGPUPipeline : Pass<"tritongpu-pipeline", "mlir::ModuleOp"> {
   let summary = "pipeline";
 
@@ -43,7 +36,9 @@ def TritonGPUAssignLatencies : Pass<"tritongpu-assign-latencies", "mlir::ModuleO
 
   let options = [
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
-           "number of pipeline stages">
+           "number of pipeline stages">,
+    Option<"useMetaWS", "use-meta-ws", "bool", /*default*/"false",
+           "Which WS path to use">
   ];
 }
 
@@ -54,6 +49,13 @@ def TritonGPUScheduleLoops : Pass<"tritongpu-schedule-loops", "mlir::ModuleOp"> 
     The `tritongpu-schedule-loops` pass performs scheduling for loop pipelining
     for loops with latency ops.
   }];
+
+  let options = [
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "number of pipeline stages">,
+    Option<"useMetaWS", "use-meta-ws", "bool", /*default*/"false",
+           "Which WS path to use">
+  ];
 }
 
 def TritonGPUHoistTMEMAlloc : Pass<"tritongpu-hoist-tmem-alloc", "mlir::ModuleOp"> {
@@ -181,6 +183,31 @@ def TritonGPUPartitionScheduling : Pass<"tritongpu-partition-scheduling", "mlir:
     operations in a loop that is meant to be warp specialized and determines
     which partitions to assign to each operation.
   }];
+
+  let options = [
+    Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
+           "bool", /*default*/"false",
+           "If true, merge epilogue stores into the computation partition "
+           "instead of creating a separate epilogue partition">
+  ];
+}
+
+def TritonGPULoadMMASpecialization : Pass<"tritongpu-load-mma-specialization", "mlir::ModuleOp"> {
+  let summary = "load MMA specialization";
+
+  let description = [{
+    The `tritongpu-load-mma-specialization` pass looks for matmul loops in the
+    module and attempts to create a partition schedule, separating async loads
+    and async MMAs into separate partitions.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+
+  let options = [
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "number of pipeline stages">
+  ];
 }
 
 def TritonGPUF32DotTC : Pass<"tritongpu-F32DotTC", "mlir::ModuleOp"> {
@@ -271,6 +298,11 @@ def TritonGPUCoalesce: Pass<"tritongpu-coalesce", "mlir::ModuleOp"> {
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+
+  let options = [
+    Option<"maxVecBits", "max-vec-bits", "unsigned", /*default*/"128",
+           "Maximum vector width in bits for load/store coalescing">
+  ];
 }
 
 
@@ -283,12 +315,21 @@ def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions
     `BlockedEncodingAttr` layout for "expensive" loads and stores
     (good for coalescing) and `NvidiaMmaEncodingAttr` otherwise
     (good for tensor ops).
+
+    When `smemBudget` is nonzero, the pass additionally checks whether the
+    chosen layout would produce a `convert_layout` whose scratch buffer
+    causes total shared memory usage to exceed the budget. In that case it
+    overrides the default heuristic and picks the layout that can be absorbed
+    by a `local_load` or `local_store` without scratch.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect"];
 
   let options = [
+    Option<"smemBudget", "smem-budget", "unsigned", /*default=*/"0",
+           "When nonzero, override layout choices whose convert_layout "
+           "scratch would push shared memory usage above this budget (bytes)">,
     Option<"disableRematSplitting", "disable-remat-splitting",
            "bool", /*default*/"false",
            "prevent rematerialization from splitting or duplicating "
@@ -315,6 +356,34 @@ def TritonGPUOptimizeThreadLocality : Pass<"tritongpu-optimize-thread-locality",
     and trigger their respective codegen paths. For now, the pass only attempts
     to apply layouts that result in warp-synchronous gathers.
   }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
+def TritonGPUOptimizeReductionLayout : Pass<"tritongpu-optimize-reduction-layout", "mlir::ModuleOp"> {
+  let summary = "Pick a cheaper operand layout for inner_tree reductions";
+
+  let description = [{
+    An `inner_tree` reduction is layout-invariant by construction, so its operand
+    data layout is a free performance knob. This pass rewrites the operand of such
+    reduces to a layout with `warpsPerCTA[axis] = 1` (warps moved onto a kept
+    dimension), which deletes the cross-warp shared-memory reduction stage. The
+    reduction op, axis, extent and ordering are never changed, so the numeric
+    result is bit-identical. Scope: within-CTA blocked-layout reductions.
+  }];
+
+  let options = [
+    Option<"strategy", "strategy", "std::string", /*default=*/"\"ideal\"",
+           "Relayout strategy: \"ideal\" builds the warp-synchronous reduce "
+           "layout; \"off\" disables the rewrite (no-op).">,
+    Option<"minUnderparallel", "min-underparallel", "int", /*default=*/"8",
+           "Only relayout when the reduce axis is under-parallelized across the "
+           "warp: axisExtent >= threadsPerWarp[axis] * this.">,
+    Option<"maxElemsPerThread", "max-elems-per-thread", "int", /*default=*/"256",
+           "Register-pressure cap: skip when tileElems/(warpSize*num_warps) "
+           "exceeds this (the reduce-friendly layout carries the axis per thread).">
+  ];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect"];

@@ -3,12 +3,13 @@ import pathlib
 
 from typing import NamedTuple, Tuple, Optional
 
+import triton.profiler as proton
+
 import pytest
 import torch
 
 import triton
 import triton.language as tl
-import triton.profiler as proton
 import triton.profiler.language as pl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -197,6 +198,75 @@ def test_record(method, device, fresh_knobs, tmp_path: pathlib.Path):
     )
     assert loc_line is not None
     assert "line: " in loc_line and "line: 0" not in loc_line
+
+    # check ttir line info
+    start_loc = None
+    end_loc = None
+    for line in ttir.split("\n"):
+        if "proton.record start" in line:
+            start_loc = line.split("loc(")[1].split(")")[0]
+        elif "proton.record end" in line:
+            end_loc = line.split("loc(")[1].split(")")[0]
+        elif start_loc and f"#loc{start_loc}" in line:
+            assert "test_instrumentation.py" in line
+        elif end_loc and f"#loc{end_loc}" in line:
+            assert "test_instrumentation.py" in line
+
+    assert start_loc is not None and end_loc is not None
+
+    # check llir line info
+    llir_lines = pgm.asm["llir"].splitlines()
+    clock_instr = "clock" if is_cuda() else "memtime"
+    clock_loc = None
+    for line in llir_lines:
+        if clock_instr not in line or "!dbg" not in line:
+            continue
+        suffix = line.split("!dbg ")[1]
+        clock_loc = suffix.split(",")[0].split()[0]
+        break
+    assert clock_loc is not None
+    loc_line = next(
+        (line for line in llir_lines if clock_loc in line and "DILocation" in line),
+        None,
+    )
+    assert loc_line is not None
+    assert "line: " in loc_line and "line: 0" not in loc_line
+
+
+def test_record_predicate_ir(fresh_knobs, tmp_path: pathlib.Path):
+    fresh_knobs.compilation.disable_line_info = False
+
+    @triton.jit
+    def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        pred = tl.program_id(axis=0) == 0
+        pl.record(True, "record_dynamic", predicate=pred)
+        pl.record(False, "record_dynamic", predicate=pred)
+        pl.enter_scope("emit_dynamic", predicate=pred)
+        pl.exit_scope("emit_dynamic", predicate=pred)
+        pl.enter_scope("compile_time_false", predicate=False)
+        pl.exit_scope("compile_time_false", predicate=False)
+        output = tl.load(x_ptr + offsets, mask=mask) + tl.load(y_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, output, mask=mask)
+
+    size = 256
+    x = torch.rand(size, device="cuda")
+    y = torch.rand(size, device="cuda")
+    output = torch.empty_like(x)
+    temp_file = tmp_path / "test_record_predicate_ir.hatchet"
+
+    proton.start(str(temp_file.with_suffix("")), backend="instrumentation")
+    pgm = add_kernel[(1, )](x, y, output, size, BLOCK_SIZE=1024, num_warps=4)
+    proton.finalize()
+
+    ttir = pgm.asm["ttir"]
+    assert "proton.record start \"record_dynamic\" if %" in ttir
+    assert "proton.record end \"record_dynamic\" if %" in ttir
+    assert "proton.record start \"emit_dynamic\" if %" in ttir
+    assert "proton.record end \"emit_dynamic\" if %" in ttir
+    assert "compile_time_false" not in ttir
+    assert "scf.if" not in ttir
 
 
 def test_event(device, tmp_path: pathlib.Path):
@@ -492,6 +562,62 @@ def test_no_scope_zero_scratch(device, tmp_path: pathlib.Path):
         add_kernel[(1, 1, 1)](x, y, output, size, BLOCK_SIZE=1024, num_warps=4)
         # Header is still built even though there is no profile-scratch payload.
         assert proton.hooks.InstrumentationHook.host_buffer is not None
+
+
+def test_host_buffer_survives_uninstrumented_kernel(tmp_path: pathlib.Path):
+    from contextlib import contextmanager
+
+    # A session that launches an instrumented (scoped) kernel followed by an
+    # uninstrumented one (no scopes, profile_scratch_size == 0, e.g. an
+    # auxiliary reduction trailing the profiled kernel). The trailing kernel
+    # must not clobber the valid host_buffer snapshot: block_num/total_unit
+    # must still describe the scoped kernel. Complements
+    # test_no_scope_zero_scratch, which covers the single-kernel case.
+    @contextmanager
+    def instrumentation(file_path):
+        proton.hooks.InstrumentationHook.enable_host_buffer = True
+        proton.start(str(file_path.with_suffix("")), backend="instrumentation")
+        try:
+            yield
+        finally:
+            proton.hooks.InstrumentationHook.enable_host_buffer = False
+            proton.finalize()
+
+    @triton.jit
+    def scoped_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        with pl.scope("load0"):
+            x = tl.load(x_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    @triton.jit
+    def plain_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    size = 256
+    x = torch.rand(size, device="cuda")
+    out0 = torch.empty_like(x)
+    out1 = torch.empty_like(x)
+    temp_file = tmp_path / "test_host_buffer_survives_uninstrumented_kernel.hatchet"
+
+    def header_u32(buf, off):
+        return int.from_bytes(buf[off:off + 4].numpy().tobytes(), "little")
+
+    with instrumentation(temp_file):
+        scoped_kernel[(1, 1, 1)](x, out0, size, BLOCK_SIZE=1024, num_warps=8)
+        plain_kernel[(1, 1, 1)](x, out1, size, BLOCK_SIZE=1024, num_warps=4)
+        host_buffer = proton.hooks.InstrumentationHook.host_buffer
+        assert host_buffer is not None
+        # The snapshot must still describe the scoped kernel (8 warps with
+        # profiling data), not the trailing plain kernel (4 warps, no data).
+        assert header_u32(host_buffer, 28) == 8  # total_unit
+        assert header_u32(host_buffer, 24) > 0  # block_num
 
 
 @pytest.mark.parametrize("hook", ["triton", None])

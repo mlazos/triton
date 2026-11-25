@@ -1,0 +1,107 @@
+# Partition Loop Peeling
+
+`peelPartitionLoops` runs in the generic software pipeliner after `lowerLoops`
+and before `expandLoops`. Code partitioning has already cloned code into
+physical `ttg.warp_specialize` regions. This placement matters: `lowerLoops`
+must consume the original schedule before peeling moves one iteration into a
+prologue. It exposes separate first-tile and remainder paths inside one
+numbered partition without requiring every partition to share the same
+control-flow shape.
+
+The transformation is intentionally narrow. It recognizes an `scf.for` body
+predicate of the form:
+
+```mlir
+%distance = arith.muli %step, %K
+%boundary = arith.addi %lb, %distance
+%masked = arith.cmpi slt, %iv, %boundary
+%result = scf.if %masked { ... } else { ... }
+```
+
+when `%iv` is the loop induction variable, `K` is a positive compile-time
+constant of at most four, and the comparison controls an `scf.if`. The one-step
+`%lb + %step` form also accepts a dynamic step, preserving the legacy match.
+The equivalent constant-folded `%lb + C` form is accepted when `C` is an exact
+multiple of a constant loop step. It rewrites the loop to a zero-trip-safe
+outer `scf.if`, clones the first `K` iterations with `%masked = true`, and
+creates a remainder loop beginning at `%lb + K * %step` with `%masked = false`.
+Canonicalization removes the dead side of each activation branch later in the
+AutoWS pipeline.
+
+For target-aware HSTU, the scalar condition may additionally be guarded by a
+loop-invariant force-mask bit:
+
+```mlir
+%needs_mask = arith.ori %masked, %force_mask
+%result = scf.if %needs_mask { ... } else { ... }
+```
+
+The pass creates one outer `scf.if %force_mask` in the computation partition.
+Its true arm keeps one fully masked loop; its false arm uses the normal peeled
+prefix and unmasked remainder. This is deliberately done after physical code
+partitioning so the source still has one loop and the load partitions,
+communication channels, and operand buffers are not duplicated.
+
+The pass also recognizes the equivalent tensor-select form emitted by the HSTU
+backward kernel before the source-level branch was added:
+
+```mlir
+%diagonal = arith.cmpi eq, %m, %n
+%delta = arith.subi %m, %n
+%below = arith.cmpi sgt, %delta, %zero
+%causal = arith.ori %diagonal, %below
+%masked = arith.select %causal, %value, %zero_value
+```
+
+`%causal` is just `m >= n`, so the canonicalized `arith.cmpi sge, %m, %n`
+spelling is matched as well; which one appears depends on whether an earlier
+pass folded the disjunction.
+
+Here `%m` must be `iv + make_range(0, M)`, `%n` must be
+`lb + make_range(0, N)`, and the loop step must be a positive constant. Every
+use of `%causal` must be an `arith.select` with an all-zero false value. The
+first `ceil((N - 1) / step)` iterations can therefore contain false mask
+elements; the mask is all true afterward. The pass peels that masked prefix
+(currently up to four iterations), guarding every iteration after the first
+for dynamic short loops, and starts the pipelined remainder at
+`lb + ceil((N - 1) / step) * step`. This covers HSTU backward's production
+`BLOCK_M=64`, `BLOCK_N=128` shape, whose first two M tiles need the mask.
+
+Immediately before peeling, the pass materializes a scalar prefix `scf.if`
+that yields either `%causal` or an all-true tensor. The peeler folds that
+synthetic branch while cloning each path, so it never reaches
+`PipelineExpander` as unscheduled control flow.
+
+## Matching contract
+
+The comparison must live directly in the `scf.for` body block and must control
+either an `scf.if` condition or, in the tensor-select form above, only
+`arith.select` users. Anything else -- a guard buried in a nested region, a
+comparison feeding unrelated arithmetic, or an `scf.while` (which has no
+induction variable to split on, so CLC's dynamic outer loop is out of scope) --
+fails to match and the loop is left untouched. Peeling therefore never
+partially rewrites a shape it does not fully recognize.
+
+Loops are peeled in walk (post) order, innermost first. Peeling replaces a loop
+with an `scf.if` and erases the original, so peeling an outer loop first would
+erase the inner loops collected alongside it.
+
+When more than one comparison matches, only the first in walk order is peeled.
+Loops without iteration arguments are supported; the generated `scf.if` ops
+drop the terminators that `scf.IfOp` auto-inserts for a result-less op before
+the explicit yields are attached.
+
+Only numbered partition regions returned by
+`ttg.warp_specialize.getPartitionRegions()` are considered. The default region
+is excluded, and the pass does not traverse into nested warp-specialize ops.
+This placement and restriction are important: communication channels and
+physical buffers have already been planned, so peeling cannot change channel
+discovery or memory-planner decisions.
+
+The HSTU self-attention backward kernel uses the scalar form to expose its two
+causal-prefix dK/dV tiles. With targets, a loop-invariant bit forces the whole
+loop to remain masked when its K/V tile overlaps the target suffix; K/V tiles
+wholly inside the UIH prefix use the peeled path. The explicit-branch regression is
+`test/Hopper/WarpSpecialization/ws_single_partition_else_hstu_bwd.mlir`; the
+scalar multi-tile and tensor-select regressions are
+`test/Hopper/WarpSpecialization/ws_partition_where_loop_peeling.mlir`.

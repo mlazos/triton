@@ -8,7 +8,6 @@
 !tma_cache_dst = !ttg.memdesc<16x64xf16, #tma_cache_shared, #ttg.shared_memory, mutable>
 !tma_cache_mbar = !ttg.memdesc<1xi64, #tma_cache_bar, #ttg.shared_memory, mutable>
 
-
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -24,12 +23,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 tt.func @tma_gather_simple(%arg0: !tt.tensordesc<1x128xbf16, #shared1>, %arg1: !ttg.memdesc<1xi64, #shared, #smem, mutable>, %arg2: tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>, %arg3: i32, %arg4: !ttg.memdesc<32x128xbf16, #shared1, #smem, mutable>, %arg5: i1) {
   // There are 32 indices distributed to 4 warps, so each warp as 8 indices.
 
-  // CHECK: [[BAR:%.*]] = extractvalue {{.*}} %1, 0
-  // CHECK: [[BASE_PTR:%.*]] = extractvalue {{.*}} %4, 0
-
   // CHECK: [[TIDX:%.*]] = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   // CHECK: [[WIDX:%.*]] = lshr i32 [[TIDX]], 5
   // CHECK: [[WARP_ID:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.idx.i32(i32 -1, i32 [[WIDX]],
+
+  // CHECK: [[BAR:%.*]] = extractvalue {{.*}} %1, 0
+  // CHECK: [[BASE_PTR:%.*]] = extractvalue {{.*}} %4, 0
 
   // CHECK: [[ELECT:%.*]] = tail call { i32, i1 } @llvm.nvvm.elect.sync
   // CHECK: [[ELECT_PRED:%.*]] = extractvalue { i32, i1 } [[ELECT]], 1
@@ -172,6 +171,24 @@ tt.func @tma_scatter(%arg0: !tt.tensordesc<1x128xbf16, #shared1>, %arg1: tensor<
   // CHECK: nvvm.cp.async.bulk.commit.group()
 
   // CHECK-NEXT: ret void
+  tt.return
+}
+
+// CHECK-LABEL: @tma_multicast
+tt.func @tma_multicast(%desc: !tt.tensordesc<64x64xf16, #shared1>,
+                        %buffer: !ttg.memdesc<64x64xf16, #shared1, #smem, mutable>,
+                        %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+                        %target_cta_mask: i32,
+                        %off_m: i32,
+                        %off_n: i32) {
+  %true = arith.constant true
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [$1], [$2, {$3, $4}], [$5], $6;"
+  ttng.async_tma_copy_global_to_local %desc[%off_m, %off_n] %buffer, %bar, %true, %target_cta_mask : !tt.tensordesc<64x64xf16, #shared1>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared1, #smem, mutable>
+
+  // non multicast version: non-cluster barrier (no CGALayout) -> shared::cta
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [$1], [$2, {$3, $4}], [$5];"
+  ttng.async_tma_copy_global_to_local %desc[%off_m, %off_n] %buffer, %bar, %true : !tt.tensordesc<64x64xf16, #shared1>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared1, #smem, mutable>
+
   tt.return
 }
 

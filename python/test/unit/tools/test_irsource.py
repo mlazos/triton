@@ -7,7 +7,14 @@ from triton._C.libtriton import ir
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 
-target = triton.runtime.driver.active.get_current_target()
+try:
+    target = triton.runtime.driver.active.get_current_target()
+except RuntimeError:
+    target = None
+
+if target is None or target.backend == "cpu":
+    pytest.skip("No active GPU driver", allow_module_level=True)
+
 backend = make_backend(target)
 
 

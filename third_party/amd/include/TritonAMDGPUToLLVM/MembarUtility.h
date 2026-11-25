@@ -3,42 +3,65 @@
 
 #include "mlir/IR/Operation.h"
 #include "triton/Analysis/Allocation.h"
+#include "triton/Analysis/Membar.h"
 
 namespace mlir {
+class DialectRegistry;
 struct AllocationSlice;
-}
+struct MembarScratchSync;
+} // namespace mlir
 
 namespace mlir::triton::AMD {
 
-// Filter function used in the AMDGPU backend to filter unnecessary barriers
-// during Membar Analysis. Membar calls the filter with the pending (earlier)
-// access as op1 and the current access as op2; the filters below rely on that
-// ordering to tell RAW from WAR. Filters applied by this function:
-// 1) Do not create a barrier between an AsyncCopyGlobalToLocal and a LocalLoad
-// that follows it into the same buffer, if the LocalLoad is synced by
-// AsyncWait. Such a LocalLoad is ordered after the AsyncLoads its token waits
-// for, so the barrier membar would add is redundant: membar cannot see that
-// subviews from the same shared allocation do not alias when pipelining loads.
-// See amdgpu_membar.mlir for examples.
-// This filter is direction-aware and applies to the RAW direction only. The
-// wait says nothing about what follows the read, so an AsyncCopyGlobalToLocal
-// that refills the same buffer after a synced LocalLoad must still wait for
-// every thread to finish reading it (WAR), and only a barrier orders that.
-// Example membar input IR, where both barriers below are required and emitted:
-//   %tile_a = ttg.memdesc_index
-//   %1 = AsyncCopyGlobalToLocal %ptr %tile_a
-//   scf.for
-//     %2 = AsyncWait %1
-//      # Membar will add a required ttg.barrier here
-//     %3 = LocalLoad %tile_a
-//      # WAR: membar will add the required ttg.barrier here
-//     %4 = AsyncCopyGlobalToLocal %ptr_2 %tile_a
-//     scf.yield
-// 2) Do not create barriers between two async loads. The synchronization
-// between them do not make sense.
-bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
-                  bool op2IsRead, Allocation *allocation,
+// Filter function used in the AMDGPU backend to remove dependencies that do
+// not require a workgroup barrier. Two GlobalToLocalCopyTrait ops do not need
+// an ordinary workgroup barrier between them: async synchronization governs
+// their completion. AsyncWait synchronization only filters the
+// producer-to-consumer RAW edge from an async LDS write to its LocalLoad. It
+// does not filter the consumer-to-producer WAR edge when that LDS slice is
+// refilled: every workgroup consumer must release a cooperatively owned slice
+// before any wave overwrites it. Distinct constant memdesc_index slices are
+// proven independent by the generic Membar allocation-slice analysis.
+bool membarFilter(Operation *op1, Operation *op2, bool /*op1IsRead*/,
+                  bool /*op2IsRead*/, Allocation *allocation,
                   const AllocationSlice &, const AllocationSlice &);
+
+// Pair the allocated warp-local scratch reuse proof with its required leading
+// wave fence. Callers using only membarFilter retain CTA synchronization for
+// scratch reuse, since they have no corresponding wave-fence emitter.
+MembarScratchSync getWarpLocalScratchSync();
+
+// Registers an external interface model marking the AMD scheduling-only fences
+// rocdl.sched.barrier / rocdl.sched.group.barrier with
+// ttg::SchedulingBarrierOpInterface. Membar's forward scan for a sync point
+// looks THROUGH ops carrying that interface (they have no cross-wave memory
+// semantics), so it does not insert a redundant barrier around the real
+// ttg.barrier that a tlx.workgroup_barrier interposes. Attaching via a dialect
+// extension keeps the core Membar analysis free of any ROCDL dependency.
+void registerSchedulingBarrierExternalModel(DialectRegistry &registry);
+
+// Membar with the AMD split workgroup barrier: the signal/wait pair
+// synchronizes shared-memory accesses issued before the signal with those
+// after the wait. By convention the window between them holds no
+// shared-memory access, so Membar never needs a barrier inside it.
+class AMDMembarAnalysis : public MembarAnalysis {
+public:
+  AMDMembarAnalysis(Allocation &allocation, MembarFilterFn filter,
+                    MembarScratchSync scratchSync,
+                    triton::BufferRegionAnalysis &regions)
+      : MembarAnalysis(allocation, std::move(filter), std::move(scratchSync),
+                       regions) {}
+
+protected:
+  triton::BarrierStages getBarrierStages(Operation *op) override;
+  // AMD kernels synchronize the LDS they use inside ttg.warp_predicate
+  // themselves, so keep predicated regions opaque here as they were before
+  // NVIDIA lowered them. Walking in adds barriers that the kernel's own already
+  // cover (gfx950 short-causal FA) and can place a barrier inside a region.
+  // TODO: Check whether we should enable walking into the region for AMD
+  // lowering.
+  bool analyzesPredicatedRegions() const override { return false; }
+};
 } // namespace mlir::triton::AMD
 
 #endif // TRITON_THIRD_PARTY_AMD_INCLUDE_TRITONAMDGPUTOLLVM_MEMBARUTILITY_H_

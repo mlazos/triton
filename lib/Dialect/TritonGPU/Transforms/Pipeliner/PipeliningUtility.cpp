@@ -10,14 +10,18 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Partitioning.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionLoopPeeling.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <queue>
@@ -179,13 +183,17 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   if (isa<LLVM::AssumeOp, ttng::FenceAsyncSharedOp>(op))
     return op;
-  if (isa<ttng::ClusterBarrierOp>(op))
-    return op;
-  if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op))
+  // Waits only retire already-issued async work, so running one in a
+  // predicated-off iteration is harmless.
+  if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp, ttng::TMAStoreWaitOp>(op))
     return op;
   if (op->hasTrait<OpTrait::LocalLoadTrait>())
     return op;
-  if (isa<ttg::LocalStoreOp>(op))
+  // Under warp specialization a local_store may write a buffer that another
+  // partition reads under an mbarrier handshake. The paired wait_barrier is
+  // predicated, so the store must be too (wrapped in scf.if below).
+  if (isa<ttg::LocalStoreOp>(op) &&
+      !op->getParentOfType<ttg::WarpSpecializeOp>())
     return op;
   if (isa<ttng::TMEMAllocOp, ttng::TMEMLoadOp>(op))
     return op;
@@ -196,6 +204,13 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     ifOp.getConditionMutable().assign(cnd);
     return op;
   }
+  if (auto prefetchOp = dyn_cast<ttng::AsyncTMAPrefetchOp>(op)) {
+    rewriter.setInsertionPoint(prefetchOp);
+    Value mask = getPredMask(rewriter, prefetchOp.getPred().getType(),
+                             prefetchOp.getPred(), pred);
+    prefetchOp.getPredMutable().assign(mask);
+    return op;
+  }
   if (auto predicatedOp = dyn_cast<tt::PredicatedOpInterface>(op)) {
     rewriter.setInsertionPoint(op);
     Value mask =
@@ -203,6 +218,65 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
                     predicatedOp.getPredicateOperand(), pred);
     predicatedOp.setPredicateOperand(mask);
     return op;
+  }
+  // Dots (tt.dot, ttng.warp_group_dot, ...): predicate by executing
+  // conditionally and forwarding the accumulator input on the inactive path.
+  // Mirrors streamPredication in the AMD pipeline.
+  if (auto dotOp = dyn_cast<tt::DotOpInterface>(op)) {
+    rewriter.setInsertionPoint(op);
+    auto loc = dotOp->getLoc();
+    auto ifOp = scf::IfOp::create(rewriter, loc, dotOp->getResult(0).getType(),
+                                  pred, /*withElseRegion=*/true);
+    auto thenB = ifOp.getThenBodyBuilder();
+    auto yield = scf::YieldOp::create(thenB, loc, dotOp->getResult(0));
+    dotOp->moveBefore(yield);
+    auto elseB = ifOp.getElseBodyBuilder();
+    scf::YieldOp::create(elseB, loc, dotOp->getOperand(2));
+    // Redirect external uses to the scf.if result, but not the then-yield we
+    // just created, which must keep forwarding the dot's own result.
+    dotOp->getResult(0).replaceAllUsesExcept(ifOp->getResult(0), yield);
+    return ifOp;
+  }
+  // Ops without a built-in pred operand: wrap in scf.if.
+  //
+  // Synchronous descriptor loads/gathers, descriptor stores/reductions/
+  // scatters, and the TMA "store" family have no mask/pred operand, so they
+  // cannot be masked in place. They must be predicated when the pipeliner
+  // peels prologue/epilogue iterations of a dynamic loop. Guard them with
+  // scf.if(pred); result-producing operations
+  // yield poison on the inactive path because their consumers are predicated
+  // by the same pipeline-stage condition.
+  //
+  // tt.descriptor_load / tt.descriptor_gather reach this path only outside
+  // warp specialization. Under autoWS the loads have already been rewritten to
+  // nvws.descriptor_load / nvws.descriptor_gather, which LowerAref turns into
+  // ttng.async_tma_copy_global_to_local carrying a real `pred` operand, so
+  // those are masked in place and never need the scf.if wrapper. An nvws load
+  // arriving here would hit the "doesn't know how to predicate" error below
+  // rather than being silently mishandled.
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op) ||
+      isa<tt::DescriptorStoreLikeOpInterface, ttg::LocalStoreOp>(op) ||
+      isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+          ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
+    rewriter.setInsertionPoint(op);
+    bool hasResults = op->getNumResults() > 0;
+    auto ifOp =
+        scf::IfOp::create(rewriter, op->getLoc(), op->getResultTypes(), pred,
+                          /*withElseRegion=*/hasResults);
+    rewriter.setInsertionPointToStart(ifOp.thenBlock());
+    auto *clonedOp = rewriter.clone(*op);
+    if (hasResults) {
+      scf::YieldOp::create(rewriter, op->getLoc(), clonedOp->getResults());
+      rewriter.setInsertionPointToStart(ifOp.elseBlock());
+      SmallVector<Value> poisonResults;
+      for (auto result : op->getResults())
+        poisonResults.push_back(mlir::ub::PoisonOp::create(
+            rewriter, op->getLoc(), result.getType()));
+      scf::YieldOp::create(rewriter, op->getLoc(), poisonResults);
+    }
+    op->replaceAllUsesWith(ifOp->getResults());
+    rewriter.eraseOp(op);
+    return ifOp;
   }
   if (!op->isRegistered()) {
     // Skip ops from unregistered dialects to make writing lit tests easier.
@@ -310,6 +384,11 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
   // FIXME: Here we should pass a MemDescType instead of a SharedEncodingTrait!!
   // This is currently broken for memdesc_subslice!
   auto sharedLayout = triton::gpu::toLinearLayout(shape, sharedEnc);
+  // A mixed-radix layout doesn't compose with the shared layout: copy by runs.
+  if (!regLayout.isRadix2())
+    return ttg::getMixedRadixSharedRun(regLayout, sharedLayout.pseudoinvert(),
+                                       registerTy.getElementTypeBitWidth()) *
+           registerTy.getElementTypeBitWidth() / 8;
   auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
   const int vecElems = regToSharedLayout.getNumConsecutiveInOut();
   return vecElems * getIntOrFloatOrPtrBitWidth(registerTy.getElementType()) / 8;
@@ -340,6 +419,22 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   return width >= 32;
 }
 
+bool mlir::triton::canPipelineInSharedMemory(tt::LoadOp load) {
+  auto ty = dyn_cast<RankedTensorType>(load.getType());
+  if (!ty)
+    return true;
+  LinearLayout layout = ttg::toLinearLayout(ty);
+  if (layout.isRadix2())
+    return true;
+  Type type = ty;
+  for (StringRef name : {ttg::AsyncCopyGlobalToLocalOp::getOperationName(),
+                         ttg::LocalLoadOp::getOperationName()})
+    if (ttg::getNpotLayoutUnsupportedReason(
+            OperationName(name, load.getContext()), type))
+      return false;
+  return !getNpotAsyncCopyUnsupportedReason(load, layout);
+}
+
 void mlir::triton::serializeLatencies(ModuleOp module,
                                       DenseMap<Operation *, int> &opLatency) {
   auto helper = TritonDialect::getLoaded(module)->getLatencyAttrHelper();
@@ -363,7 +458,11 @@ DenseMap<Operation *, int> mlir::triton::deserializeLatencies(Operation *op) {
   auto latencyHelper = TritonDialect::getLoaded(op)->getLatencyAttrHelper();
   op->walk([&](Operation *op) {
     if (auto attr = latencyHelper.getAttr(op)) {
-      opLatency[op] = attr.getInt();
+      // A load whose shared-memory ops can't lower its layout stays
+      // unpipelined.
+      auto load = dyn_cast<tt::LoadOp>(op);
+      if (!load || canPipelineInSharedMemory(load))
+        opLatency[op] = attr.getInt();
       latencyHelper.removeAttr(op);
     }
   });
@@ -371,34 +470,28 @@ DenseMap<Operation *, int> mlir::triton::deserializeLatencies(Operation *op) {
 }
 
 Value mlir::triton::createScalarAlloc(ImplicitLocOpBuilder &rewriter, Type type,
-                                      unsigned numBuffers, bool twoCTAs) {
-  unsigned numCTAs =
-      triton::gpu::lookupNumCTAs(rewriter.getBlock()->getParentOp());
+                                      unsigned numBuffers) {
   MLIRContext *ctx = rewriter.getContext();
-  Attribute sharedMemorySpace = ttg::SharedMemorySpaceAttr::get(ctx);
-  auto kBlock = StringAttr::get(ctx, "block");
-  auto dim = tt::standardOutDimNames(ctx, /*rank=*/1)[0];
-  auto barrierCGALayout =
-      twoCTAs
-          ? ttg::CGAEncodingAttr::get(
-                ctx, tt::LinearLayout::zeros1D(2, kBlock, dim) *
-                         tt::LinearLayout::identity1D(numCTAs / 2, kBlock, dim))
-          : ttg::CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+  unsigned numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(
+      rewriter.getBlock()->getParentOp()->getParentOfType<ModuleOp>());
+  Attribute sharedMemorySpace =
+      ttg::SharedMemorySpaceAttr::get(rewriter.getContext());
+  auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(ctx, numCTAs);
   auto barrierEncoding =
       ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, barrierCGALayout);
-  int numBarrierSlots = twoCTAs ? numCTAs / 2 : numCTAs;
   ttg::MemDescType memDescType = ttg::MemDescType::get(
-      {numBuffers, numBarrierSlots}, type, barrierEncoding, sharedMemorySpace,
+      {numBuffers, numCTAs}, type, barrierEncoding, sharedMemorySpace,
       /*mutableMemory=*/true);
   return ttg::LocalAllocOp::create(rewriter, memDescType, Value());
 }
 
 // Create an allocation and init the mbarriers.
 Value mlir::triton::createBarrierAlloc(Operation *op, int numBarriers,
-                                       int arriveCount, bool twoCTAs) {
+                                       int arriveCount) {
   ImplicitLocOpBuilder rewriter(op->getLoc(), op);
+
   Value barrierAlloc =
-      createScalarAlloc(rewriter, rewriter.getI64Type(), numBarriers, twoCTAs);
+      createScalarAlloc(rewriter, rewriter.getI64Type(), numBarriers);
   for (unsigned i = 0; i < numBarriers; i++) {
     Value barrierView = createSingleBufferView(rewriter, barrierAlloc, i);
     ttng::InitBarrierOp::create(rewriter, barrierView, arriveCount);
@@ -871,4 +964,78 @@ void triton::removePipeliningAttributes(ModuleOp moduleOp) {
     op->removeAttr(mlir::triton::kLoopClusterAttrName);
     op->removeAttr(mlir::triton::kScheduledMaxStageAttrName);
   });
+}
+
+bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
+                                          DominanceInfo &domInfo) {
+  // Crudely match llvm.assume(ub > lb) or llvm.assume(lb < ub), the form
+  // tl.assume(hi > lo) lowers to. Kept deliberately syntactic: the assume
+  // must reference the loop's own bound SSA values, and must dominate the
+  // loop -- an assume placed after it, or under a sibling branch, asserts
+  // nothing at the point the trip count is taken.
+  auto isDominatingAssume = [&](Operation *op) {
+    return isa<LLVM::AssumeOp>(op) && domInfo.properlyDominates(op, loop);
+  };
+  for (Operation *user : loop.getUpperBound().getUsers()) {
+    auto cmp = dyn_cast<arith::CmpIOp>(user);
+    if (!cmp)
+      continue;
+    if (llvm::none_of(cmp->getUsers(), isDominatingAssume))
+      continue;
+    bool unsignedCmp = loop.getUnsignedCmp();
+    if (cmp.getPredicate() == (unsignedCmp ? arith::CmpIPredicate::ugt
+                                           : arith::CmpIPredicate::sgt) &&
+        cmp.getLhs() == loop.getUpperBound() &&
+        cmp.getRhs() == loop.getLowerBound())
+      return true;
+    if (cmp.getPredicate() == (unsignedCmp ? arith::CmpIPredicate::ult
+                                           : arith::CmpIPredicate::slt) &&
+        cmp.getLhs() == loop.getLowerBound() &&
+        cmp.getRhs() == loop.getUpperBound())
+      return true;
+  }
+  return false;
+}
+
+// Meta AutoWS warp-specialization predicates.
+bool mlir::triton::requestsMetaWarpSpecialization(Operation *op) {
+  return op->getAttrOfType<DenseI32ArrayAttr>(ttg::kAsyncTaskIdAttrName) ||
+         op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName) ||
+         (isa<scf::ForOp, scf::WhileOp>(op) &&
+          op->hasAttr(kWarpSpecializeAttrName));
+}
+
+// One walk for both the function and module predicates. With
+// `countWarpSpecializeOp`, an existing ttg.warp_specialize region (e.g. from
+// TLX) also counts as a request.
+static bool containsMetaWarpSpecializationRequest(Operation *root,
+                                                  bool countWarpSpecializeOp) {
+  return root
+      ->walk([&](Operation *op) {
+        return (countWarpSpecializeOp && isa<ttg::WarpSpecializeOp>(op)) ||
+                       triton::requestsMetaWarpSpecialization(op)
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+bool mlir::triton::isMetaWarpSpecializedFunc(triton::FuncOp funcOp) {
+  return containsMetaWarpSpecializationRequest(funcOp,
+                                               /*countWarpSpecializeOp=*/false);
+}
+
+bool mlir::triton::moduleRequestsMetaWarpSpecialization(ModuleOp mod) {
+  return containsMetaWarpSpecializationRequest(mod,
+                                               /*countWarpSpecializeOp=*/true);
+}
+
+bool mlir::triton::isMetaWSEnabled(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  if (mod)
+    if (auto attr = mod->getAttrOfType<BoolAttr>(kUseMetaWSAttrName))
+      return attr.getValue();
+  return triton::tools::getBoolEnv("TRITON_USE_META_WS");
 }

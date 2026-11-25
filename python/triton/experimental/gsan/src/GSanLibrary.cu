@@ -1,17 +1,11 @@
 #include "GSan.h"
 #include "Hash.cuh"
-#include "TMA.cuh"
 
-extern "C" GSAN_DEVICE void __assertfail(const char *assertion,
-                                         const char *file, unsigned line,
-                                         const char *function,
-                                         __SIZE_TYPE__ charSize);
-
-static GSAN_DEVICE inline void __assert_fail(const char *assertion,
-                                             const char *file, unsigned line,
-                                             const char *function) {
-  __assertfail(assertion, file, line, function, sizeof(char));
-}
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <device_launch_parameters.h>
+#include <limits>
 
 namespace gsan {
 
@@ -20,7 +14,7 @@ struct Location {
   unsigned line;
 };
 
-GSAN_DEVICE const char *getSourceFile(Location loc) {
+__device__ const char *getSourceFile(Location loc) {
   return loc.file == nullptr ? "<unknown>" : loc.file;
 }
 
@@ -35,8 +29,7 @@ GSAN_DEVICE const char *getSourceFile(Location loc) {
 
 namespace gsan {
 namespace {
-static constexpr uint32_t kWriterFlag = 1u << 31;
-static constexpr epoch_t kMaxEpoch = static_cast<epoch_t>(~0u);
+static constexpr uint32_t writerFlag = 1u << 31;
 static constexpr uint16_t kMaxUint16 = static_cast<uint16_t>(~0u);
 
 enum class AtomicSem : uint8_t {
@@ -46,35 +39,35 @@ enum class AtomicSem : uint8_t {
   AcquireRelease = 4,
 };
 
-GSAN_DEVICE void rwLockAcquireRead(uint32_t &lock) {
+__device__ void rwLockAcquireRead(uint32_t &lock) {
   uint32_t old = __scoped_atomic_fetch_add(&lock, 1, __ATOMIC_ACQUIRE,
                                            __MEMORY_SCOPE_WRKGRP);
-  if ((old & kWriterFlag) == 0)
+  if ((old & writerFlag) == 0)
     return;
 
   do {
     old =
         __scoped_atomic_load_n(&lock, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_WRKGRP);
-  } while ((old & kWriterFlag) != 0);
+  } while ((old & writerFlag) != 0);
 }
 
-GSAN_DEVICE void rwLockAcquireWrite(uint32_t &lock) {
+__device__ void rwLockAcquireWrite(uint32_t &lock) {
   uint32_t actual = 0;
-  while (!__scoped_atomic_compare_exchange_n(&lock, &actual, kWriterFlag, true,
+  while (!__scoped_atomic_compare_exchange_n(&lock, &actual, writerFlag, true,
                                              __ATOMIC_ACQUIRE, __ATOMIC_RELAXED,
                                              __MEMORY_SCOPE_WRKGRP)) {
     actual = 0;
   }
 }
 
-GSAN_DEVICE void rwLockReleaseRead(uint32_t &lock) {
+__device__ void rwLockReleaseRead(uint32_t &lock) {
   __scoped_atomic_fetch_sub(&lock, 1, __ATOMIC_RELAXED, __MEMORY_SCOPE_WRKGRP);
 }
 
-GSAN_DEVICE void rwLockReleaseWrite(uint32_t &lock) {
+__device__ void rwLockReleaseWrite(uint32_t &lock) {
   // Note we don't set 0 as there may be readers who've already
   // incremented optimistically
-  __scoped_atomic_fetch_and(&lock, ~kWriterFlag, __ATOMIC_RELEASE,
+  __scoped_atomic_fetch_and(&lock, ~writerFlag, __ATOMIC_RELEASE,
                             __MEMORY_SCOPE_WRKGRP);
 }
 
@@ -91,14 +84,14 @@ GSAN_DEVICE void clusterLockRelease(uint32_t &lock) {
   __scoped_atomic_store_n(&lock, 0, __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
 }
 
-GSAN_DEVICE inline uintptr_t roundUp(uintptr_t ptr, uintptr_t align) {
+__device__ inline uintptr_t roundUp(uintptr_t ptr, uintptr_t align) {
   return ptr % align == 0 ? ptr : ptr + align - (ptr % align);
 }
 
 GSAN_DEVICE uint32_t getSmId() { return __nvvm_read_ptx_sreg_smid(); }
 
 GSAN_DEVICE void syncThreads(uint32_t barrierId, uint32_t numThreads) {
-  asm volatile("barrier.sync %0, %1;"
+  asm volatile("bar.sync %0, %1;"
                :
                : "r"(barrierId), "r"(numThreads)
                : "memory");
@@ -110,21 +103,21 @@ GSAN_DEVICE uintptr_t getThreadStateStrideBytes(GlobalState *globals) {
          sizeof(epoch_t) * globals->numThreads * clocksPerThread;
 }
 
-GSAN_DEVICE thread_id_t getDeviceThreadId(GlobalState *globals, uint32_t smid) {
+__device__ thread_id_t getDeviceThreadId(GlobalState *globals, uint32_t smid) {
   auto globalsBase = static_cast<uintptr_t>(globals->globalsBase);
   auto deviceBase = reinterpret_cast<uintptr_t>(globals);
   auto deviceIdx = (deviceBase - globalsBase) / kPerDeviceStateStride;
   return static_cast<thread_id_t>(deviceIdx * globals->numSms + smid);
 }
 
-GSAN_DEVICE uintptr_t getThreadStateBaseAddress(uintptr_t globalsAddr) {
+__device__ uintptr_t getThreadStateBaseAddress(uintptr_t globalsAddr) {
   uintptr_t stateBase = globalsAddr;
   stateBase = roundUp(stateBase + sizeof(GlobalState), alignof(ThreadState));
   return stateBase;
 }
 
-GSAN_DEVICE ThreadState *getThreadStateById(GlobalState *globals,
-                                            thread_id_t tid) {
+__device__ ThreadState *getThreadStateById(GlobalState *globals,
+                                           thread_id_t tid) {
   uint32_t deviceIdx = tid / globals->numSms;
   uint32_t smid = tid % globals->numSms;
   uintptr_t stateBase = static_cast<uintptr_t>(globals->globalsBase) +
@@ -134,7 +127,7 @@ GSAN_DEVICE ThreadState *getThreadStateById(GlobalState *globals,
   return reinterpret_cast<ThreadState *>(stateBase + stateStride * smid);
 }
 
-GSAN_DEVICE ThreadState *getThreadState(GlobalState *globals) {
+__device__ ThreadState *getThreadState(GlobalState *globals) {
   uint32_t smid = getSmId();
   uintptr_t stateBase =
       getThreadStateBaseAddress(reinterpret_cast<uintptr_t>(globals));
@@ -142,13 +135,13 @@ GSAN_DEVICE ThreadState *getThreadState(GlobalState *globals) {
   return reinterpret_cast<ThreadState *>(stateBase + stateStride * smid);
 }
 
-GSAN_DEVICE epoch_t *getClockBufferBase(ThreadState *state) {
+__device__ epoch_t *getClockBufferBase(ThreadState *state) {
   auto *globals = getGlobalState(state);
   return state->vectorClock + globals->numThreads;
 }
 
-GSAN_DEVICE epoch_t *getClockBufferSlot(ThreadState *state, epoch_t token,
-                                        Location loc) {
+__device__ epoch_t *getClockBufferSlot(ThreadState *state, epoch_t token,
+                                       Location loc) {
   assert_msg(loc, token != 0, "Invalid GSan clock token");
   assert_msg(loc, token <= state->clockBufferHead, "Future GSan clock token");
   auto *globals = getGlobalState(state);
@@ -158,10 +151,11 @@ GSAN_DEVICE epoch_t *getClockBufferSlot(ThreadState *state, epoch_t token,
   return getClockBufferBase(state) + slot * globals->numThreads;
 }
 
-GSAN_DEVICE epoch_t publishClockBuffer(ThreadState *state, Location loc) {
+__device__ epoch_t publishClockBuffer(ThreadState *state, Location loc) {
   auto *globals = getGlobalState(state);
   uint32_t nextHead = state->clockBufferHead + 1;
-  assert_msg(loc, nextHead <= kMaxEpoch, "GSan clock buffer token overflowed");
+  assert_msg(loc, nextHead <= std::numeric_limits<epoch_t>::max(),
+             "GSan clock buffer token overflowed");
   epoch_t *slot =
       getClockBufferBase(state) +
       ((nextHead - 1) % globals->clockBufferSize) * globals->numThreads;
@@ -172,7 +166,7 @@ GSAN_DEVICE epoch_t publishClockBuffer(ThreadState *state, Location loc) {
   return static_cast<epoch_t>(nextHead);
 }
 
-GSAN_DEVICE AtomicSem decodeAtomicSem(uint32_t sem) {
+__device__ AtomicSem decodeAtomicSem(uint32_t sem) {
   switch (sem) {
   case 1:
     return AtomicSem::Relaxed;
@@ -183,12 +177,11 @@ GSAN_DEVICE AtomicSem decodeAtomicSem(uint32_t sem) {
   case 4:
     return AtomicSem::AcquireRelease;
   default:
-    __builtin_trap();
-    return AtomicSem::Relaxed;
+    assert(false || !"Unexpected atomic semantic type");
   }
 }
 
-GSAN_DEVICE AtomicScope decodeAtomicScope(uint32_t scope) {
+__device__ AtomicScope decodeAtomicScope(uint32_t scope) {
   switch (scope) {
   case 1:
     return AtomicScope::GPU;
@@ -197,21 +190,20 @@ GSAN_DEVICE AtomicScope decodeAtomicScope(uint32_t scope) {
   case 3:
     return AtomicScope::System;
   default:
-    __builtin_trap();
-    return AtomicScope::NonAtomic;
+    assert(false || !"Unexpected atomic scope");
   }
 }
 
-GSAN_DEVICE bool hasAcquire(AtomicSem sem) {
+__device__ bool hasAcquire(AtomicSem sem) {
   return sem == AtomicSem::Acquire || sem == AtomicSem::AcquireRelease;
 }
 
-GSAN_DEVICE bool hasRelease(AtomicSem sem) {
+__device__ bool hasRelease(AtomicSem sem) {
   return sem == AtomicSem::Release || sem == AtomicSem::AcquireRelease;
 }
 
-GSAN_DEVICE bool scopeCoversPair(AtomicScope scope, thread_id_t lhs,
-                                 thread_id_t rhs, GlobalState *globals) {
+__device__ bool scopeCoversPair(AtomicScope scope, thread_id_t lhs,
+                                thread_id_t rhs, GlobalState *globals) {
   switch (scope) {
   case AtomicScope::CTA:
     return lhs == rhs;
@@ -225,9 +217,9 @@ GSAN_DEVICE bool scopeCoversPair(AtomicScope scope, thread_id_t lhs,
   return false;
 }
 
-GSAN_DEVICE bool areAtomicScopesCompatible(AtomicScope lhs, thread_id_t lhsTid,
-                                           AtomicScope rhs, thread_id_t rhsTid,
-                                           GlobalState *globals) {
+__device__ bool areAtomicScopesCompatible(AtomicScope lhs, thread_id_t lhsTid,
+                                          AtomicScope rhs, thread_id_t rhsTid,
+                                          GlobalState *globals) {
   if (!isAtomicScope(lhs) || !isAtomicScope(rhs))
     return false;
   return scopeCoversPair(lhs, lhsTid, rhsTid, globals) &&
@@ -339,7 +331,8 @@ GSAN_DEVICE void initThread(GlobalState *globals, const LaunchState &launch,
     // Advance the SM's local epoch; nonlocal components came from the explicit
     // entry frontier above.
     auto *clock = state->vectorClock;
-    assert_msg(loc, clock[tid] != kMaxEpoch, "Vector clock overflowed");
+    assert_msg(loc, clock[tid] != std::numeric_limits<epoch_t>::max(),
+               "Vector clock overflowed");
     clock[tid] += 1;
     state->clockBufferDirty = 1;
   }
@@ -391,15 +384,16 @@ GSAN_DEVICE void releaseShadow(ShadowCell *cell) {
                             __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
 }
 
-GSAN_DEVICE epoch_t appendClockBufferSnapshot(ThreadState *state,
-                                              const epoch_t *snapshot,
-                                              Location loc) {
+__device__ epoch_t appendClockBufferSnapshot(ThreadState *state,
+                                             const epoch_t *snapshot,
+                                             Location loc) {
   auto *globals = getGlobalState(state);
   assert_msg(loc, globals->clockBufferSize != 0,
              "GSan clock buffer size must be non-zero");
   uint32_t curHead = state->clockBufferHead;
   uint32_t nextHead = curHead + 1;
-  assert_msg(loc, nextHead <= kMaxEpoch, "GSan clock buffer token overflowed");
+  assert_msg(loc, nextHead <= std::numeric_limits<epoch_t>::max(),
+             "GSan clock buffer token overflowed");
   epoch_t *slot = getClockBufferBase(state) +
                   (nextHead % globals->clockBufferSize) * globals->numThreads;
   for (int i = 0; i < globals->numThreads; ++i)
@@ -408,8 +402,7 @@ GSAN_DEVICE epoch_t appendClockBufferSnapshot(ThreadState *state,
   return static_cast<epoch_t>(nextHead);
 }
 
-GSAN_DEVICE epoch_t publishCurrentVectorClock(ThreadState *state,
-                                              Location loc) {
+__device__ epoch_t publishCurrentVectorClock(ThreadState *state, Location loc) {
   if (state->clockBufferDirty) {
     auto token = appendClockBufferSnapshot(state, state->vectorClock, loc);
     state->clockBufferDirty = 0;
@@ -418,9 +411,9 @@ GSAN_DEVICE epoch_t publishCurrentVectorClock(ThreadState *state,
   return state->clockBufferHead;
 }
 
-GSAN_DEVICE const epoch_t *getSnapshotForWrite(ThreadState *state,
-                                               const ScalarClock &write,
-                                               Location loc) {
+__device__ const epoch_t *getSnapshotForWrite(ThreadState *state,
+                                              const ScalarClock &write,
+                                              Location loc) {
   if (!write.isRelease)
     return nullptr;
   auto *writerState = getThreadStateById(getGlobalState(state), write.threadId);
@@ -434,7 +427,8 @@ GSAN_DEVICE epoch_t publishCurrentVectorClockWithPriorRelease(
   assert_msg(loc, globals->clockBufferSize != 0,
              "GSan clock buffer size must be non-zero");
   uint32_t nextHead = state->clockBufferHead + 1;
-  assert_msg(loc, nextHead <= kMaxEpoch, "GSan clock buffer token overflowed");
+  assert_msg(loc, nextHead <= std::numeric_limits<epoch_t>::max(),
+             "GSan clock buffer token overflowed");
   auto *slot = getClockBufferBase(state) +
                (nextHead % globals->clockBufferSize) * globals->numThreads;
   for (int i = 0; i < globals->numThreads; ++i) {
@@ -459,10 +453,11 @@ GSAN_DEVICE epoch_t propagateClockBufferSnapshot(ThreadState *state,
   return token;
 }
 
-GSAN_DEVICE void incrementThreadEpoch(ThreadState *state, Location loc) {
+__device__ void incrementThreadEpoch(ThreadState *state, Location loc) {
   auto tid = state->threadId;
   auto *clock = state->vectorClock;
-  assert_msg(loc, clock[tid] != kMaxEpoch, "Vector clock overflowed");
+  assert_msg(loc, clock[tid] != std::numeric_limits<epoch_t>::max(),
+             "Vector clock overflowed");
   clock[tid] += 1;
   state->clockBufferDirty = 1;
 }
@@ -487,8 +482,7 @@ GSAN_DEVICE bool mergeVectorClock(ThreadState *state, const epoch_t *snapshot,
   return changed;
 }
 
-GSAN_DEVICE bool dominatesSnapshot(ThreadState *state,
-                                   const epoch_t *snapshot) {
+__device__ bool dominatesSnapshot(ThreadState *state, const epoch_t *snapshot) {
   auto *globals = getGlobalState(state);
   for (int i = 0; i < globals->numThreads; ++i) {
     if (state->vectorClock[i] < snapshot[i])
@@ -497,8 +491,8 @@ GSAN_DEVICE bool dominatesSnapshot(ThreadState *state,
   return true;
 }
 
-GSAN_DEVICE bool clockHappensBefore(ThreadState *state,
-                                    const ScalarClock &clock, Location loc) {
+__device__ bool clockHappensBefore(ThreadState *state, const ScalarClock &clock,
+                                   Location loc) {
   if (clock.epoch == 0)
     return true;
   if (const epoch_t *snapshot = getSnapshotForWrite(state, clock, loc))
@@ -506,10 +500,10 @@ GSAN_DEVICE bool clockHappensBefore(ThreadState *state,
   return state->vectorClock[clock.threadId] >= clock.epoch;
 }
 
-GSAN_DEVICE void assertOrderedOrCompatible(ThreadState *state,
-                                           AtomicScope currentScope,
-                                           const ScalarClock &prior,
-                                           Location loc, const char *message) {
+__device__ void assertOrderedOrCompatible(ThreadState *state,
+                                          AtomicScope currentScope,
+                                          const ScalarClock &prior,
+                                          Location loc, const char *message) {
   if (prior.epoch == 0)
     return;
   if (isAtomicScope(currentScope) &&
@@ -520,8 +514,8 @@ GSAN_DEVICE void assertOrderedOrCompatible(ThreadState *state,
   assert_msg(loc, clockHappensBefore(state, prior, loc), message);
 }
 
-GSAN_DEVICE void maybeMergeAcquire(ThreadState *state, AtomicScope currentScope,
-                                   const ScalarClock &prior, Location loc) {
+__device__ void maybeMergeAcquire(ThreadState *state, AtomicScope currentScope,
+                                  const ScalarClock &prior, Location loc) {
   if (!prior.isRelease)
     return;
   if (!areAtomicScopesCompatible(currentScope, state->threadId, prior.scope,
@@ -776,13 +770,13 @@ GSAN_DEVICE void acquireMBarrierPhase(GlobalState *globals, void *scratch,
   rwLockReleaseWrite(threadState->lock);
 }
 
-GSAN_DEVICE ScalarClock makeScalarClock(ThreadState *state, AtomicScope scope) {
+__device__ ScalarClock makeScalarClock(ThreadState *state, AtomicScope scope) {
   auto tid = state->threadId;
   return ScalarClock{state->vectorClock[tid], tid, scope, false};
 }
 
-GSAN_DEVICE ScalarClock makePublishedClock(ThreadState *state,
-                                           AtomicScope scope, epoch_t token) {
+__device__ ScalarClock makePublishedClock(ThreadState *state, AtomicScope scope,
+                                          epoch_t token) {
   return ScalarClock{token, state->threadId, scope, true};
 }
 
@@ -818,7 +812,7 @@ GSAN_DEVICE void recordRead(ThreadState *state, ShadowCell *cell,
   }
 }
 
-GSAN_DEVICE void doWrite(ThreadState *state, ShadowCell *cell, Location loc) {
+__device__ void doWrite(ThreadState *state, ShadowCell *cell, Location loc) {
   // Check WAR
   for (int iRead = 0; iRead < ShadowCell::kReadClockSize; ++iRead) {
     assertOrderedOrCompatible(state, AtomicScope::NonAtomic,
@@ -832,8 +826,8 @@ GSAN_DEVICE void doWrite(ThreadState *state, ShadowCell *cell, Location loc) {
   cell->writeClock = makeScalarClock(state, AtomicScope::NonAtomic);
 }
 
-GSAN_DEVICE void doWrite(ThreadState *state, WriteOnceShadowCell *cell,
-                         Location loc) {
+__device__ void doWrite(ThreadState *state, WriteOnceShadowCell *cell,
+                        Location loc) {
   auto clock = makeScalarClock(state, AtomicScope::NonAtomic);
   ScalarClock expected{};
   bool firstWrite = __scoped_atomic_compare_exchange(
@@ -842,8 +836,8 @@ GSAN_DEVICE void doWrite(ThreadState *state, WriteOnceShadowCell *cell,
   assert_msg(loc, firstWrite, "Write-once memory written more than once");
 }
 
-GSAN_DEVICE void doRead(ThreadState *state, WriteOnceShadowCell *cell,
-                        Location loc) {
+__device__ void doRead(ThreadState *state, WriteOnceShadowCell *cell,
+                       Location loc) {
   ScalarClock clock;
   __scoped_atomic_load(&cell->writeClock, &clock, __ATOMIC_RELAXED,
                        __MEMORY_SCOPE_SYSTEM);
@@ -853,8 +847,8 @@ GSAN_DEVICE void doRead(ThreadState *state, WriteOnceShadowCell *cell,
                             "Read after write race detected");
 }
 
-GSAN_DEVICE void writeRange(ThreadState *state, uintptr_t write_addr,
-                            int nBytes, Location loc) {
+__device__ void writeRange(ThreadState *state, uintptr_t write_addr, int nBytes,
+                           Location loc) {
   auto reserveBase = state->reserveBase;
   auto category = categorize(write_addr, reserveBase);
   bool writeOnce = category == AddressCategory::WriteOnce;
@@ -881,8 +875,8 @@ GSAN_DEVICE void writeRange(ThreadState *state, uintptr_t write_addr,
 }
 
 // Handles tl.store(ptrs, values, mask)
-GSAN_DEVICE void tensorStore(ThreadState *state, const char *stackPtr,
-                             int nElems, int bytesPerElem, Location loc) {
+__device__ void tensorStore(ThreadState *state, const char *stackPtr,
+                            int nElems, int bytesPerElem, Location loc) {
   const uintptr_t *ptrsPtr = reinterpret_cast<const uintptr_t *>(stackPtr);
   const char *maskPtr = stackPtr + nElems * sizeof(uintptr_t);
   bool acquired = false;
@@ -901,14 +895,14 @@ GSAN_DEVICE void tensorStore(ThreadState *state, const char *stackPtr,
     rwLockReleaseRead(state->lock);
 }
 
-GSAN_DEVICE void doRead(ThreadState *state, ShadowCell *cell, Location loc) {
+__device__ void doRead(ThreadState *state, ShadowCell *cell, Location loc) {
   assertOrderedOrCompatible(state, AtomicScope::NonAtomic, cell->writeClock,
                             loc, "Read after write race detected");
   recordRead(state, cell, AtomicScope::NonAtomic);
 }
 
-GSAN_DEVICE void readRange(ThreadState *state, uintptr_t read_addr, int nBytes,
-                           Location loc) {
+__device__ void readRange(ThreadState *state, uintptr_t read_addr, int nBytes,
+                          Location loc) {
   auto reserveBase = state->reserveBase;
   auto category = categorize(read_addr, reserveBase);
   bool writeOnce = category == AddressCategory::WriteOnce;
@@ -935,8 +929,8 @@ GSAN_DEVICE void readRange(ThreadState *state, uintptr_t read_addr, int nBytes,
 }
 
 // Handles tl.load(ptrs, mask)
-GSAN_DEVICE void tensorLoad(ThreadState *state, const char *stackPtr,
-                            int nElems, int bytesPerElem, Location loc) {
+__device__ void tensorLoad(ThreadState *state, const char *stackPtr, int nElems,
+                           int bytesPerElem, Location loc) {
   const uintptr_t *ptrsPtr = reinterpret_cast<const uintptr_t *>(stackPtr);
   const char *maskPtr = stackPtr + nElems * sizeof(uintptr_t);
   bool acquired = false;
@@ -953,6 +947,34 @@ GSAN_DEVICE void tensorLoad(ThreadState *state, const char *stackPtr,
   }
   if (acquired)
     rwLockReleaseRead(state->lock);
+}
+
+struct TensorDescInfo {
+  static constexpr int kShapeWordBase = 8;
+  static constexpr int kStrideWordBase = 3;
+  static constexpr int kStrideUnitBytes = 16;
+
+  uintptr_t base;
+  const uint32_t *words;
+  int rank;
+  int bytesPerElem;
+
+  GSAN_DEVICE int64_t shape(int dim) const {
+    return static_cast<int64_t>(words[kShapeWordBase + rank - 1 - dim]) + 1;
+  }
+
+  GSAN_DEVICE uintptr_t byteStride(int dim) const {
+    if (dim + 1 == rank)
+      return bytesPerElem;
+    return static_cast<uintptr_t>(words[kStrideWordBase + rank - 2 - dim]) *
+           kStrideUnitBytes;
+  }
+};
+
+GSAN_DEVICE TensorDescInfo decodeTensorDesc(const void *descriptor, int rank,
+                                            int bytesPerElem) {
+  return {*reinterpret_cast<const uintptr_t *>(descriptor),
+          reinterpret_cast<const uint32_t *>(descriptor), rank, bytesPerElem};
 }
 
 template <typename ElementHandler>
@@ -1140,15 +1162,15 @@ tensorNonAtomicIndexedDesc(ThreadState *state, const void *descriptor,
     rwLockReleaseRead(state->lock);
 }
 
-GSAN_DEVICE void initAtomicEventState(AtomicEventState *event) {
+__device__ void initAtomicEventState(AtomicEventState *event) {
   event->threadState = nullptr;
   event->numCells = 0;
   for (auto &cell : event->cells)
     cell = nullptr;
 }
 
-GSAN_DEVICE void checkAtomicAddress(uintptr_t reserveBase, uintptr_t address,
-                                    Location loc) {
+__device__ void checkAtomicAddress(uintptr_t reserveBase, uintptr_t address,
+                                   Location loc) {
   assert_msg(loc,
              categorize(address, reserveBase) != AddressCategory::WriteOnce,
              "Atomic operations on write-once memory are not supported");
@@ -1188,7 +1210,7 @@ GSAN_DEVICE void acquireAtomicShadowRange(ThreadState *state,
   }
 }
 
-GSAN_DEVICE void releaseAtomicShadowRange(AtomicEventState *event) {
+__device__ void releaseAtomicShadowRange(AtomicEventState *event) {
   if (event->threadState == nullptr)
     return;
   for (uint8_t i = 0; i < event->numCells; ++i)
@@ -1231,9 +1253,9 @@ GSAN_DEVICE void beginAtomicAccess(GlobalState *globals,
   }
 }
 
-GSAN_DEVICE void endAtomicAccess(AtomicEventState *event, bool pred,
-                                 bool didWrite, bool isRmw, uint32_t semRaw,
-                                 uint32_t scopeRaw, Location loc) {
+__device__ void endAtomicAccess(AtomicEventState *event, bool pred,
+                                bool didWrite, bool isRmw, uint32_t semRaw,
+                                uint32_t scopeRaw, Location loc) {
   if (!pred || event->threadState == nullptr)
     return;
 
@@ -1320,7 +1342,7 @@ GSAN_DEVICE void tensorAtomicDesc(GlobalState *globals, const void *descriptor,
 } // namespace
 } // namespace gsan
 
-extern "C" GSAN_DEVICE void
+extern "C" __device__ void
 __triton_gsan_load_tensor(void *globalState, const char *stackPtr, int numElems,
                           int bytesPerElem, const char *file, unsigned line) {
   auto loc = gsan::Location{file, line};
@@ -1445,7 +1467,7 @@ __triton_gsan_mbarrier_wait(void *globalState, void *scratch, unsigned offset,
                              scratch, offset, ownerRank, phase, loc);
 }
 
-extern "C" GSAN_DEVICE void
+extern "C" __device__ void
 __triton_gsan_store_tensor(void *globalState, const char *stackPtr,
                            int numElems, int bytesPerElem, const char *file,
                            unsigned line) {
@@ -1491,7 +1513,7 @@ extern "C" GSAN_DEVICE void __triton_gsan_atomic_tensor_desc(
                          bytesPerElem, sem, scope, warpId, numWarps, loc);
 }
 
-extern "C" GSAN_DEVICE void
+extern "C" __device__ void
 __triton_gsan_atomic_begin_scalar(void *globalState, void *eventState, int pred,
                                   gsan::uintptr_t address, int nBytes,
                                   int bytesPerElem, int doesRead, int sem,
@@ -1503,7 +1525,7 @@ __triton_gsan_atomic_begin_scalar(void *globalState, void *eventState, int pred,
       address, nBytes, bytesPerElem, doesRead != 0, sem, scope, loc);
 }
 
-extern "C" GSAN_DEVICE void
+extern "C" __device__ void
 __triton_gsan_atomic_end_scalar(void *eventState, int pred, int didWrite,
                                 int isRmw, int sem, int scope, const char *file,
                                 unsigned line) {

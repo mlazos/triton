@@ -7,7 +7,7 @@ module {
     %c0_i32 = arith.constant 0 : i32
     %c128_i32 = arith.constant 128 : i32
     %c256_i32 = arith.constant 256 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c1_i64, %c256_i64] {order = array<i32: 0>} : <f32>, <128x128xf32>
+    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c1_i64, %c256_i64] {order = array<i32: 0>} : !tt.ptr<f32>, !tt.tensordesc<128x128xf32>
     %3 = tt.descriptor_load %0[%arg1, %arg2] {cachePolicy = #tt.cache_policy<cache_modifier = cg, eviction_policy = evict_last>} : !tt.tensordesc<128x128xf32> -> tensor<128x128xf32>
     tt.return %3 : tensor<128x128xf32>
   }
@@ -50,7 +50,7 @@ module {
 // CHECK-DAG: %[[VAL23:.*]] = tt.broadcast %[[VAL22]] : tensor<1x128xi1> -> tensor<128x128xi1>
 // CHECK-DAG: %[[VAL24:.*]] = arith.andi %[[VAL19]], %[[VAL23]]
 
-// CHECK-DAG: %[[VAL25:.*]] = tt.load %[[VAL15]], %[[VAL24]], %[[CST]] {cachePolicy = #tt.cache_policy<cache_modifier = cg, eviction_policy = evict_last>}
+// CHECK-DAG: %[[VAL25:.*]] = tt.load %[[VAL15]], %[[VAL24]], %[[CST]] {cachePolicy = #tt.cache_policy<cache_modifier = cg, eviction_policy = evict_last>, multicast = false}
 // CHECK: tt.return %[[VAL25]] :
 
 // -----
@@ -59,7 +59,7 @@ module {
   tt.func public @dynamic_shape(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: i32) -> tensor<16xf32> {
     %c1_i64 = arith.constant 1 : i64
     %c0_i32 = arith.constant 0 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%arg1], [%c1_i64] : <f32>, <16xf32>
+    %0 = tt.make_tensor_descriptor %arg0, [%arg1], [%c1_i64] : !tt.ptr<f32>, !tt.tensordesc<16xf32>
     %1 = tt.descriptor_load %0[%c0_i32] : !tt.tensordesc<16xf32> -> tensor<16xf32>
     tt.return %1 : tensor<16xf32>
   }
@@ -81,7 +81,7 @@ module {
     %c0_i32 = arith.constant 0 : i32
     %c128_i32 = arith.constant 128 : i32
     %c256_i32 = arith.constant 256 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c1_i64, %c256_i64] {order = array<i32: 0>} : <f32>, <128x128xf32>
+    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c1_i64, %c256_i64] {order = array<i32: 0>} : !tt.ptr<f32>, !tt.tensordesc<128x128xf32>
     tt.descriptor_store %0[%arg1, %arg2], %arg3 : !tt.tensordesc<128x128xf32>, tensor<128x128xf32>
     tt.return
   }
@@ -135,7 +135,7 @@ module {
     %c256_i32 = arith.constant 256 : i32
     %c128_i32 = arith.constant 128 : i32
     %c8_i32 = arith.constant 8 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c128_i32], [%c256_i64, %c1_i64] {order = array<i32: 0>} : <bf16>, <1x128xbf16>
+    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c128_i32], [%c256_i64, %c1_i64] {order = array<i32: 0>} : !tt.ptr<bf16>, !tt.tensordesc<1x128xbf16>
     tt.descriptor_scatter %0[%arg3, %c8_i32], %arg4 : !tt.tensordesc<1x128xbf16>, tensor<32xi32>, i32, tensor<32x128xbf16>
     tt.return
   }
@@ -190,7 +190,7 @@ module {
     %c1_i64 = arith.constant 1 : i64
     %c256_i32 = arith.constant 256 : i32
     %c256_i64 = arith.constant 256 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c256_i64, %c1_i64] {order = array<i32: 0>} : <f32>, <128x128xf32>
+    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c256_i64, %c1_i64] {order = array<i32: 0>} : !tt.ptr<f32>, !tt.tensordesc<128x128xf32>
     %1 = tt.call @callee(%0) : (!tt.tensordesc<128x128xf32>) -> !tt.tensordesc<128x128xf32>
     tt.return
   }

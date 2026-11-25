@@ -279,7 +279,8 @@ module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 2 : i32
   // CHECK: %[[CTA_RANK_INIT:.*]] = nvg.cluster_id
   // CHECK: %[[INIT_SCRATCH:.*]] = llvm.addrspacecast %[[SCRATCH]] : !llvm.ptr<1> to !llvm.ptr
   // CHECK: llvm.call @__triton_gsan_cluster_barrier_init(%[[INIT_SCRATCH]], %{{.*}}) : (!llvm.ptr, i32) -> ()
-  // CHECK: %[[ELECT_SYNC:.*]] = nvvm.elect.sync -> i1
+  // fbtriton base reuses the init elect (dedup); check the reuse wiring via llvm.and
+  // CHECK: %{{.*}} = llvm.and %{{.*}}, %[[ELECT_INIT]] : i1
   // CHECK: %[[CTA_RANK_SYNC:.*]] = nvg.cluster_id
   // CHECK: %[[SYNC_SCRATCH:.*]] = llvm.addrspacecast %[[SCRATCH]] : !llvm.ptr<1> to !llvm.ptr
   // CHECK: llvm.call @__triton_gsan_cluster_barrier_sync(%{{.*}}, %[[SYNC_SCRATCH]], %{{.*}}, %[[TWO]], %[[CTA_RANK_SYNC]], %{{.*}}, %{{.*}}) : (!llvm.ptr, !llvm.ptr, i32, i32, i32, !llvm.ptr, i32) -> ()
@@ -362,7 +363,8 @@ module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 4 : i32
   // CHECK: %[[TABLE_ELECT:.*]] = nvvm.elect.sync -> i1
   // CHECK: %[[TABLE_CTA:.*]] = nvg.cluster_id
   // CHECK: llvm.call @__triton_gsan_mbarrier_table_init(%[[TABLE:.*]], %{{.*}}, %{{.*}}) : (!llvm.ptr, i32, i32) -> ()
-  // CHECK: %[[INIT_ELECT:.*]] = nvvm.elect.sync -> i1
+  // fbtriton base reuses the table-init elect (dedup); check the reuse wiring via llvm.and
+  // CHECK: %{{.*}} = llvm.and %{{.*}}, %[[TABLE_ELECT]] : i1
   // CHECK: %[[INIT_LEADER_CTA:.*]] = nvg.cluster_id
   // CHECK: %[[INIT_CTA:.*]] = nvg.cluster_id
   // CHECK: %[[INIT_ADDRESS:.*]] = llvm.ptrtoint %{{.*}} : !llvm.ptr<3> to i32
@@ -370,12 +372,13 @@ module attributes {"ttg.instrumentation_mode" = "gsan", "ttg.num-ctas" = 4 : i32
   // CHECK: %[[INIT_TABLE:.*]] = llvm.addrspacecast %{{.*}} : !llvm.ptr<1> to !llvm.ptr
   // CHECK: llvm.call @__triton_gsan_mbarrier_init(%[[INIT_TABLE]], %[[INIT_OFFSET]], %{{.*}}, %[[INIT_CTA]], %{{.*}}, %{{.*}}, %{{.*}}) : (!llvm.ptr, i32, i32, i32, i32, !llvm.ptr, i32) -> ()
   // CHECK: %[[ARRIVE_CTA:.*]] = nvg.cluster_id
-  // CHECK: %[[ARRIVE_ELECT:.*]] = nvvm.elect.sync -> i1
+  // fbtriton base reuses the table-init elect (dedup); check the reuse wiring via llvm.and
+  // CHECK: %{{.*}} = llvm.and %{{.*}}, %[[TABLE_ELECT]] : i1
   // CHECK: %[[LEADER_RANK:.*]] = llvm.and %[[ARRIVE_CTA]], %{{.*}} : i32
   // CHECK: %[[RECIPIENTS:.*]] = llvm.shl %[[ONE]], %[[LEADER_RANK]] : i32
   // CHECK: llvm.call @__triton_gsan_mbarrier_arrive(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %[[RECIPIENTS]], %[[ONE]], %[[ARRIVE_CTA]], %[[ONE]], %{{.*}}, %{{.*}}) : (!llvm.ptr, !llvm.ptr, i32, i32, i32, i32, i32, i32, !llvm.ptr, i32) -> ()
-  // CHECK: %[[WAIT_ELECT:.*]] = nvvm.elect.sync -> i1
-  // CHECK: %[[WAIT_WARP_ELECT:.*]] = llvm.and %{{.*}}, %[[WAIT_ELECT]] : i1
+  // fbtriton base reuses the table-init elect (dedup); check the reuse wiring via llvm.and
+  // CHECK: %[[WAIT_WARP_ELECT:.*]] = llvm.and %{{.*}}, %[[TABLE_ELECT]] : i1
   // CHECK: %[[WAIT_OP_PRED:.*]] = llvm.and %[[WAIT_WARP_ELECT]], %{{.*}} : i1
   // CHECK: %[[WAIT_LEADER_CTA:.*]] = nvg.cluster_id
   // CHECK: %[[WAIT_RANK_IN_GROUP:.*]] = llvm.and %[[WAIT_LEADER_CTA]], %[[ONE]] : i32

@@ -29,6 +29,7 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 using ::mlir::LLVM::AMD::getVectorSize;
+using ::mlir::LLVM::AMD::getVectorSizeIgnoringAlignment;
 using mlir::triton::amdgpu::TargetFeatures;
 
 namespace ttg = mlir::triton::gpu;
@@ -40,6 +41,21 @@ namespace mlir {
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
 namespace {
+
+// Return true iff the given value v is a tensor splatting from 1 (int).
+// The usefulness of this func stems from the fact than if a buffer-op's mask
+// operand is a all-1-tensor, it does not need to take this operand.
+bool isSplatOneConstTensor(const Value v) {
+  auto constantOp = v.getDefiningOp<arith::ConstantOp>();
+  if (!constantOp)
+    return false;
+
+  if (auto denseAttr =
+          dyn_cast<DenseIntElementsAttr>(constantOp.getValueAttr()))
+    return denseAttr.isSplat() && denseAttr.getSplatValue<APInt>().isOne();
+
+  return false;
+}
 
 bool isByteOffsetSmallerThan2GB(triton::AddPtrOp addPtrOp,
                                 std::shared_ptr<DataFlowSolver> solver) {
@@ -199,6 +215,13 @@ Value getBlockStride(Location loc, Value offset, PatternRewriter &rewriter) {
   return nullptr;
 }
 
+// Leave an atomic global when the buffer op's verifier would reject its layout.
+template <typename BufferOp> static bool bufferOpRejects(Operation *op) {
+  OperationName name(BufferOp::getOperationName(), op->getContext());
+  return ttg::getNpotLayoutUnsupportedReason(name, op->getResultTypes())
+      .has_value();
+}
+
 // Buffer ops take Optional<I32> stride. getBlockStride walks the offset chain
 // and returns the splat's scalar source, which may be i64 when the kernel uses
 // i64 indices (e.g. row * stride + col with stride in i64).
@@ -247,6 +270,8 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
     if (!canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       return rewriter.notifyMatchFailure(op, "canUseBufferOps check failed");
     }
+    if (bufferOpRejects<triton::amdgpu::BufferAtomicCASOp>(op))
+      return rewriter.notifyMatchFailure(op, "layout rejected by buffer op");
 
     switch (scope) {
     case MemSyncScope::GPU:
@@ -347,6 +372,8 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
     if (!canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       return rewriter.notifyMatchFailure(op, "canUseBufferOps check failed");
     }
+    if (bufferOpRejects<triton::amdgpu::BufferAtomicRMWOp>(op))
+      return rewriter.notifyMatchFailure(op, "layout rejected by buffer op");
 
     // 2. Check the scope. We support GPU and CTA for now (SYSTEM scope is not
     // supported yet)
@@ -464,12 +491,15 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
     auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
     Value basePtr = splatOp.getSrc();
 
+    Value maybeMask{};
+    if (op.getMask() && !isSplatOneConstTensor(op.getMask()))
+      maybeMask = op.getMask();
     Value blockStride = maybeTruncateStrideToI32(
         getBlockStride(op->getLoc(), tensorOffset, rewriter), rewriter,
         op->getLoc(), op);
     rewriter.replaceOpWithNewOp<triton::amdgpu::BufferAtomicRMWOp>(
         op, op.getVal().getType(), atomicRmwOp, basePtr, tensorOffset,
-        op.getVal(), blockStride, sem, scope, op.getMask());
+        op.getVal(), blockStride, sem, scope, maybeMask, vecSize);
 
     return success();
   }
@@ -493,18 +523,28 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       mlir::MLIRContext *context,
       DenseMap<Value, SetVector<Operation *>> &assumptions,
       ModuleAxisInfoAnalysis &axisAnalysisPass,
-      std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_)
+      std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_,
+      StringRef targetArch_)
       : mlir::OpRewritePattern<SourceOp>(context), assumptions(assumptions),
         axisAnalysisPass(axisAnalysisPass), solver(std::move(solver)),
-        analyzeSmallTensorOfst(analyzeSmallTensorOfst_) {}
+        analyzeSmallTensorOfst(analyzeSmallTensorOfst_),
+        targetArch(targetArch_) {}
   mlir::LogicalResult
   matchAndRewrite(SourceOp op, PatternRewriter &rewriter) const override {
     LDBG("Try to convert: " << op);
-    if constexpr (std::is_same_v<SourceOp, triton::LoadOp>)
-      if (op.getIsVolatile())
-        return rewriter.notifyMatchFailure(
-            op, "Unsupported volatile load in ConvertTritonLoadToBufferLoad");
+    if (op.getIsVolatile()) {
+      return rewriter.notifyMatchFailure(
+          op, "volatile access cannot use buffer ops");
+    }
     Value ptr = op.getOperand(0);
+
+    // BufferLoadOp cannot represent volatile semantics. Keep volatile
+    // tt.load operations on the generic lowering path instead of silently
+    // dropping the attribute during conversion.
+    if constexpr (std::is_same_v<SourceOp, triton::LoadOp>) {
+      if (op.getIsVolatile())
+        return rewriter.notifyMatchFailure(op, "volatile load");
+    }
 
     if (canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
@@ -515,9 +555,11 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
       Value basePtr = splatOp.getSrc();
       Value maybeOther{};
-      if (op.getOther() && !isZeroFillConst(op.getOther()))
+      if (op.getOther())
         maybeOther = op.getOther();
-      Value mask = op.getMask();
+      Value maybeMask{};
+      if (op.getMask() && !isSplatOneConstTensor(op.getMask()))
+        maybeMask = op.getMask();
       Value blockStride = maybeTruncateStrideToI32(
           getBlockStride(op->getLoc(), tensorOffset, rewriter), rewriter,
           op->getLoc(), op);
@@ -525,20 +567,28 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       auto bufferLoadOp = [&]() {
         if constexpr (std::is_same_v<SourceOp, triton::LoadOp>) {
           unsigned contig = getVectorSize(ptr, axisAnalysisPass);
-          if (mask)
+          if (canUseUnalignedVectorizedLoad(op, targetArch)) {
+            contig = std::max(
+                contig, getVectorSizeIgnoringAlignment(ptr, axisAnalysisPass));
+            if (maybeMask) {
+              auto ptrTy = cast<RankedTensorType>(ptr.getType());
+              contig = std::min<unsigned>(
+                  contig, axisAnalysisPass.getMaskAlignment(
+                              maybeMask, ttg::getOrder(ptrTy)[0]));
+            }
+          } else if (maybeMask) {
             contig = std::min<unsigned>(
-                contig, axisAnalysisPass.getMaskAlignment(mask));
+                contig, axisAnalysisPass.getMaskAlignment(maybeMask));
+          }
           return triton::amdgpu::BufferLoadOp::create(
               rewriter, op->getLoc(), op.getType(), basePtr, tensorOffset,
-              blockStride, op.getCachePolicyAttr(), mask, maybeOther, contig,
-              /*soffset=*/Value(),
-              /*scope=*/triton::MemSyncScopeAttr());
+              blockStride, op.getCachePolicyAttr(), maybeMask, maybeOther,
+              contig);
         } else {
           return triton::amdgpu::BufferLoadToLocalOp::create(
               rewriter, op->getLoc(), op.getType(), op.getResult(), basePtr,
-              tensorOffset, mask, maybeOther, blockStride,
-              op.getCachePolicyAttr(), op.getContiguity(),
-              /*soffset=*/Value(), /*scope=*/triton::MemSyncScopeAttr());
+              tensorOffset, maybeMask, maybeOther, blockStride,
+              op.getCachePolicyAttr(), op.getContiguity());
         }
       }();
 
@@ -558,6 +608,7 @@ private:
   ModuleAxisInfoAnalysis &axisAnalysisPass;
   std::shared_ptr<DataFlowSolver> solver;
   bool analyzeSmallTensorOfst;
+  std::string targetArch;
 };
 
 struct ConvertTritonStoreToBufferStore
@@ -588,19 +639,20 @@ struct ConvertTritonStoreToBufferStore
           truncateOffsetToI32(offset, rewriter, op->getLoc(), op);
       auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
       Value basePtr = splatOp.getSrc();
-      Value mask = op.getMask();
+      Value maybeMask{};
       unsigned contig = getVectorSize(ptr, axisAnalysisPass);
-      if (mask)
-        contig =
-            std::min<unsigned>(contig, axisAnalysisPass.getMaskAlignment(mask));
+      if (op.getMask() && !isSplatOneConstTensor(op.getMask())) {
+        maybeMask = op.getMask();
+        contig = std::min<unsigned>(
+            contig, axisAnalysisPass.getMaskAlignment(maybeMask));
+      }
       Value blockStride = maybeTruncateStrideToI32(
           getBlockStride(op->getLoc(), tensorOffset, rewriter), rewriter,
           op->getLoc(), op);
 
       rewriter.replaceOpWithNewOp<triton::amdgpu::BufferStoreOp>(
           op, op.getValue(), basePtr, tensorOffset, blockStride,
-          op.getCachePolicyAttr(), mask, contig, /*soffset=*/Value(),
-          /*scope=*/triton::MemSyncScopeAttr());
+          op.getCachePolicyAttr(), maybeMask, contig);
       return success();
     }
     LDBG("Failed to convert: " << op);
@@ -626,7 +678,10 @@ struct TritonAMDGPUConvertToBufferOpsPass
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     ModuleOp mod = getOperation();
-    TargetFeatures targetFeatures{llvm::StringRef(gfxArch)};
+    StringRef targetArch = gfxArch;
+    if (auto moduleArch = getAMDArch(mod))
+      targetArch = moduleArch->split(':').first;
+    TargetFeatures targetFeatures{targetArch};
 
     // Collect assumptions in the function
     DenseMap<Value, SetVector<Operation *>> assumptions =
@@ -641,15 +696,17 @@ struct TritonAMDGPUConvertToBufferOpsPass
       return signalPassFailure();
 
     AMD::ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
-    patterns.add<ConvertTritonLoadToBufferLoad<tt::LoadOp>,
-                 ConvertTritonStoreToBufferStore>(context, assumptions,
+    patterns.add<ConvertTritonLoadToBufferLoad<tt::LoadOp>>(
+        context, assumptions, axisInfoAnalysis, solver,
+        this->analyzeSmallTensorOfst, targetArch);
+    patterns.add<ConvertTritonStoreToBufferStore>(context, assumptions,
                                                   axisInfoAnalysis, solver,
                                                   this->analyzeSmallTensorOfst);
     if (targetFeatures.supportsBufferLoadToLocal()) {
       patterns
           .add<ConvertTritonLoadToBufferLoad<ttg::AsyncCopyGlobalToLocalOp>>(
               context, assumptions, axisInfoAnalysis, solver,
-              this->analyzeSmallTensorOfst);
+              this->analyzeSmallTensorOfst, targetArch);
     }
 
     if (this->allowBufferAtomics && targetFeatures.supportsBufferAtomicRMW())

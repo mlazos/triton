@@ -2,7 +2,9 @@
 #define TRITON_TRITONGPU_TRANSFORMS_PIPELINER_PIPELINING_UTILITY_H_
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <optional>
 #include <utility>
@@ -13,13 +15,10 @@ class DominanceInfo;
 class ImplicitLocOpBuilder;
 namespace triton {
 
-static const char *kNumStagesAttrName = "tt.num_stages";
-static const char *kDisallowAccMultiBufferAttrName =
-    "tt.disallow_acc_multi_buffer";
-static const char *kWarpSpecializeAttrName = "tt.warp_specialize";
 static const char *kLoopStageAttrName = "loop.stage";
 static const char *kLoopClusterAttrName = "loop.cluster";
-static const char *kScheduledMaxStageAttrName = "tt.scheduled_max_stage";
+static const char *kSkipGenericPipelineAttrName =
+    "triton.skip_generic_pipeline";
 class CoarseSchedule;
 class ModuleAxisInfoAnalysis;
 //===----------------------------------------------------------------------===//
@@ -102,6 +101,10 @@ int getCopyVecBytes(RankedTensorType registerTy,
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 
+// Whether every op that pipelining `load` through shared memory creates, an
+// async copy and a local_load, lowers its layout on its target.
+bool canPipelineInSharedMemory(triton::LoadOp load);
+
 // Serialize the latencies of the operations in the loops into the latency
 // attribute.
 void serializeLatencies(ModuleOp module, DenseMap<Operation *, int> &opLatency);
@@ -116,10 +119,9 @@ DenseMap<Operation *, int> deserializeLatencies(Operation *op);
 
 // Create an allocation for multibuffered scalars.
 Value createScalarAlloc(ImplicitLocOpBuilder &rewriter, Type type,
-                        unsigned numBuffers, bool twoCTAs = false);
+                        unsigned numBuffers);
 // Create an allocation and init the mbarriers.
-Value createBarrierAlloc(Operation *op, int numBarriers, int arriveCount = 1,
-                         bool twoCTAs = false);
+Value createBarrierAlloc(Operation *op, int numBarriers, int arriveCount = 1);
 // Create an allocation that can hold distance number of tensor shapes.
 Value createAlloc(Operation *insertBefore, RankedTensorType ty, Location loc,
                   gpu::SharedEncodingTrait sharedEnc, unsigned distance);
@@ -200,6 +202,36 @@ getLastUseOfPipelinedOp(ArrayRef<Operation *> ops, scf::ForOp forOp,
 
 // Clean up attributes passing over schedules across stages in pipelining
 void removePipeliningAttributes(ModuleOp moduleOp);
+
+// True when an `llvm.assume` dominating `loop` proves its trip count is at
+// least one, by asserting `ub > lb` (or the equivalent `lb < ub`) on the
+// loop's own bound values. Matches `tl.assume(hi > lo)` in the frontend.
+// `domInfo` is required because an assume only states a fact at its own
+// program point: one sitting after the loop, or in a region that does not
+// dominate it, proves nothing about the trip count.
+bool isLoopTripCountKnownPositive(scf::ForOp loop, DominanceInfo &domInfo);
+
+// Meta AutoWS warp-specialization predicates.
+// A loop marked tt.warp_specialize, or an op already assigned to a partition.
+bool requestsMetaWarpSpecialization(Operation *op);
+
+// Whether some op in the function requests warp specialization.
+bool isMetaWarpSpecializedFunc(triton::FuncOp funcOp);
+
+// Whether some op in the module requests Meta AutoWS, or the module is already
+// warp-specialized (e.g. TLX ttg.warp_specialize regions).
+bool moduleRequestsMetaWarpSpecialization(ModuleOp mod);
+
+// Module attribute recording the per-module TRITON_USE_META_WS decision. It is
+// set by make_ttgir (CUDA backend) and exposed to Python as
+// triton._C.libtriton.nvidia.USE_META_WS_ATTR_NAME.
+inline constexpr llvm::StringLiteral kUseMetaWSAttrName = "ttg.use_meta_ws";
+
+// The module's kUseMetaWSAttrName attribute if present, else
+// TRITON_USE_META_WS. The decision is per module: a module that requests Meta
+// AutoWS gets the Meta-WS pipeline choices on all of its loops, including
+// loops that are not themselves warp-specialized.
+bool isMetaWSEnabled(Operation *op);
 } // namespace triton
 } // namespace mlir
 

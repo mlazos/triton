@@ -24,6 +24,7 @@
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
+#include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -34,10 +35,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/ADT/SmallPtrSet.h"
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
-#include "triton/Analysis/BufferIndexAnalysis.h"
 #include "triton/Analysis/Membar.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -55,42 +54,12 @@ namespace mlir::triton {
 
 namespace {
 
-// Find the slot selection through descriptor views and single-block stage
-// yields. Unsupported producers, including loop-carried values, stay unknown.
-static triton::gpu::MemDescIndexOp resolveMemDescIndex(Value value) {
-  llvm::SmallPtrSet<Value, 8> seen;
-  while (value && seen.insert(value).second) {
-    Operation *def = value.getDefiningOp();
-    if (!def)
-      return {};
-    if (auto index = dyn_cast<triton::gpu::MemDescIndexOp>(def))
-      return index;
-    if (auto exec = dyn_cast<scf::ExecuteRegionOp>(def)) {
-      if (!llvm::hasSingleElement(exec.getRegion()))
-        return {};
-      auto yield =
-          dyn_cast<scf::YieldOp>(exec.getRegion().front().getTerminator());
-      unsigned resultNumber = cast<OpResult>(value).getResultNumber();
-      if (!yield || resultNumber >= yield.getNumOperands())
-        return {};
-      value = yield.getOperand(resultNumber);
-      continue;
-    }
-    if (!def->hasTrait<OpTrait::MemDescViewTrait>())
-      return {};
-    value = def->getOperand(0);
-  }
-  return {};
-}
-
 // Construct a virtual block describing a pipeline cluster's buffer R/W set.
 // Walks recursively so that LDS effects inside nested non-loop regions
 // (scf.if / tt.reduce / tt.scan / etc.) are accounted for.  Loops (scf.for /
 // scf.while) cannot legally appear inside a cluster, so this walk never has
 // to reason about iteration-multiplied effects.
-static BlockInfo
-buildBlockInfoFromBlock(Block *block, Allocation *allocation,
-                        BufferIndexAnalysis *bufferIndex = nullptr) {
+static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
   BlockInfo info;
   block->walk([&](MemoryEffectOpInterface mei) {
     Operation *op = mei.getOperation();
@@ -105,14 +74,6 @@ buildBlockInfoFromBlock(Block *block, Allocation *allocation,
           continue;
         auto interval = allocation->getAllocatedInterval(bufId);
         auto slice = AllocationSlice(v, interval, bufId);
-        // Retain the access's physical footprint and subview restrictions;
-        // recover only its slot expression through descriptor and stage views.
-        if (bufferIndex) {
-          if (auto indexed = resolveMemDescIndex(v))
-            slice.bufferIndexExpr =
-                bufferIndex->makeSlice(indexed.getResult(), interval, bufId)
-                    .bufferIndexExpr;
-        }
         if (isa<MemoryEffects::Write>(eff.getEffect()))
           info.syncWriteSlices[slice].insert(op);
         else if (isa<MemoryEffects::Read>(eff.getEffect()))
@@ -151,6 +112,11 @@ static bool isPipelineStage(scf::ExecuteRegionOp exec) {
 static scf::ExecuteRegionOp getPipelineStage(Operation *op) {
   auto exec = dyn_cast_or_null<scf::ExecuteRegionOp>(op);
   return isPipelineStage(exec) ? exec : nullptr;
+}
+
+static scf::ExecuteRegionOp getFlatPipelineStage(Operation *op) {
+  auto exec = getPipelineStage(op);
+  return exec && exec->hasAttr("triton.warp_pipeline.flat") ? exec : nullptr;
 }
 
 // Validate the body of a `pipelined_for` loop.  After WarpPipeliner the body
@@ -468,11 +434,9 @@ private:
       }
     }
 
-    BufferIndexAnalysis bufferIndex(forOp->getParentOfType<triton::FuncOp>());
     SmallVector<BlockInfo> clusterInfo;
     for (auto cb : clusterBlocks)
-      clusterInfo.push_back(
-          buildBlockInfoFromBlock(cb, allocation, &bufferIndex));
+      clusterInfo.push_back(buildBlockInfoFromBlock(cb, allocation));
     int numClusters = clusterInfo.size();
 
     // Check if any cluster has explicit priority.
@@ -542,7 +506,7 @@ private:
           exBar != existingBarrierMap.end()) {
         // FIXME: Non-LOCAL barriers other than group waits do not acquire
         // a local fence in wrapExistingBarrier. They must occur only where
-        // bars[i] is false.
+        // no local fence is needed.
         wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
                             anyHasPriority, emitPriorityAtBoundary);
       } else {
@@ -593,15 +557,18 @@ public:
     // Inline region.
     Block *block = &reg.front();
 
-    // Emit a scheduling barrier after every memory op in the stage so the
-    // backend scheduler keeps them in program order.
-    for (Operation &op : llvm::make_early_inc_range(*block))
-      if (readsOrWritesMemory(&op)) {
+    // Preserve the existing source-order policy unless the frontend explicitly
+    // allows the backend scheduler to reorder a stage's memory operations.
+    if (!exec->hasAttr("triton.warp_pipeline.allow_memory_reorder")) {
+      for (Operation &op : llvm::make_early_inc_range(*block)) {
+        if (!readsOrWritesMemory(&op))
+          continue;
         rewriter.setInsertionPointAfter(&op);
         ROCDL::SchedBarrier::create(
             rewriter, op.getLoc(),
             ROCDL::SchedGroupMask::non_mem_non_sideeffect);
       }
+    }
 
     Operation *terminator = block->getTerminator();
     ValueRange results = terminator->getOperands();
@@ -650,12 +617,9 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     clusterBlocks.push_back(&exec->getRegion(0).front());
   }
 
-  BufferIndexAnalysis bufferIndex(
-      clusterOps.front()->getParentOfType<triton::FuncOp>());
   SmallVector<BlockInfo> clusterInfo;
   for (auto *cb : clusterBlocks)
-    clusterInfo.push_back(
-        buildBlockInfoFromBlock(cb, allocation, &bufferIndex));
+    clusterInfo.push_back(buildBlockInfoFromBlock(cb, allocation));
 
   bool anyHasPriority = llvm::any_of(clusterOps, [](scf::ExecuteRegionOp op) {
     return op->hasAttr("triton.warp_pipeline.priority");
@@ -683,9 +647,9 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     }
 
     if (existingBarrier) {
-      // FIXME: Non-LOCAL barriers other than group waits do not acquire
-      // a local fence in wrapExistingBarrier. They must occur only where
-      // bars[i] is false.
+      // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing barrier
+      // is not enough to satisfy LDS ordering.  For now we rely on the
+      // producer to place such barriers only where no local fence is needed.
       wrapExistingBarrier(b, loc, clusterOps[i], existingBarrier,
                           anyHasPriority);
     } else {
@@ -711,18 +675,25 @@ static void processUnrolledPipelineRegions(ModuleOp m,
     if (!allocation)
       return;
 
-    // NOTE: We only iterate the function's top-level blocks; flat-pipeline
-    // execute_regions inside nested non-loop regions (e.g. scf.if bodies)
-    // are not collected.  WarpPipeliner's flat-pipeline frontend has the
-    // same scope, so the two stay in sync.
-    for (Block &block : funcOp.getBody()) {
+    // Flat pipelines can be nested in an enclosing persistent loop when their
+    // original owner loop was fully unrolled. The explicit flat attribute
+    // distinguishes those stages from stages owned by a pipelined_for loop.
+    SmallVector<Block *> blocks;
+    funcOp.walk([&](Block *block) { blocks.push_back(block); });
+    for (Block *block : blocks) {
       // Collect contiguous sequences of flat warp-pipeline execute_regions,
       // splitting at any non-ignorable, non-pipeline op.
       SmallVector<SmallVector<scf::ExecuteRegionOp>> sequences;
       SmallVector<scf::ExecuteRegionOp> current;
 
-      for (auto &op : block) {
-        if (auto exec = getPipelineStage(&op)) {
+      bool isFunctionBody = block->getParentOp() == funcOp;
+      for (auto &op : *block) {
+        auto exec = getPipelineStage(&op);
+        // Before flat stages were explicitly tagged, the frontend only
+        // produced them in the function body. Keep accepting that legacy
+        // form there; nested stages must carry the flat tag so stages owned
+        // by pipelined_for are not converted twice.
+        if (exec && (isFunctionBody || getFlatPipelineStage(&op))) {
           current.push_back(exec);
           continue;
         }
@@ -1075,6 +1046,9 @@ public:
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
+    // Reject before the ModuleAllocation below, as the allocation passes do.
+    if (failed(mlir::triton::gpu::verifyNpotTypesSupported(m)))
+      return signalPassFailure();
 
     mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());
     size_t partitionSize = targetInfo.getSharedMemoryPartitionSize();

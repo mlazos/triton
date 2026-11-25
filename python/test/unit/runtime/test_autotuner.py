@@ -6,12 +6,185 @@ import pytest
 
 import pathlib
 from triton._internal_testing import is_cuda, is_hip_cdna2, is_rubin
+from triton.backends.amd.compiler import HIPBackend
+from triton.backends.compiler import GPUTarget
+from triton.backends.nvidia.compiler import CUDABackend
+from triton.runtime import autotuner as _autotuner
 
 
 def do_bench(kernel_call, quantiles, use_cuda_graph=False):
     if use_cuda_graph:
         return triton.testing.do_bench_cudagraph(kernel_call, quantiles=quantiles)
     return triton.testing.do_bench(kernel_call, quantiles=quantiles, warmup=1, rep=1)
+
+
+@pytest.mark.parametrize(
+    "probe_ms, expected",
+    [(0.001, 10000), (0.1, 2500), (1.0, 250), (24.0, 10), (100.0, 2)],
+)
+def test_entropy_warmup_sample_budget(probe_ms, expected):
+    assert _autotuner._entropy_warmup_sample_limit(probe_ms, 250) == expected
+
+
+@pytest.mark.parametrize(
+    "rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms, expected",
+    [
+        # Wall-clock denominator: 0.06s over 550 sampling launches ~= 0.109ms/iter.
+        # The kernel average (0.027ms) must NOT be used here: the old formula
+        # sized 100/0.027 = 3703 repeats, overshooting the rep budget ~4x.
+        (100, 0.06, 550, 0.027, 916),
+        # No sampling launches: fall back to the kernel average.
+        (100, 0.0, 0, 0.027, 3703),
+        # Non-positive denominator: fixed fallback count.
+        (100, 0.0, 10, 0.0, 100),
+        # Floor of 10 repeats for slow kernels.
+        (100, 2.0, 10, 50.0, 10),
+        # Ceiling of 10000 repeats for tiny per-iteration costs (bounds the
+        # 2*n_repeat event pre-allocation in _timed_measurement).
+        (100, 0.001, 1000, 0.027, 10000),
+    ],
+)
+def test_entropy_repeat_uses_wall_clock_denominator(rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms,
+                                                    expected):
+    assert (_autotuner._entropy_repeat_count(rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms) == expected)
+
+
+def test_entropy_sampling_syncs_tail_on_early_convergence(monkeypatch):
+    # Fast convergence stops consuming partway through a 50-launch batch, but
+    # all 50 launches were issued and count toward the repeat denominator, so
+    # the final event must be synchronized before returning: otherwise the
+    # caller's wall-clock span excludes the tail's GPU time while the
+    # denominator includes it, underestimating per-iteration cost.
+    created = []
+    synced = []
+
+    class FakeEvent:
+
+        def __init__(self, enable_timing=True):
+            created.append(self)
+
+        def record(self):
+            pass
+
+        def synchronize(self):
+            synced.append(self)
+
+        def elapsed_time(self, other):
+            return 0.027
+
+    class FakeCuda:
+        Event = FakeEvent
+
+    class FakeTorch:
+        cuda = FakeCuda
+
+    monkeypatch.setattr(_autotuner._EntropyCriterion, "is_finished", lambda self: self.total_samples >= 20)
+
+    counter, avg_ms, launched = _autotuner._entropy_sampling(lambda: None, lambda: None, FakeTorch)
+
+    assert counter == 20
+    assert launched == 50
+    assert avg_ms == pytest.approx(0.027)
+    # 20 in-loop syncs plus the final tail event; the skipped middle events
+    # need no sync since the last event orders the whole batch on the stream.
+    assert len(synced) == 21
+    assert synced[-1] is created[-1]
+
+
+def test_cpu_backend_skips_cuda_entropy_benchmark(monkeypatch, fresh_knobs):
+    expected = [1.0, 0.5, 1.5]
+    calls = []
+
+    def fixed_benchmarker(kernel_call, **kwargs):
+        calls.append(kwargs)
+        return expected
+
+    class FakeCPUDriver:
+        is_cpu_backend = True
+
+        def get_benchmarker(self):
+            return fixed_benchmarker
+
+        def get_empty_cache_for_benchmark(self):
+            raise AssertionError("CPU autotuning must not use the CUDA entropy benchmarker")
+
+    monkeypatch.setattr(_autotuner.driver, "_active", FakeCPUDriver())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    fresh_knobs.autotuning.use_entropy = True
+
+    autotuner = object.__new__(_autotuner.Autotuner)
+    autotuner._do_bench = None
+    result = autotuner.do_bench(lambda: None, quantiles=(0.5, 0.2, 0.8))
+
+    assert result == expected
+    assert len(calls) == 1
+
+
+def test_config_backend_options():
+    default_config = triton.Config(kwargs={})
+    tree_config = triton.Config(kwargs={}, enable_tree_reduction=True)
+    linear_config = triton.Config(kwargs={}, enable_tree_reduction=False)
+    dependent_two_cta_config = triton.Config(kwargs={}, allowDependentTwoCTA=True)
+    packed_i32_config = triton.Config(kwargs={}, enable_nvptx_v2i32=True)
+
+    assert "enable_tree_reduction" not in default_config.all_kwargs()
+    assert "enable_nvptx_v2i32" not in default_config.all_kwargs()
+    assert tree_config.all_kwargs()["enable_tree_reduction"] is True
+    assert linear_config.all_kwargs()["enable_tree_reduction"] is False
+    assert "allowDependentTwoCTA" not in default_config.all_kwargs()
+    assert dependent_two_cta_config.all_kwargs()["allowDependentTwoCTA"] is True
+    assert packed_i32_config.all_kwargs()["enable_nvptx_v2i32"] is True
+
+    amd_backend = HIPBackend(GPUTarget("hip", "gfx942", 64))
+    assert amd_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert amd_backend.parse_options(packed_i32_config.all_kwargs()).enable_nvptx_v2i32 is True
+    assert amd_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
+    assert amd_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
+
+    h100_backend = CUDABackend(GPUTarget("cuda", 90, 32))
+    blackwell_backend = CUDABackend(GPUTarget("cuda", 100, 32))
+    assert h100_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is True
+    assert blackwell_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert h100_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
+    assert blackwell_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
+    assert blackwell_backend.parse_options(dependent_two_cta_config.all_kwargs()).allowDependentTwoCTA is True
+    assert blackwell_backend.parse_options(default_config.all_kwargs()).enable_nvptx_v2i32 is False
+    assert blackwell_backend.parse_options(packed_i32_config.all_kwargs()).enable_nvptx_v2i32 is True
+
+
+def test_c_cache_fallback_forwards_autotune_config_options():
+
+    class Param:
+        is_constexpr = False
+
+    class FakeJITFunction:
+        c_cache = True
+        arg_names = ["x"]
+        params = [Param()]
+
+        def __init__(self):
+            self.run_kwargs = None
+
+        def _get_jit_cache_proxy(self, grid):
+            return None
+
+        def run(self, *args, **kwargs):
+            self.run_kwargs = kwargs
+            return "fallback"
+
+    fn = FakeJITFunction()
+    autotuner = object.__new__(_autotuner.Autotuner)
+    autotuner.fn = fn
+    autotuner.keys = []
+    autotuner._fc_seeded = {None}
+    autotuner._last_key = None
+    config = triton.Config({}, num_warps=4, num_stages=2)
+
+    result = autotuner._try_fast_path((object(), ), {"grid": (1, )}, config)
+
+    assert result == "fallback"
+    assert fn.run_kwargs["num_warps"] == 4
+    assert fn.run_kwargs["num_stages"] == 2
 
 
 @pytest.mark.parametrize('use_cuda_graph', [False, True])
@@ -182,9 +355,8 @@ def test_hooks(device):
     # This will cause out of resources when N_STAGES = 64
     # shared memory bytes = N_STAGES * BLOCK_SIZE * sizeof(float)
     # On AMD GPUs:
-    # Software pipeliner logic anchors on dot to figure out shared layout
-    # so it will effectively ignore pipeling pure load/store right now.
-    if is_cuda():
+    # `num_stages` is a fixed value of 2, so it won't cause out of resources
+    if triton.runtime.driver.active.get_current_target().is_cuda_backend():
         assert values["has_exception"] is True
     else:
         assert values["has_exception"] is False
@@ -420,6 +592,43 @@ def test_pruned_single_config_skips_benchmark(prune_kind: str, device: str, fres
     assert _kernel.best_config == configs[1]
     assert 'run_do_bench' not in records
     assert captured == []
+
+
+def test_pruned_single_config_preserves_ir_pruning(device: str):
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+    records = {}
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
+
+    def early_config_prune(configs, named_args, **kwargs):
+        return [configs[1]]
+
+    def ir_config_prune(config, asm, metadata):
+        records['run_ir_config_prune'] = True
+        return True
+
+    def record_bench(kernel_call, quantiles):
+        records['run_do_bench'] = True
+        return do_bench(kernel_call, quantiles)
+
+    prune_configs_by = {
+        'early_config_prune': early_config_prune,
+        'ir_config_prune': ir_config_prune,
+    }
+
+    @triton.autotune(configs=configs, key=['N'], prune_configs_by=prune_configs_by, do_bench=record_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    _kernel[grid](dst, src, N=N)
+    torch.testing.assert_close(src, dst)
+    assert _kernel.best_config == configs[1]
+    assert records == {'run_do_bench': True, 'run_ir_config_prune': True}
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
@@ -724,6 +933,195 @@ def test_prune_all_configs(device):
         _kernel[grid](dst, src, N=N)
         pytest.fail("Expected exception was not thrown.")
     except triton.TritonError as e:
-        assert e is not None and str(
-            e
-        ) == "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
+        assert (
+            e is not None and str(e) ==
+            "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
+        )
+
+
+def test_autotune_dump_dir_structure(device, monkeypatch, tmp_path):
+    """Test that IR dumps during autotuning use a common base directory with readable config subdirs."""
+
+    # Set up environment for IR dumping during autotuning
+    dump_dir = tmp_path / "triton_dump"
+    dump_dir.mkdir()
+    monkeypatch.setenv("TRITON_KERNEL_DUMP", "1")
+    monkeypatch.setenv("TRITON_PRINT_AUTOTUNING", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton_cache"))
+    monkeypatch.setenv("TRITON_DUMP_DIR", str(dump_dir))
+
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    configs = [
+        triton.Config(kwargs={'BLOCK_SIZE': 32}, num_warps=4, num_stages=2),
+        triton.Config(kwargs={'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
+    ]
+
+    @triton.autotune(configs=configs, key=['N'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    _kernel[grid](dst, src, N=N)
+
+    # Verify dump directory structure
+    # Should have exactly one base hash directory
+    base_dirs = list(dump_dir.iterdir())
+    assert len(base_dirs) == 1, f"Expected 1 base directory, got {len(base_dirs)}: {base_dirs}"
+
+    # Should have subdirectories for each config with readable names
+    config_dirs = list(base_dirs[0].iterdir())
+    assert len(config_dirs) == 2, f"Expected 2 config subdirectories, got {len(config_dirs)}: {config_dirs}"
+
+    # Config subdirectory names should contain block size info
+    config_names = [d.name for d in config_dirs]
+    assert any("B_32" in name or "BLOCK_SIZE_32" in name for name in config_names), \
+        f"Expected config with BLOCK_SIZE=32, got {config_names}"
+    assert any("B_64" in name or "BLOCK_SIZE_64" in name for name in config_names), \
+        f"Expected config with BLOCK_SIZE=64, got {config_names}"
+
+    # All config subdirs should contain warps/stages/ctas info
+    for name in config_names:
+        assert "warps4" in name, f"Expected warps info in {name}"
+        assert "stages2" in name, f"Expected stages info in {name}"
+        assert "ctas1" in name, f"Expected ctas info in {name}"
+
+
+def test_dump_best_config_ir(device, tmp_path):
+    """Test TRITON_KERNEL_DUMP_BEST_CONFIG only dumps IR for best autotuned config."""
+    import os
+    from triton import knobs
+
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    configs = [
+        triton.Config(kwargs={'BLOCK_SIZE': 32}, num_warps=4, num_stages=2),
+        triton.Config(kwargs={'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
+    ]
+
+    @triton.autotune(configs=configs, key=['N'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    dump_dir = str(tmp_path / "dump")
+    os.makedirs(dump_dir, exist_ok=True)
+
+    # Save original knob values
+    original_dump_best = knobs.autotuning.dump_best_config_ir
+    original_dump_ir = knobs.compilation.dump_ir
+    original_dump_dir = knobs.cache.dump_dir
+
+    try:
+        # Enable dumping for best config only
+        knobs.autotuning.dump_best_config_ir = True
+        knobs.compilation.dump_ir = False  # Should be off initially
+        knobs.cache.dump_dir = dump_dir
+
+        grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+        _kernel[grid](dst, src, N=N)
+
+        # Verify that IR was dumped (dump_dir should contain files)
+        ttir_files = list(tmp_path.glob("dump/**/*.ttir"))
+        ttgir_files = list(tmp_path.glob("dump/**/*.ttgir"))
+        assert len(ttir_files) > 0 or len(ttgir_files) > 0, (
+            f"Expected IR files to be dumped in {dump_dir}, but found none")
+
+        # Verify that only ONE config's IR was dumped (not all configs)
+        # Each config would have its own hash directory, so we check
+        # that there's only one hash directory with IR files
+        hash_dirs = [d for d in (tmp_path / "dump").iterdir() if d.is_dir()]
+        assert len(hash_dirs) == 1, f"Expected IR for only 1 config (best), but found {len(hash_dirs)} config(s)"
+
+        # Verify correctness
+        triton.testing.assert_close(dst, src)
+
+    finally:
+        # Restore original knob values
+        knobs.autotuning.dump_best_config_ir = original_dump_best
+        knobs.compilation.dump_ir = original_dump_ir
+        knobs.cache.dump_dir = original_dump_dir
+
+
+# --- NPOT autotuner: wave-quant candidate generation + bench-path prune gating ---
+
+
+def test_wave_efficiency_and_pre_check():
+    # Full waves -> 1.0; just over a boundary -> a near-empty trailing wave.
+    assert _autotuner._wave_efficiency(64, 64) == 1.0
+    assert _autotuner._wave_efficiency(65, 64) < 0.55
+    # A cleanly-tiling pow2 shape yields no NPOT candidates (no autotune tax on POT shapes).
+    assert _autotuner._wave_quant_npot_candidates(128, 128, 1024, 1024, 64) == []
+    # A single-wave shape cannot be improved by re-tiling -> none, even when it underfills the wave.
+    assert _autotuner._wave_quant_npot_candidates(128, 128, 100, 100, 64) == []
+
+
+def test_wave_quant_candidates_target_bad_tail():
+    # 9x8 = 72 tiles over 64 units -> 2 waves, ~0.56 efficiency: a real wave-quant tail.
+    M, N, U = 1152, 1024, 64
+    cands = _autotuner._wave_quant_npot_candidates(128, 128, M, N, U)
+    assert cands, "expected NPOT candidates for a bad wave tail"
+    pow2_tiles = _autotuner._cdiv(M, 128) * _autotuner._cdiv(N, 128)
+    pow2_waves = _autotuner._cdiv(pow2_tiles, U)
+    pow2_eff = _autotuner._wave_efficiency(pow2_tiles, U)
+    for bm, bn in cands:
+        assert bm % 16 == 0 and bn % 16 == 0  # legal-snapped
+        tiles = _autotuner._cdiv(M, bm) * _autotuner._cdiv(N, bn)
+        waves = _autotuner._cdiv(tiles, U)
+        eff = _autotuner._wave_efficiency(tiles, U)
+        # every candidate strictly improves on (fewer waves, then higher efficiency)
+        assert waves < pow2_waves or (waves == pow2_waves and eff > pow2_eff)
+
+
+def test_generate_wave_quant_candidates_appends_npot_and_noop():
+    base = triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128})
+    prev = triton.knobs.language.allow_npot
+    try:
+        triton.knobs.language.allow_npot = True
+        # Clean shape -> unchanged (no tax). Unknown shape / no SMs -> no-op.
+        assert _autotuner._generate_wave_quant_candidates([base], {'M': 1024, 'N': 1024}, 64) == [base]
+        assert _autotuner._generate_wave_quant_candidates([base], {}, 64) == [base]
+        assert _autotuner._generate_wave_quant_candidates([base], {'M': 1152, 'N': 1024}, 0) == [base]
+        # Bad tail -> NPOT candidates appended; original preserved (and stays pow2).
+        out = _autotuner._generate_wave_quant_candidates([base], {'M': 1152, 'N': 1024}, 64)
+    finally:
+        triton.knobs.language.allow_npot = prev
+    assert base in out
+    assert not _autotuner._config_has_npot_block(base)
+    npot = [c for c in out if c is not base and _autotuner._config_has_npot_block(c)]
+    assert npot, "expected wave-quant NPOT candidates for a bad tail"
+
+
+def _autotune_with_failing_block(fail_block):
+    # A real compile failure: the reshape needs BLOCK to be a multiple of 64, which only 128 is.
+    @triton.autotune(configs=[triton.Config({'BLOCK': fail_block}),
+                              triton.Config({'BLOCK': 128})], key=['n'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(x_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        x = tl.reshape(tl.load(x_ptr + offs, mask=offs < n), (BLOCK // 64, 64))
+        tl.store(x_ptr + offs, tl.reshape(x, (BLOCK, )), mask=offs < n)
+
+    return _kernel
+
+
+def test_autotune_skips_npot_config_that_fails_to_compile(fresh_knobs, device):
+    fresh_knobs.language.allow_npot = True
+    kernel = _autotune_with_failing_block(96)
+    kernel[(1, )](torch.randn(128, device=device), 128)
+    assert kernel.best_config.kwargs['BLOCK'] == 128
+
+
+def test_autotune_raises_when_pow2_config_fails_to_compile(fresh_knobs, device):
+    fresh_knobs.language.allow_npot = True
+    with pytest.raises(triton.CompilationError):
+        _autotune_with_failing_block(32)[(1, )](torch.randn(128, device=device), 128)

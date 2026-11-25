@@ -306,8 +306,8 @@ void cloneReduceOp(triton::ReduceOp reduceOp,
       srcs.push_back(b.mapping.lookupOrDefault(src));
     }
     auto axis = reduceOp.getAxis();
-    auto newReduceOp =
-        triton::ReduceOp::create(b, reduceOp.getLoc(), srcs, axis);
+    auto newReduceOp = triton::ReduceOp::create(
+        b, reduceOp.getLoc(), srcs, axis, reduceOp.getReductionOrderingAttr());
     newReduceOp->setAttrs(reduceOp->getAttrs());
     if (reduceOp->hasAttr(kPartitionOutputsAttrName)) {
       newReduceOp->removeAttr(kPartitionOutputsAttrName);
@@ -333,45 +333,6 @@ void cloneReduceOp(triton::ReduceOp reduceOp,
   }
 }
 
-void cloneScanOp(triton::ScanOp scanOp, SmallVector<WarpGroupBuilder> &builders,
-                 const PartitionSet &partitions) {
-  auto partitionIndices = getPartitionIds(scanOp);
-
-  SmallVector<ScanOp> newScanOps;
-  for (size_t idx : partitionIndices) {
-    auto &b = builders[idx];
-
-    SmallVector<Value> srcs;
-    for (auto src : scanOp.getSrcs()) {
-      srcs.push_back(b.mapping.lookupOrDefault(src));
-    }
-    auto newScanOp = triton::ScanOp::create(
-        b, scanOp.getLoc(), srcs, scanOp.getAxis(), scanOp.getReverse());
-    newScanOp->setAttrs(scanOp->getAttrs());
-    if (scanOp->hasAttr(kPartitionOutputsAttrName)) {
-      newScanOp->removeAttr(kPartitionOutputsAttrName);
-    }
-    newScanOps.push_back(newScanOp);
-
-    mapRange(scanOp.getResults(), newScanOp.getResults(), b.mapping);
-
-    auto &region = newScanOp.getRegion();
-    Block *block = &region.emplaceBlock();
-    for (auto arg : scanOp.getRegion().getBlocks().front().getArguments()) {
-      auto newArg = block->addArgument(arg.getType(), arg.getLoc());
-      b.mapping.map(arg, newArg);
-    }
-
-    b.setInsertionPointToStart(block);
-  }
-
-  cloneOpsInBlock(&scanOp.getRegion().front(), builders, partitions);
-
-  for (auto [idx, newScanOp] : llvm::zip(partitionIndices, newScanOps)) {
-    builders[idx].setInsertionPointAfter(newScanOp);
-  }
-}
-
 void cloneOp(Operation *op, SmallVector<WarpGroupBuilder> &builders,
              const SetVector<int> &partitionIndices) {
   if (op->getNumRegions() != 0) {
@@ -388,8 +349,11 @@ void cloneOp(Operation *op, SmallVector<WarpGroupBuilder> &builders,
         return getPartitionOutputs(def)[result.getResultNumber()];
       }
       auto arg = cast<BlockArgument>(value);
-      auto forOp = cast<scf::ForOp>(arg.getOwner()->getParentOp());
-      return getPartitionOutputs(forOp)[arg.getArgNumber() - 1];
+      auto loop = cast<LoopLikeOpInterface>(arg.getOwner()->getParentOp());
+      unsigned resultIdx = arg.getArgNumber();
+      if (isa<scf::ForOp>(loop.getOperation()))
+        --resultIdx; // scf.for's first block argument is the induction var.
+      return getPartitionOutputs(loop)[resultIdx];
     };
     auto localPartitions = getValuePartitions(arefPhi.getLocal());
     auto remotePartitions = getValuePartitions(arefPhi.getRemote());
@@ -424,8 +388,6 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
       cloneIfOp(ifOp, builders, partitions);
     } else if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
       cloneReduceOp(reduceOp, builders, partitions);
-    } else if (auto scanOp = dyn_cast<triton::ScanOp>(op)) {
-      cloneScanOp(scanOp, builders, partitions);
     } else if (auto conditionOp = dyn_cast<scf::ConditionOp>(op)) {
       for (int idx : getPartitionIds(conditionOp)) {
         auto &builder = builders[idx];
@@ -493,13 +455,17 @@ LogicalResult triton::gpu::partitionLoop(LoopLikeOpInterface loop) {
   for (const Partition &partition : partitions.getPartitions()) {
     bool failed = false;
     auto callback = [&](OpResult output, OpOperand &use, unsigned distance) {
-      if (isa<nvws::ArefPhiOp>(use.getOwner()))
+      // Ignore fbtriton's unpartitioned inner/post-loop uses and upstream's
+      // aref.phi, which selects a partition-local operand when cloned.
+      if (!hasPartition(use.getOwner()) || isa<nvws::ArefPhiOp>(use.getOwner()))
         return;
       auto partitionIds = getPartitionIds(use.getOwner());
       if (llvm::is_contained(partitionIds, partition.getIndex()))
         return;
 
       // check if consumer partition set is a subset of the producer partitions
+      if (!hasPartition(output.getDefiningOp()))
+        return;
       auto defOpPartitionIds = getPartitionIds(output.getDefiningOp());
       bool isValidSubset = std::all_of(
           partitionIds.begin(), partitionIds.end(), [&](int consumerId) {
@@ -556,6 +522,12 @@ LogicalResult triton::gpu::partitionLoop(LoopLikeOpInterface loop) {
   SmallVector<int32_t> numWarps(numPartitions, lookupNumWarps(loop));
   auto wgOp = nvws::WarpGroupOp::create(topBuilder, resultTypes, numWarps,
                                         numPartitions);
+
+  // Preserve Meta's partition type metadata when creating the warp group.
+  if (auto typesAttr =
+          loop->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+    wgOp->setAttr(kPartitionTypesAttrName, typesAttr);
+  }
 
   SmallVector<WarpGroupBuilder> builders;
   for (Region &region : wgOp.getPartitionRegions()) {

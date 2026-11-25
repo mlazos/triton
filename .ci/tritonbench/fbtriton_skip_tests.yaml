@@ -1,0 +1,144 @@
+# Test skip list in tritonbench OSS CI
+# Usage:
+#  op: to skip an entire operator
+#    extra_args: <extra args to pass to the test>
+#    extra_bwd_args: <extra args to pass to the backward test>
+#    devices: <list of devices> (options: "cuda", "hip", "h100", "mi350", "b200", default: ["h100", "mi350"])
+#    channels: <list of triton channels> (options: "triton-main", "meta-triton", default: ["triton-main", "meta-triton"])
+# to override the default, specify devices and channels to limit combinations
+# we rely on the code to determine specific backends to skip
+#    disabled_devices: <list of devices to disable on>
+#    disabled_channels: <list of triton channels to disable on>
+#    backends: <comma-separated backends to skip via --skip> (requires disabled_devices
+#              or disabled_channels; only the listed backends are skipped instead of
+#              disabling the entire operator when the disabled_* condition matches)
+#
+# Override the skip list entirely by setting the env var TRITONBENCH_TEST_SKIP_FILE
+# to a custom yaml file path (a RuntimeError is raised if the file does not exist).
+
+# aoti_kernel requires --artifact arg; tested separately
+aoti_kernel:
+# cpu-op for testing
+test_op:
+# fb-only ops
+fp8_fused_quant_gemm_rowwise:
+flash_attention:
+  extra_bwd_args: --causal
+  report: true
+  disabled_devices:
+    - hip
+# Device specific tests
+gemm:
+  # gfx950 TLX matmul does not support backward.
+  backends: tlx_matmul_gfx950
+  disabled_devices:
+    - hip
+blackwell_attentions_mxfp8:
+  devices:
+    - b200
+  # Inherits the parent op's input shapes (input-0 is N_CTX=128), which triggers
+  # the same AutoWS compiler crash and cross-tile race on the persistent
+  # Blackwell FA path (single-trip inner loop). Run seq>=256 in CI until that is
+  # fixed. See T279315890.
+  extra_args: --seq-len 256
+blackwell_attentions:
+  devices:
+    - b200
+  # Default input-0 is N_CTX=128, which triggers an AutoWS compiler crash and a
+  # cross-tile race on the persistent Blackwell FA path (single-trip inner
+  # loop). Run seq>=256 in CI until that is fixed. See T279315890.
+  extra_args: --seq-len 256
+hstu_cross_attention_bwd:
+  devices:
+    - b200
+  # Blackwell reduce_dq backward op (autoWS / TLX 2-KV variants). The default
+  # kv-len sweep (256/384/512/1024) is heavy for CI; pin a single shape.
+  extra_args: --seq-len-kv 256
+nvfp4_gemm:
+  devices:
+    - b200
+fp32_to_mx4:
+  devices:
+    - cuda
+mx4_to_fp32:
+  devices:
+    - cuda
+# cuda covers all NVIDIA (keeps existing coverage); the literal b200 entry is
+# required for the b200-only CI filter. This exercises hstu_tlx plus the
+# default, manual-DP, and DQ-reduce AutoWS self-attention backends on b200.
+ragged_attention:
+  devices:
+    - cuda
+    - b200
+  # TritonBench still selects a BM=128, two-stage configuration for the
+  # dqreduce backend, which requires more shared memory than B200 provides. The
+  # packed QKV path is covered by py_self_attention_tlx_autows_blackwell_test
+  # with its maintained BM=64 configuration.
+  backends: hstu_triton_autows_clc,hstu_triton_autows_dqreduce
+  disabled_devices:
+    - b200
+# rms_norm subprocess segfaults on hip (exit code 11)
+rms_norm:
+  report: true
+  disabled_devices:
+    - hip
+# ============ TODO: errors in CI ============
+launch_latency:
+  backends: nop_triton_kernel_autotuned,nop_triton_kernel_autotuned_nocache
+  disabled_devices:
+    - cuda
+## torch.AcceleratorError: CUDA error: unspecified launch failure
+decoding_attention:
+  report: true
+# TODO: MSLK does not work with meta-triton
+# TypeError: failed to specialize argument of type: KernelParamWrapper
+fp8_gemm_rowwise:
+  report: true
+# TODO: jagged_mean, jagged_sum will segfault on hip
+fp8_attention:
+  report: true
+  disabled_devices:
+    - hip
+gather_gemv:
+  report: true
+  disabled_devices:
+   - hip
+# TODO: jagged_softmax will CPU OOM and cancel the entire workflow
+jagged_softmax:
+  report: true
+jagged_mean:
+  report: true
+# TODO: jagged_sum will CPU OOM and cancel the entire workflow
+jagged_sum:
+  report: true
+jagged_layer_norm:
+  report: true
+# TODO: embedding, flash_attention will segfault on hip
+embedding:
+  report: true
+  disabled_devices:
+    - hip
+# TODO: welford, jsd will segfault on hip
+welford:
+  report: true
+  disabled_devices:
+    - hip
+jsd:
+  report: true
+  disabled_devices:
+    - hip
+# limit the test ops to save CI resources
+bf16xint16_gemm:
+cross_entropy:
+gdn_fwd_h:
+geglu:
+int4_gemm:
+inductor_softmax_fused:
+softmax:
+sum:
+vector_add:
+moe_fused_mul_sum:
+mamba2_chunk_scan:
+mamba2_chunk_state:
+low_mem_dropout:
+kl_div:

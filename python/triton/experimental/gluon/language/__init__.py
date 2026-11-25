@@ -1,3 +1,5 @@
+# ruff: noqa: F401
+
 from ._core import (
     aggregate_replace,
     CachePolicy,

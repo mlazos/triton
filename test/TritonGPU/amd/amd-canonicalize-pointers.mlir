@@ -144,6 +144,56 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#blocked_buffer = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared_buffer = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem_buffer = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // Buffer ops already carry a scalar pointer and tensor offsets, but the
+  // scalar pointer can itself be a canonicalized function-argument pointer.
+  // Every buffer-op family must materialize that fat pointer at its own pointer
+  // operand (operand 1 for store/load-to-local, operand 0 otherwise).
+  tt.func @materialize_buffer_op_bases(
+      %load_ptr: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %local_ptr: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %store_ptr: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %rmw_ptr: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %cas_ptr: !tt.ptr<i32> {tt.pointer_range = 32 : i32},
+      %offsets: tensor<256xi32, #blocked_buffer>,
+      %fvalue: tensor<256xf32, #blocked_buffer>,
+      %icmp: tensor<256xi32, #blocked_buffer>,
+      %ival: tensor<256xi32, #blocked_buffer>,
+      %dest: !ttg.memdesc<256xf32, #shared_buffer, #smem_buffer, mutable>) {
+    %pid = tt.get_program_id x : i32
+    %load_base = tt.addptr %load_ptr, %pid : !tt.ptr<f32>, i32
+    %local_base = tt.addptr %local_ptr, %pid : !tt.ptr<f32>, i32
+    %store_base = tt.addptr %store_ptr, %pid : !tt.ptr<f32>, i32
+    %rmw_base = tt.addptr %rmw_ptr, %pid : !tt.ptr<f32>, i32
+    %cas_base = tt.addptr %cas_ptr, %pid : !tt.ptr<i32>, i32
+    %loaded = amdg.buffer_load %load_base[%offsets] : !tt.ptr<f32> -> tensor<256xf32, #blocked_buffer>
+    %token = amdg.buffer_load_to_local %local_base[%offsets] into %dest : !tt.ptr<f32>[tensor<256xi32, #blocked_buffer>] -> !ttg.memdesc<256xf32, #shared_buffer, #smem_buffer, mutable>
+    amdg.buffer_store %loaded, %store_base[%offsets] : !tt.ptr<f32> -> tensor<256xf32, #blocked_buffer>
+    %rmw = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %fvalue, %rmw_base[%offsets] : !tt.ptr<f32> -> tensor<256xf32, #blocked_buffer>
+    %cas = amdg.buffer_atomic_cas acq_rel, gpu, %icmp, %ival, %cas_base[%offsets] : !tt.ptr<i32> -> tensor<256xi32, #blocked_buffer>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @materialize_buffer_op_bases
+// CHECK-NOT: builtin.unrealized_conversion_cast
+// CHECK: %[[LOAD_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: amdg.buffer_load %[[LOAD_BASE]][%{{.*}}] : !tt.ptr<f32> -> tensor<256xf32, #{{.*}}>
+// CHECK: %[[LOCAL_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: amdg.buffer_load_to_local %[[LOCAL_BASE]][%{{.*}}] into %{{.*}}
+// CHECK: %[[STORE_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: amdg.buffer_store %{{.*}}, %[[STORE_BASE]][%{{.*}}] : !tt.ptr<f32> -> tensor<256xf32, #{{.*}}>
+// CHECK: %[[RMW_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %{{.*}}, %[[RMW_BASE]][%{{.*}}] : !tt.ptr<f32> -> tensor<256xf32, #{{.*}}>
+// CHECK: %[[CAS_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<i32>, i32
+// CHECK: amdg.buffer_atomic_cas acq_rel, gpu, %{{.*}}, %{{.*}}, %[[CAS_BASE]][%{{.*}}] : !tt.ptr<i32> -> tensor<256xi32, #{{.*}}>
+// CHECK-NOT: builtin.unrealized_conversion_cast
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
@@ -1193,10 +1243,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // CHECK-LABEL:   tt.func public @test_atomic_rmw(
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %[[VAL_1:.*]]: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}) {
+// CHECK:           %[[VAL_2:.*]] = arith.constant true
 // CHECK:           %[[VAL_3:.*]] = tt.get_program_id x : i32
 // CHECK:           %[[VAL_4:.*]] = tt.addptr %[[VAL_0]], %[[VAL_3]] : !tt.ptr<f16>, i32
 // CHECK:           %[[VAL_5:.*]] = tt.load %[[VAL_4]] : !tt.ptr<f16>
-// CHECK:           %[[VAL_6:.*]] = tt.atomic_rmw fadd, acq_rel, gpu, %[[VAL_1]], %[[VAL_5]] : (!tt.ptr<f16>, f16) -> f16
+// CHECK:           %[[VAL_6:.*]] = tt.atomic_rmw fadd, acq_rel, gpu, %[[VAL_1]], %[[VAL_5]], %[[VAL_2]] : (!tt.ptr<f16>, f16, i1) -> f16
 // CHECK:           tt.return
 // CHECK:         }
 
@@ -1234,10 +1285,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // CHECK-LABEL:   tt.func public @test_atomic_rmw_bf16(
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %[[VAL_1:.*]]: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}) {
+// CHECK:           %[[VAL_2:.*]] = arith.constant true
 // CHECK:           %[[VAL_3:.*]] = tt.get_program_id x : i32
 // CHECK:           %[[VAL_4:.*]] = tt.addptr %[[VAL_0]], %[[VAL_3]] : !tt.ptr<bf16>, i32
 // CHECK:           %[[VAL_5:.*]] = tt.load %[[VAL_4]] : !tt.ptr<bf16>
-// CHECK:           %[[VAL_6:.*]] = tt.atomic_rmw fadd, acq_rel, gpu, %[[VAL_1]], %[[VAL_5]] : (!tt.ptr<bf16>, bf16) -> bf16
+// CHECK:           %[[VAL_6:.*]] = tt.atomic_rmw fadd, acq_rel, gpu, %[[VAL_1]], %[[VAL_5]], %[[VAL_2]] : (!tt.ptr<bf16>, bf16, i1) -> bf16
 // CHECK:           tt.return
 // CHECK:         }
 
@@ -1610,3 +1662,50 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 // CHECK:           %[[VAL_6:.*]] = tt.load %[[VAL_5]] : tensor<1024x32x!tt.ptr<f32>>
 // CHECK:           tt.return %[[VAL_6]] : tensor<1024x32xf32>
 // CHECK:         }
+
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @add2_warp_specialized_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg5: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    ttg.warp_specialize(%arg3, %arg4, %arg5)
+    default {
+      %0 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+      %1 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+      %2 = tt.addptr %1, %0 : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+      %3 = tt.load %2 : tensor<1024x!tt.ptr<f32>, #blocked>
+      %4 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+      %5 = tt.addptr %4, %0 : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+      %6 = tt.load %5 : tensor<1024x!tt.ptr<f32>, #blocked>
+      %7 = arith.addf %3, %6 : tensor<1024xf32, #blocked>
+      %8 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+      %9 = tt.addptr %8, %0 : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+      tt.store %9, %7 : tensor<1024x!tt.ptr<f32>, #blocked>
+      ttg.warp_yield
+    }
+    partition0(%arg7: !tt.ptr<f32>, %arg8: !tt.ptr<f32>, %arg9: !tt.ptr<f32>) num_warps(1) {
+      %0 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked1>
+      %1 = tt.splat %arg7 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+      %2 = tt.addptr %1, %0 : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+      %3 = tt.load %2 : tensor<1024x!tt.ptr<f32>, #blocked1>
+      %4 = tt.splat %arg8 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+      %5 = tt.addptr %4, %0 : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+      %6 = tt.load %5 : tensor<1024x!tt.ptr<f32>, #blocked1>
+      %7 = arith.addf %3, %6 : tensor<1024xf32, #blocked1>
+      %8 = tt.splat %arg9 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+      %9 = tt.addptr %8, %0 : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+      tt.store %9, %7 : tensor<1024x!tt.ptr<f32>, #blocked1>
+      ttg.warp_return
+    } : (!tt.ptr<f32>, !tt.ptr<f32>, !tt.ptr<f32>) -> ()
+    tt.return
+  }
+}
+
+// CHECK-LABEL:   tt.func @add2_warp_specialized_kernel(
+// CHECK:           ttg.warp_specialize(%arg3, %arg4, %arg5)
+// CHECK:           default {
+// CHECK:           }
+// CHECK:           partition0(%[[VAL_7:.*]]: !tt.ptr<f32>, %[[VAL_9:.*]]: !tt.ptr<f32>, %[[VAL_10:.*]]: !tt.ptr<f32>)
+// CHECK:             %[[VAL_1:.*]] = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32

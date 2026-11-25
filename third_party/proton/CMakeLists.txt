@@ -23,13 +23,13 @@ endif()
 unset(PROTON_ROCPROFILER_SDK_HAS_HIP_GRAPH CACHE)
 set(_proton_saved_cmake_required_includes "${CMAKE_REQUIRED_INCLUDES}")
 set(CMAKE_REQUIRED_INCLUDES "${ROCPROFILER_SDK_INCLUDE_DIR};${ROCM_INCLUDE_DIR}")
-check_cxx_source_compiles([=[
-  #include <rocprofiler-sdk/fwd.h>
-  int main() {
-    auto op = ROCPROFILER_HIP_GRAPH_OPERATION_EXEC_LAUNCH;
-    return static_cast<int>(op);
-  }
-]=] PROTON_ROCPROFILER_SDK_HAS_HIP_GRAPH)
+check_cxx_source_compiles(
+  "#include <rocprofiler-sdk/fwd.h>
+int main() {
+  auto op = ROCPROFILER_HIP_GRAPH_OPERATION_EXEC_LAUNCH;
+  return static_cast<int>(op);
+}"
+  PROTON_ROCPROFILER_SDK_HAS_HIP_GRAPH)
 set(CMAKE_REQUIRED_INCLUDES "${_proton_saved_cmake_required_includes}")
 
 if(PROTON_ROCPROFILER_SDK_HAS_HIP_GRAPH)

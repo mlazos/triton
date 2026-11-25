@@ -20,10 +20,16 @@ void lowerLoops(ModuleOp moduleOp);
 
 bool hasGpuBarriers(scf::ForOp forOp);
 bool isSafeToPipeline(scf::ForOp forOp);
+// Do any preprocessing on the loop information for a given module.
+void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder);
+// TODO: Remove me and move to pass structure.
+void scheduleLoops(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS);
 llvm::MapVector<Operation *, std::pair<int, Operation *>>
 loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                          int numStages, bool filterSmall = true);
+                          int numStages,
+                          llvm::DenseMap<Operation *, int> &opLatency,
+                          bool filterSmall = true);
 
 }; // namespace gpu
 
@@ -158,7 +164,7 @@ public:
   auto begin() const { return opToStageAndCluster.begin(); }
 
   // Set <stage, cluster> based on CoarseSchedule.
-  void serialize(scf::ForOp &forOp) const;
+  void serialize(scf::ForOp &forOp, bool keepExistingMaxStage = true) const;
   // Create a CoarseSchedule based on forOp's <stage, cluster>.
   // If normalizeClusterId is true, clusters [minClusterId, maxClusterId] will
   // be remapped to [0, maxClusterId - minClusterId].
@@ -200,6 +206,14 @@ public:
     bool operator!=(const LinearizedIterator &other) const;
 
     bool isEnd() const { return atEnd; }
+
+    /// Override the maximum number of stages the iterator will traverse.
+    /// By default this is the schedule's numStages.
+    void setMaxStages(int stages) { maxStages = stages; }
+
+    /// Return the current stage limit of the iterator, which reflects
+    /// the initial op's stage plus the number of wrap-arounds.
+    int currStage() const { return currStageLimit; }
 
     /// Advance the iterator to the next operation that satisfies the optional
     /// predicate. Returns the found operation, or std::nullopt if not found.

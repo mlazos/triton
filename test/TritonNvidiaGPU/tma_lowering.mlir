@@ -18,39 +18,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[1, 0]]}>
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
-  // Synchronize both CTAs after a non-pipelined TMA load in a two-CTA MMA module.
-  // CHECK-LABEL: @tma_load_two_cta(
-  // CHECK: ttng.async_tma_copy_global_to_local
-  // CHECK: ttng.wait_barrier
-  // CHECK-NEXT: ttng.cluster_barrier
-  // CHECK-NEXT: ttng.inval_barrier
-  // CHECK-NEXT: {{.*}}ttg.local_load
-  tt.func public @tma_load_two_cta(%desc: !tt.tensordesc<256x64xf16, #shared>, %offset: i32) -> tensor<256x64xf16, #blocked> {
-    %value = tt.descriptor_load %desc[%offset, %offset] : !tt.tensordesc<256x64xf16, #shared> -> tensor<256x64xf16, #blocked>
-    tt.return %value : tensor<256x64xf16, #blocked>
-  }
-}
-
-// -----
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[1, 0]]}>
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // Keep non-pipelined TMA waits local when cluster CTAs execute independently.
-  // CHECK-LABEL: @tma_load_independent_ctas(
-  // CHECK: ttng.async_tma_copy_global_to_local
-  // CHECK: ttng.wait_barrier
-  // CHECK-NEXT: ttng.inval_barrier
-  // CHECK-NEXT: {{.*}}ttg.local_load
-  tt.func public @tma_load_independent_ctas(%desc: !tt.tensordesc<256x64xf16, #shared>, %offset: i32) -> tensor<256x64xf16, #blocked> {
-    %value = tt.descriptor_load %desc[%offset, %offset] : !tt.tensordesc<256x64xf16, #shared> -> tensor<256x64xf16, #blocked>
-    tt.return %value : tensor<256x64xf16, #blocked>
-  }
-}
-
-// -----
 #nvmma_128 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -82,6 +49,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c8_i32 = arith.constant 8 : i32
     %0 = arith.extsi %arg2 : i32 to i64
     %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<8x32xi8, #nvmma_32>
+    tt.return %1 : !tt.tensordesc<8x32xi8, #nvmma_32>
+  }
+}
+
+// -----
+#nvmma_32 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: make_tensor_descriptor_with_desc_ptr
+  // CHECK-NOT: ttg.global_scratch_alloc
+  // CHECK: ttng.tensormap_create %arg3
+  // CHECK: ttng.tensormap_fenceproxy_acquire %arg3
+  // CHECK: ttng.reinterpret_tensor_descriptor %arg3
+  tt.func public @make_tensor_descriptor_with_desc_ptr(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}, %arg3: !tt.ptr<i8> {tt.divisibility = 16 : i32}) -> !tt.tensordesc<8x32xi8, #nvmma_32> {
+    %c1_i64 = arith.constant 1 : i64
+    %cst = arith.constant dense<32> : tensor<8x1xi32>
+    %c64_i32 = arith.constant 64 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %0 = arith.extsi %arg2 : i32 to i64
+    %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64], descPtr = %arg3 : !tt.ptr<i8> : !tt.ptr<i8>, !tt.tensordesc<8x32xi8, #nvmma_32>
     tt.return %1 : !tt.tensordesc<8x32xi8, #nvmma_32>
   }
 }
@@ -132,8 +119,60 @@ tt.func @tma_scatter(%arg0: !tt.tensordesc<1x128xbf16, #nvmma_128>, %arg1: tenso
   // CHECK-NEXT: ttng.async_tma_store_wait {pendings = 0 : i32}
   tt.descriptor_scatter %arg0[%arg1, %arg2], %arg3 : !tt.tensordesc<1x128xbf16, #nvmma_128>, tensor<32xi32, #offsets>, i32, tensor<32x128xbf16, #blocked1>
   tt.return
+  }
+
 }
 
+// -----
+
+#nvmma_32 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // Test that MakeTensorDescOp without descPtr has no memory effects (pure)
+  // This enables CSE - duplicate operations with identical inputs can be eliminated
+  // CHECK-LABEL: make_tensor_descriptor_pure
+  tt.func public @make_tensor_descriptor_pure(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}) -> !tt.tensordesc<8x32xi8, #nvmma_32> {
+    %c1_i64 = arith.constant 1 : i64
+    %0 = arith.extsi %arg2 : i32 to i64
+    // Without descPtr, the operation has no observable side effects
+    // Both calls have identical inputs, so CSE should eliminate one
+    %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<8x32xi8, #nvmma_32>
+    %2 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<8x32xi8, #nvmma_32>
+    // CHECK: %[[ALLOC:.*]] = ttg.global_scratch_alloc
+    // CHECK: ttng.tensormap_create %[[ALLOC]]
+    // CHECK: ttng.tensormap_fenceproxy_acquire %[[ALLOC]]
+    // CHECK: %[[DESC:.*]] = ttng.reinterpret_tensor_descriptor %[[ALLOC]]
+    // CHECK-NOT: ttg.global_scratch_alloc
+    // CHECK-NOT: ttng.tensormap_create
+    // Both operations should be CSE'd into a single descriptor due to purity
+    tt.return %1 : !tt.tensordesc<8x32xi8, #nvmma_32>
+  }
+}
+
+// -----
+
+#nvmma_32 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // Test that MakeTensorDescOp with descPtr has memory effects (impure)
+  // This prevents CSE - operations writing to different locations must be preserved
+  // CHECK-LABEL: make_tensor_descriptor_impure
+  tt.func public @make_tensor_descriptor_impure(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}, %arg3: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg4: !tt.ptr<i8> {tt.divisibility = 16 : i32}) -> (!tt.tensordesc<8x32xi8, #nvmma_32>, !tt.tensordesc<8x32xi8, #nvmma_32>) {
+    %c1_i64 = arith.constant 1 : i64
+    %0 = arith.extsi %arg2 : i32 to i64
+    // With descPtr, the operation writes to global memory (impure)
+    // Both operations write to different locations (arg3 vs arg4), so both must be preserved
+    %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64], descPtr = %arg3 : !tt.ptr<i8> : !tt.ptr<i8>, !tt.tensordesc<8x32xi8, #nvmma_32>
+    %2 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64], descPtr = %arg4 : !tt.ptr<i8> : !tt.ptr<i8>, !tt.tensordesc<8x32xi8, #nvmma_32>
+    // CHECK: ttng.tensormap_create %arg3
+    // CHECK: ttng.tensormap_fenceproxy_acquire %arg3
+    // CHECK: %[[DESC1:.*]] = ttng.reinterpret_tensor_descriptor %arg3
+    // CHECK: ttng.tensormap_create %arg4
+    // CHECK: ttng.tensormap_fenceproxy_acquire %arg4
+    // CHECK: %[[DESC2:.*]] = ttng.reinterpret_tensor_descriptor %arg4
+    // Both operations must be preserved (no CSE) due to impurity
+    tt.return %1, %2 : !tt.tensordesc<8x32xi8, #nvmma_32>, !tt.tensordesc<8x32xi8, #nvmma_32>
+  }
 }
 
 // -----
@@ -207,6 +246,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %8 = ttng.warp_group_dot %3, %7, %cst_0 {isAsync = true} : !ttg.memdesc<64x32xf32, #shared, #smem> * !ttg.memdesc<32x32xf32, #shared, #smem> -> tensor<64x32xf32, #mma1>
     %9:3 = ttng.warp_group_dot_wait %8, %3, %7 {pendings = 0 : i32} : tensor<64x32xf32, #mma1>, !ttg.memdesc<64x32xf32, #shared, #smem>, !ttg.memdesc<32x32xf32, #shared, #smem>
     tt.return %9 : tensor<64x32xf32, #mma1>
+  }
+}
+
+// -----
+
+#fp6 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, fp6Padded = true}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @fp6_descriptor_load
+  // CHECK: ttng.barrier_expect {{.*}}, 12288,
+  // CHECK: ttng.async_tma_copy_global_to_local
+  // CHECK: ttng.wait_barrier
+  // CHECK-NOT: ttg.local_load
+  // CHECK: tt.return
+  tt.func @fp6_descriptor_load(%desc: !tt.tensordesc<128x128xi8, #fp6>, %offset: i32) -> !ttg.memdesc<128x128xi8, #fp6, #smem, mutable> {
+    %value = tt.descriptor_load %desc[%offset, %offset] : !tt.tensordesc<128x128xi8, #fp6> -> tensor<128x128xi8, #blocked>
+    %tile = ttg.local_alloc %value : (tensor<128x128xi8, #blocked>) -> !ttg.memdesc<128x128xi8, #fp6, #smem, mutable>
+    tt.return %tile : !ttg.memdesc<128x128xi8, #fp6, #smem, mutable>
+  }
+
+  // CHECK-LABEL: @fp6_make_descriptor
+  // CHECK: ttng.tensormap_create {{.*}} {elem_type = 15 : i32,
+  tt.func @fp6_make_descriptor(%base: !tt.ptr<i8>, %m: i32, %k: i32, %stride: i64) -> !tt.tensordesc<128x128xi8, #fp6> {
+    %one = arith.constant 1 : i64
+    %desc = tt.make_tensor_descriptor %base, [%m, %k], [%stride, %one] : !tt.ptr<i8>, !tt.tensordesc<128x128xi8, #fp6>
+    tt.return %desc : !tt.tensordesc<128x128xi8, #fp6>
   }
 }
 

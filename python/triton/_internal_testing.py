@@ -19,7 +19,6 @@ import resource
 from triton._compile_warmup_state import is_compile_warmup
 
 from numpy.random import RandomState
-from triton.backends import backends
 from triton.runtime.jit import TensorWrapper, reinterpret, type_canonicalisation_dict
 
 int_dtypes = ['int8', 'int16', 'int32', 'int64']
@@ -67,14 +66,15 @@ def random_float(*, warmup_value=0.5, **kwargs):
 def get_current_target():
     if is_interpreter():
         return None
-    if not any(backend.driver.is_active() for backend in backends.values()):
+    try:
+        return triton.runtime.driver.active.get_current_target()
+    except RuntimeError:
         return None
-    return triton.runtime.driver.active.get_current_target()
 
 
 def is_cuda():
     target = get_current_target()
-    return False if target is None else target.backend == "cuda"
+    return False if target is None else target.is_cuda_backend()
 
 
 def is_ampere_or_newer():
@@ -189,6 +189,11 @@ def is_xpu():
     return False if target is None else target.backend == "xpu"
 
 
+def is_cpu():
+    target = get_current_target()
+    return False if target is None else target.backend == "cpu"
+
+
 def numpy_random(shape, dtype_str, rs: Optional[RandomState] = None, low=None, high=None):
     """
     Override `rs` if you're calling this function twice and don't want the same
@@ -295,9 +300,19 @@ def tma_skip_msg(byval_only=False):
         return "Requires advanced TMA support (NVIDIA Hopper or higher, CUDA 12.3 or higher)"
 
 
-# Evaluate hardware requirements when pytest runs the test, so importing the
-# process helpers does not initialize CUDA before a worker's startup code.
-requires_tma = pytest.mark.skipif("not __import__('triton')._internal_testing.supports_tma()", reason=tma_skip_msg())
+_requires_tma = None
+
+
+def __getattr__(name):
+    # requires_tma resolves lazily: supports_tma() queries the GPU, which
+    # initializes CUDA. Evaluating it at import would break no-CUDA-at-import
+    # for importers such as triton_kernels.
+    if name == "requires_tma":
+        global _requires_tma
+        if _requires_tma is None:
+            _requires_tma = pytest.mark.skipif(not supports_tma(), reason=tma_skip_msg())
+        return _requires_tma
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def default_alloc_fn(size: int, align: int, _):
@@ -310,6 +325,41 @@ def unwrap_tensor(t: Union[torch.Tensor, triton.runtime.jit.TensorWrapper]) -> t
     return t
 
 
+def swizzle_scale_to_5d(scale, outer_chunks, k_chunks):
+    """Convert raw block scales to the swizzled 5D TMA layout.
+
+    Applies the cuBLAS block scaling layout within each 128x4 block.
+    dest[row%32 * 16 + row//32 * 4 + col] = src[row, col]
+
+    Args:
+        scale: Raw scale tensor of shape (batch, rows, scale_cols).
+        outer_chunks: Number of 128-row chunks (rows // 128).
+        k_chunks: Number of 4-column scale chunks (ceil(scale_cols / 4)).
+
+    Returns:
+        Swizzled 5D tensor of shape (batch, outer_chunks, k_chunks, 2, 256).
+    """
+    batch = scale.shape[0]
+    cols = scale.shape[2]
+    padded_cols = k_chunks * 4
+
+    if cols < padded_cols:
+        scale = torch.nn.functional.pad(scale, (0, padded_cols - cols))
+
+    blocks = (scale.reshape(batch, outer_chunks, 128, k_chunks,
+                            4).permute(0, 1, 3, 2, 4).reshape(batch, outer_chunks, k_chunks, 512))
+
+    _r = torch.arange(128)
+    _c = torch.arange(4)
+    _rg, _cg = torch.meshgrid(_r, _c, indexing="ij")
+    idx = ((_rg % 32) * 16 + (_rg // 32) * 4 + _cg).reshape(-1)
+    idx = idx.to(scale.device).expand_as(blocks)
+    output = torch.empty_like(blocks)
+    output.scatter_(-1, idx, blocks)
+
+    return output.reshape(batch, outer_chunks, k_chunks, 2, 256)
+
+
 @dataclass
 class ProcessResult:
     exc: None | BaseException
@@ -320,9 +370,9 @@ def _call_in_process(client_fn, args, kwargs, env, stderr_file, compilation_list
     if env is not None:
         os.environ.update(env)
 
-    # Avoid initializing the GPU driver before the callback's startup code.
-    # The HIP build of PyTorch needs abort-on-device-assert disabled.
-    if not is_interpreter() and torch.version.hip is not None:
+    # By defaul AMD runtime calls abort on device assert.
+    # Following forces hip rutime to skip abort call.
+    if is_hip():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         os.environ["HIP_SKIP_ABORT_ON_GPU_ERROR"] = "1"
 
@@ -337,8 +387,7 @@ def _call_in_process(client_fn, args, kwargs, env, stderr_file, compilation_list
         try:
             client_fn(*args, **kwargs)
             # Raise any CUDA errors
-            if not is_interpreter():
-                torch.cuda.synchronize()
+            torch.cuda.synchronize()
         except Exception as e:
             exc = e
         finally:
@@ -542,37 +591,3 @@ def _fresh_knobs_impl(skipped_attr: Optional[Set[str]] = None):
         knobs.propagate_env = prev_propagate_env
 
     return fresh_function, reset_function
-
-
-def assert_no_collectives_in_ptx_loop(ptx):
-    # Block order does not imply a loop: LLVM may place the exit before the
-    # header. Follow branches and fallthroughs to identify actual cycles.
-    lines = [line.partition("//")[0].strip() for line in ptx.splitlines()]
-    labels = {line[:-1]: i for i, line in enumerate(lines) if re.fullmatch(r"\$\w+:", line)}
-    successors = [{i + 1} if i + 1 < len(lines) else set() for i in range(len(lines))]
-    branches = []
-    for i, line in enumerate(lines):
-        branch = re.fullmatch(r"(@!?%\w+\s+)?bra(?:\.uni)?\s+(\$\w+);", line)
-        if branch:
-            successors[i] = {labels[branch[2]]} | (successors[i] if branch[1] else set())
-            branches.append(i)
-        elif re.fullmatch(r"(?:ret|exit)(?:\.uni)?;", line):
-            successors[i] = set()
-
-    def on_cycle(start):
-        pending = list(successors[start])
-        visited = set()
-        while pending:
-            node = pending.pop()
-            if node == start:
-                return True
-            if node not in visited:
-                visited.add(node)
-                pending.extend(successors[node])
-        return False
-
-    assert any(on_cycle(branch) for branch in branches), "Expected a polling loop"
-    for i, line in enumerate(lines):
-        if any(op in line for op in ("bar.sync", "barrier.sync", "barrier.cluster", "bar.warp.sync", "bar.red",
-                                     "barrier.red", "shfl.sync", "vote.sync")):
-            assert not on_cycle(i), "Collective instruction inside a polling loop"

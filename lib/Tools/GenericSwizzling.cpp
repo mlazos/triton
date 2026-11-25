@@ -500,7 +500,7 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   LinearLayout basis1D({{vecAttr, unflatten(vbasis)},
                         {bankAttr, unflatten(bbasis)},
                         {segAttr, unflatten(sbasis)},
-                        {blockAttr, unflatten(blockBases)}},
+                        {blockAttr, unflatten(nonZeroBlockBases)}},
                        src.getOutDims(), /*requireSurjective=*/true);
   basis1D = buildReps(ctx, src, dst, basis1D, leaveReps);
 
@@ -515,7 +515,8 @@ getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
   auto kBlock = StringAttr::get(ctx, "block");
   auto regSrc = flatten(srcFlat, kReg);
   auto regDst = flatten(dstFlat, kReg);
-  auto blockSrc = flatten(srcFlat, kBlock);
+  auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
+                                                      : SmallVector<int32_t>{};
 
   auto dim = srcFlat.getTotalOutDimSizeLog2();
   SmallVector<int32_t> vbasis = intersectionBasis(regSrc, regDst, dim);
@@ -621,7 +622,8 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
   auto regDst = flatten(dstFlat, kReg);
   auto laneSrc = flatten(srcFlat, kLane);
   auto laneDst = flatten(dstFlat, kLane);
-  auto blockSrc = flatten(srcFlat, kBlock);
+  auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
+                                                      : SmallVector<int32_t>{};
 
   auto [vbasis, srcFillsBank] = getVecBasisLdSt(srcFlat, dstFlat, bitwidth);
   auto vecSize = 1 << vbasis.size();
@@ -739,7 +741,10 @@ optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   auto regDst = flatten(dstFlat, kReg);
   auto laneSrc = flatten(srcFlat, kLane);
   auto laneDst = flatten(dstFlat, kLane);
-  auto blockBases = flatten(srcFlat, kBlock);
+  auto blockBases = srcFlat.getBases().contains(kBlock)
+                        ? flatten(srcFlat, kBlock)
+                        : SmallVector<int32_t>{};
+  auto blockSrcSet = SetVector<int32_t>(llvm::from_range_t{}, blockBases);
   // Get the associated src/dst tiles for each instruction if they exist
   SmallVector<std::tuple<std::pair<int32_t, int32_t>, SmallVector<int32_t>,
                          SmallVector<int32_t>, SmallVector<int32_t>, int32_t>>
@@ -775,9 +780,9 @@ optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
     // We choose the pair of instructions that minimises the total bank
     // conflicts
     for (auto [instrs, vbasis, tileSrc, tileDst, leaveReps] : tiles) {
-      auto smem =
-          optimalSwizzling(srcFlat, dstFlat, bitwidth, vbasis, tileSrc, tileDst,
-                           blockBases, src.getOutDims(), leaveReps);
+      auto smem = optimalSwizzling(srcFlat, dstFlat, bitwidth, vbasis, tileSrc,
+                                   tileDst, blockSrcSet.getArrayRef(),
+                                   src.getOutDims(), leaveReps);
       auto [read, write] = bankConflicts(tileSrc, tileDst, smem);
       smems.push_back({read + write, smem, {instrs.first, instrs.second}});
     }

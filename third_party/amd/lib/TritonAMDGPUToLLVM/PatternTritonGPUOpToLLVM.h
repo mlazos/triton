@@ -4,17 +4,45 @@
 #include "TargetInfo.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+
+#include <memory>
+#include <utility>
+
+namespace mlir::triton {
+class DistributedCoordinateGroups;
+}
 
 namespace mlir::triton::AMD {
+
+// Operand pins stay pure through MLIR CSE. The late operand finalizer adds
+// side-effect ordering before LLVM optimization and removes this marker.
+inline constexpr llvm::StringLiteral kScheduledMfmaOperandPinAttrName =
+    "ttg.amdg.scheduled_mfma_operand_pin";
+
+// Preserve operand-ordering eligibility before conversion erases load origins,
+// and result pins whose consumers are only known after the module is lowered.
+struct ScheduledMfmaLoweringState {
+  DenseSet<Operation *> operandOrderEligibleOps;
+  SmallVector<std::pair<Operation *, int>> resultPins;
+  DenseMap<Operation *, int> commitWaitStates;
+};
+
+void finalizeScheduledMfmaLowering(const ScheduledMfmaLoweringState &state);
+
 void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            const TargetInfo &targetInfo,
                                            RewritePatternSet &patterns,
                                            PatternBenefit benefit);
 
-void populateMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
-                                    RewritePatternSet &patterns,
-                                    const TargetInfo &targetInfo,
-                                    PatternBenefit benefit);
+void populateMemoryOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    const TargetInfo &targetInfo, PatternBenefit benefit,
+    std::shared_ptr<mlir::triton::DistributedCoordinateGroups> coordinateGroups,
+    ScheduledMfmaLoweringState &scheduledMfmaState);
 
 void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  RewritePatternSet &patterns,
@@ -41,6 +69,12 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        RewritePatternSet &patterns,
                                        ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                        PatternBenefit benefit);
+
+void populateBarrierOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
+                                     const TargetInfo &targetInfo,
+                                     RewritePatternSet &patterns,
+                                     ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                     PatternBenefit benefit);
 
 void populateSPMDOpToLLVMPattern(LLVMTypeConverter &typeConverter,
                                  RewritePatternSet &patterns,

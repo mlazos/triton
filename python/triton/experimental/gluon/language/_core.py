@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 from ._layouts import (SharedLayout, DistributedLayout, BlockedLayout, DotOperandLayout, AutoLayout, CoalescedLayout,
                        SharedLinearLayout, _get_shape_per_cta)
 from triton._C.libtriton import ir
+from triton._utils import is_power_of_two
 import triton.language.core as tl_core
 from triton.language.core import (
     _CachePolicy as CachePolicy,
@@ -206,7 +207,7 @@ def inline_asm(asm, constraints="", args=(), result_types=(), is_pure=False, _se
 
 @builtin
 def load(pointer, mask=None, other=None, *, cache_modifier=None, eviction_policy=None, volatile=False,
-         cache_policy=None, _semantic=None):
+         cache_policy=None, latency=None, _semantic=None):
     """Load from memory, optionally using a cache policy."""
     mask = _unwrap_if_constexpr(mask)
     other = _unwrap_if_constexpr(other)
@@ -215,8 +216,9 @@ def load(pointer, mask=None, other=None, *, cache_modifier=None, eviction_policy
     if other is not None:
         other = _semantic.to_tensor(other)
     volatile = _unwrap_if_constexpr(volatile)
+    latency = _unwrap_if_constexpr(latency)
     cache_policy = _normalize_cache_policy(cache_policy, cache_modifier, eviction_policy)
-    return _semantic.load(pointer, mask, other, cache_policy, volatile)
+    return _semantic.load(pointer, mask, other, cache_policy, volatile, latency)
 
 
 @builtin
@@ -236,6 +238,10 @@ class distributed_type(block_type):
         layout = _unwrap_if_constexpr(layout)
         shape = _unwrap_if_constexpr(shape)
         super().__init__(element_ty, shape)
+        # TRITON_ALLOW_NPOT allows NPOT shapes only on layout-less tensors.
+        for i, d in enumerate(self.shape):
+            if not is_power_of_two(d):
+                raise ValueError(f"Shape element {i} must be a power of 2")
         self.layout = layout
         self.name = f"<{self.shape}, {self.element_ty}, {self.layout}>"
         assert isinstance(layout, DistributedLayout), "tensor layout must be a DistributedLayout"
@@ -320,8 +326,7 @@ class shared_memory_descriptor_type(base_type):
 
     def mangle(self) -> str:
         shape_str = "_".join([str(s) for s in self.shape])
-        alloc_shape_str = "_".join([str(s) for s in self.alloc_shape])
-        return f"MD{self.element_ty.mangle()}S{shape_str}SL{self.layout.mangle()}LAS{alloc_shape_str}ASMD"
+        return f"MD{self.element_ty.mangle()}S{shape_str}SL{self.layout.mangle()}LAS{self.alloc_shape}ASMD"
 
 
 def _add_atomic_scatter_docstring(kind: str) -> Callable[[T], T]:

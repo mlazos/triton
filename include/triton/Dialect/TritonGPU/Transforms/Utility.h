@@ -1,15 +1,21 @@
 #ifndef TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 #define TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/Support/MathExtras.h"
 #include <algorithm>
 #include <functional>
 #include <numeric>
 #include <optional>
+#include <string>
+#include <utility>
 
 namespace mlir {
 class DominanceInfo;
@@ -22,6 +28,13 @@ class StoreOp;
 class FuncOp;
 namespace gpu {
 class SwizzledSharedEncodingAttr;
+
+// Prove that two partition-local loop nests execute the same iterations.
+// Both arrays are ordered innermost first. Compare from the outside in so
+// corresponding induction variables can stand in for one another in inner
+// bounds, including triangular nests; resolve warp-specialize captures.
+bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
+                                           ArrayRef<scf::ForOp> rhs);
 
 // True when `op` implements EfficientLayoutOpInterface and has pinned its
 // result layout.
@@ -37,15 +50,23 @@ inline bool hasEfficientLayout(Operation *op) {
 // Version = 1: <m, n>
 // Version = 2: <1, m, n>
 // Version = 3: <m, n, k>
-SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
-                                                const ArrayRef<int64_t> &shape,
-                                                Type type, int numWarps);
+// For version 3, isLegalN (if set) picks the largest n the operands can be
+// tiled by, falling back to the unfiltered pick when there is none.
+SmallVector<unsigned, 3>
+mmaVersionToInstrShape(int version, const ArrayRef<int64_t> &shape, Type type,
+                       int numWarps,
+                       function_ref<bool(unsigned)> isLegalN = nullptr);
 
-// Gets the order of a tensor from its contiguity. Places the dimensions with
-// the largest contiguity as the inner most dimension. If the contiguity is
-// all ones, returns the order {dim - 1, dim - 2, ..., 0}
-SmallVector<unsigned, 4>
-getOrderFromContiguity(const SmallVector<int64_t> &contiguity);
+// Under TRITON_ALLOW_NPOT, whether MMAv3's warpgroups go on N: splitting an
+// NPOT M would leave a warpgroup a share that is not a multiple of 64.
+bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps);
+
+// Why `warps` of `instrShape` can't sit on each dim's power-of-two part, as
+// the mixed-radix layout puts them, or std::nullopt.
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape);
 
 // Return the operand used to access the memory in the operation
 Value getMemAccessPtr(Operation *op);
@@ -53,15 +74,70 @@ Value getMemAccessPtr(Operation *op);
 // Return bitwidth of tensor element
 unsigned getElementBitWidth(RankedTensorType type);
 
+// True if `encoding` is, or nests anywhere, an encoding implementing
+// ttg::PinnedEncodingTrait. Frontends may wrap a pinned encoding in another
+// layout attribute (for example #tlx.no_verify_layout<#tlx.user_layout<...>>),
+// so callers that enforce hard user layout anchors need to recurse through the
+// attribute tree instead of checking only the top-level encoding.
+bool containsPinnedEncoding(Attribute encoding);
+
 // Calculate the optimal number of elements per thread for a given operation
 // along an axis with greatest continuity.
 unsigned
 getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                         triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                        ArrayRef<int64_t> shape);
+                        ArrayRef<int64_t> shape, unsigned maxVecBits = 128);
+
+inline bool hasNpotShape(RankedTensorType ty) {
+  return llvm::any_of(ty.getShape(), [](int64_t d) {
+    return d > 0 && !llvm::isPowerOf2_64(d);
+  });
+}
+
+// Whether this encoding supports modular LinearLayouts.
+inline bool npotSafeForLinearLayout(Attribute encoding) {
+  if (!encoding) {
+    return false;
+  }
+  if (isa<triton::gpu::BlockedEncodingAttr, triton::gpu::LinearEncodingAttr>(
+          encoding)) {
+    return true;
+  }
+  if (auto mma = dyn_cast<triton::gpu::NvidiaMmaEncodingAttr>(encoding)) {
+    return mma.getVersionMajor() >= 2;
+  }
+  if (auto dotOp = dyn_cast<triton::gpu::DotOperandEncodingAttr>(encoding)) {
+    return npotSafeForLinearLayout(dotOp.getParent());
+  }
+  if (auto slice = dyn_cast<triton::gpu::SliceEncodingAttr>(encoding)) {
+    return npotSafeForLinearLayout(slice.getParent());
+  }
+  if (isa<triton::gpu::SharedEncodingTrait>(encoding)) {
+    return true;
+  }
+  return false;
+}
 
 // Returns whether the op is a "view op", i.e. doesn't move any data
 bool isView(Operation *op);
+
+// Returns whether `op` reinterprets a memdesc without changing the underlying
+// allocation, i.e. carries MemDescViewTrait. Using the trait rather than an
+// `isa<>` list keeps the answer from drifting as view ops are added.
+// `ttng.map_to_remote_buffer` also carries the trait but names another CTA's
+// copy of the buffer, so it is excluded: a walker asking "which allocation is
+// this" must not cross a CTA boundary.
+bool isMemDescView(Operation *op);
+
+// Walks `v` back through memdesc view ops to the value they ultimately view.
+// Different slots and views of one multi-buffered allocation share a root.
+Value getMemDescRoot(Value v);
+
+// Returns the nearest `ttg.memdesc_index` selecting `v`'s buffer, looking
+// through the other view ops. Null when `v` is not a view into a buffer array.
+// Unlike getMemDescRoot this stops at the index instead of crossing it, because
+// callers use it to recover the buffer array itself (e.g. its depth).
+triton::gpu::MemDescIndexOp getMemDescBufferIndex(Value v);
 
 // Returns whether the op is a "noop op", i.e. has one input and one output
 // and lowers to llvm as the identity function (returns the input)
@@ -109,6 +185,8 @@ public:
   std::string dump(triton::FuncOp func) const;
   void dumpToFile(triton::FuncOp func, const std::string &filename) const;
 
+  virtual ~GraphDumper() = default; // Facebook
+
 protected:
   std::string getShapeStr(const Type &type) const;
 
@@ -140,6 +218,8 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding);
 Attribute inferSrcEncoding(Operation *op, Attribute encoding);
 
 bool isExpensiveLoadOrStore(Operation *op);
+
+bool isExpensiveLocalLoad(Operation *op);
 
 // Return true if an operation may be cloned by layout rematerialization.
 bool canBeRematerialized(Operation *op);
@@ -184,6 +264,78 @@ scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
 // Append the given |newOperands| to the |forOp|'s yield op.
 void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands);
 
+//===----------------------------------------------------------------------===//
+// Loop-kind-agnostic helpers (scf.for / scf.while)
+//
+// AutoWS historically assumed every loop was an scf.for, where a loop's
+// init[k], regionIterArg[k], yieldOperand[k] and result[k] are all 1:1 aligned
+// and body argument 0 is the induction variable. That alignment does not hold
+// for scf.while, which has two regions ("before" ending in scf.condition,
+// "after" ending in scf.yield), no induction variable, and results that align
+// with the scf.condition forwarded operands rather than the scf.yield. These
+// helpers hide those differences so call sites can treat both uniformly.
+//===----------------------------------------------------------------------===//
+
+// One loop-carried value, identified by its iter-arg slot index `k` (0-based
+// index into getRegionIterArgs(), which is 1:1 with inits and yielded values
+// for both scf.for and scf.while). This hides the induction-variable offset and
+// the two-region structure of scf.while.
+struct LoopCarriedSlot {
+  // The loop init operand for this slot (init -> iterArg on loop entry).
+  OpOperand *init = nullptr;
+  // The region iter arg: scf.for body arg (k+1); scf.while "before" arg k.
+  BlockArgument iterArg;
+  // The value yielded back for the next iteration: scf.for scf.yield operand k;
+  // scf.while "after" scf.yield operand k.
+  OpOperand *yielded = nullptr;
+  // The loop result tied to this slot, if any. For scf.for this is result k.
+  // For scf.while this is non-null only when the matching "before" arg is
+  // forwarded by scf.condition (otherwise the slot has no tied result).
+  OpResult result;
+  // scf.while only: the "after" region argument fed from scf.condition for this
+  // slot, if forwarded. Null for scf.for and for non-forwarded while slots.
+  BlockArgument afterArg;
+};
+
+// Build the slot descriptor for iter-arg index `k`
+// (k < loop.getRegionIterArgs().size()).
+LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k);
+
+// Return the single block/region that partition scheduling treats as the loop
+// body. For scf.while this is the "after" region; the "before" region is loop
+// control and is replicated later by task-id propagation.
+Block *getLoopBodyBlock(LoopLikeOpInterface loop);
+Region &getLoopBodyRegion(LoopLikeOpInterface loop);
+Operation *getLoopBodyTerminator(LoopLikeOpInterface loop);
+ValueRange getLoopYieldedValues(LoopLikeOpInterface loop);
+
+// Return the induction variable for scf.for, or a null Value for scf.while.
+Value getLoopInductionVar(LoopLikeOpInterface loop);
+
+// Trace a loop-carried value to its defining result and iteration distance.
+// Returns a null result and zero distance for non-carried values and cycles.
+std::pair<OpResult, int64_t>
+getLoopDefinitionAndDistance(LoopLikeOpInterface loop, Value value);
+
+// Callers must verify hasSupportedLoopCarry(loop) before using either mapping
+// helper below.
+// Map carried-value slot `k` to its argument in the scheduled body. Returns a
+// null BlockArgument for an scf.while slot that is not forwarded by
+// scf.condition.
+BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned k);
+
+// Map a scheduled-body argument to the value yielded into its corresponding
+// carried slot on the next iteration.
+Value getLoopCarriedYieldedValue(LoopLikeOpInterface loop,
+                                 BlockArgument bodyArg);
+
+// Partition scheduling supports scf.while when scf.condition forwards a
+// direct, unique, non-empty, order-preserving subset of the before-region
+// arguments.
+// scf.for is supported by construction; other LoopLikeOpInterface
+// implementations are unsupported.
+bool hasSupportedLoopCarry(LoopLikeOpInterface loop);
+
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
                               IRMapping &mapping);
 
@@ -203,6 +355,16 @@ LogicalResult getConvertBackwardSlice(
     std::function<bool(Operation *)> stopPropagation = nullptr,
     std::function<Value(OpOperand &, Attribute)> getExistingConversion =
         nullptr);
+
+// Populate pattern to remove dead cycles in ForOp.
+// opsCanBeTriviallyDead specifies the operations of which the side effect can
+// be ignored.
+// NOTE (beta): retained alongside runDeadIterArgElimination because the beta
+// WSDataPartition deep-cleanup relies on the opsCanBeTriviallyDead allowlist,
+// which the LivenessAnalysis-based runDeadIterArgElimination cannot express.
+void populateForOpDeadArgumentElimination(
+    RewritePatternSet &patterns,
+    const DenseSet<Operation *> &opsCanBeTriviallyDead = {});
 
 /// Like getConvertBackwardSlice, but requires the resulting slice to be
 /// non-empty and fully rematerializable.
@@ -243,6 +405,14 @@ int getNVIDIAComputeCapability(Operation *module);
 
 // Read the amd target from the module attributes
 std::optional<StringRef> getAMDArch(Operation *module);
+
+// Return true when a global load may legally use a vector instruction whose
+// base address is aligned only to the element size. The caller must still
+// enforce contiguity, logical-extent, and vector-width limits. For masked
+// loads, it must also clamp the width to mask constancy along the pointer's
+// vectorized axis.
+bool canUseUnalignedVectorizedLoad(Operation *op);
+bool canUseUnalignedVectorizedLoad(Operation *op, StringRef targetArch);
 
 std::optional<mlir::triton::gpu::SwizzledSharedEncodingAttr>
 getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible);
@@ -327,6 +497,11 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx);
 
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);
+
+// The descriptor load a tensor-level value comes from, walking back
+// through convert_layout and single-operand view ops, or null. A 2-CTA
+// MMA's B must trace to one: Transform2CTALoads splits only that load.
+DescriptorLoadOp getTwoCTADescriptorLoad(Value value);
 
 } // namespace mlir::triton
 

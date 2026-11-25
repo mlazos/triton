@@ -42,7 +42,17 @@ def TTNG_CachePolicyAttr
   let genVerifyDecl = 1;
 }
 
-def TTG_TensorMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemorySpace"> {
+def TTG_SharedClusterMemorySpace
+    : AttrDef<TritonNvidiaGPU_Dialect, "SharedClusterMemorySpace"> {
+  let mnemonic = "shared_cluster_memory";
+  let description = [{
+    Attribute to indicate that the memory descriptor points to shared memory. The shared memory could reside in
+    any CTA within a CTA cluster.
+  }];
+}
+
+def TTG_TensorMemorySpace
+    : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemorySpace"> {
   let mnemonic = "tensor_memory";
   let description = [{
     Attribute to indicate that the memory descriptor points to tensor memory.
@@ -94,8 +104,8 @@ def TTNG_CGALayoutRankTwoParam
 }
 
 def TTG_TensorMemoryEncodingAttr
-    : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemoryEncoding",
-              [LayoutEncodingTrait]> {
+    : AttrDef<TritonNvidiaGPU_Dialect,
+              "TensorMemoryEncoding", [LayoutEncodingTrait]> {
   let mnemonic = "tensor_memory_encoding";
   let attrName = "triton.gpu.tensor_memory_encoding";
   let description = [{
@@ -107,34 +117,27 @@ def TTG_TensorMemoryEncodingAttr
     `twoCTAs` indicates that the tensor memory is laid out for twoCTA mode,
     i.e., `cta_group::2`.
   }];
-  let parameters = (
-    ins
-    "unsigned":$blockM,
-    "unsigned":$blockN,
-    "unsigned":$colStride,
-    TTNG_CGALayoutRankTwoParam:$CGALayout,
-    DefaultValuedParameter<"bool", "false">:$twoCTAs,
-    DefaultValuedParameter<"bool", "false">:$fp4Padded
-  );
-  let skipDefaultBuilders = 1;
-  let builders = [
-    AttrBuilder<(ins "unsigned":$blockM,
-                     "unsigned":$blockN,
-                     "unsigned":$colStride,
-                     "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout,
-                     CArg<"bool", "false">:$twoCTAs,
-                     CArg<"bool", "false">:$fp4Padded), [{
+  let parameters = (ins "unsigned":$blockM, "unsigned":$blockN,
+      "unsigned":$colStride, TTNG_CGALayoutRankTwoParam:$CGALayout,
+      DefaultValuedParameter<"bool", "false">:$twoCTAs,
+      DefaultValuedParameter<"TensorMemoryCTAMode",
+                             "TensorMemoryCTAMode::DEFAULT">:$ctaMode,
+      DefaultValuedParameter<"bool", "false">:$fp4Padded);
+  let builders = [AttrBuilder<
+      (ins "unsigned":$blockM, "unsigned":$blockN, "unsigned":$colStride,
+          "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout, "bool":$twoCTAs,
+          "TensorMemoryCTAMode":$ctaMode),
+      [{
       return $_get($_ctxt, blockM, blockN, colStride, CGALayout, twoCTAs,
-                   fp4Padded);
-    }]>
-  ];
+                   ctaMode, false);
+    }]>];
   let genVerifyDecl = 1;
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
 def TTG_TensorMemoryScalesEncodingAttr
-    : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemoryScalesEncoding",
-              [LayoutEncodingTrait]> {
+    : AttrDef<TritonNvidiaGPU_Dialect,
+              "TensorMemoryScalesEncoding", [LayoutEncodingTrait]> {
   let mnemonic = "tensor_memory_scales_encoding";
   let attrName = "triton.gpu.tensor_memory_scales_encoding";
   let description = [{
@@ -149,21 +152,97 @@ def TTG_TensorMemoryScalesEncodingAttr
     non-K dimension. When one MMA instruction consumes only one scale block along K, the value of this parameter
     does not matter. Otherwise, it must match the hardware instruction layout. For example, Rubin NVFP4 A scales
     with `BLOCK_M = 256` require `kThenMn`, while B scales keep the default `mnThenK`.
+    `ctaMode = twocta_rhs` represents B scales for the M=128 cta_group::2 Layout-B data path. It moves the high N
+    basis from TMEM columns to row partition 64 while keeping row partition 32 broadcast.
   }];
-  let parameters = (
-    ins
-    TTNG_CGALayoutRankTwoParam:$CGALayout,
-    DefaultValuedParameter<
-        "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder",
-        "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K">:$blockRepOrder
-  );
-  let builders = [
-    AttrBuilder<(ins "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout), [{
+  let parameters =
+      (ins TTNG_CGALayoutRankTwoParam:$CGALayout,
+          DefaultValuedParameter<
+              "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder",
+              "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_"
+              "THEN_K">:$blockRepOrder,
+          DefaultValuedParameter<"TensorMemoryCTAMode",
+                                 "TensorMemoryCTAMode::DEFAULT">:$ctaMode);
+  let builders = [AttrBuilder<
+      (ins "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout), [{
       return get(context, CGALayout,
-                 ::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K);
-    }]>
-  ];
+                 ::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K,
+                 ::mlir::triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
+    }]>];
   let genVerifyDecl = 1;
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// BarrierAnnotation attribute
+//===----------------------------------------------------------------------===//
+
+def TTNG_BarrierAnnotationAttr
+    : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnotation"> {
+  let mnemonic = "barrier_annotation";
+  let description = [{
+    Describes where to insert a barrier operation during subtiled region lowering.
+
+    - `barrierIdx`: index into the op's barriers/accumCnts operand lists.
+      For tile-region annotations with a tileMask, the lowering computes the
+      per-tile barrier index as `(outerAccumCnt + tileIdx) % numBuffers`.
+    - `placement`: BEFORE or AFTER the target op
+    - `targetOpIdx`: index of the target op in the target region body (0-based,
+      counting only non-terminator ops)
+    - `barrierOpKind`: "wait_barrier" or "arrive_barrier"
+    - `count`: arrive count for arrive_barrier (default 1)
+    - `region`: which region the barrier targets (default TILE):
+        - TILE: placed in the per-tile body, controlled by tileMask
+        - SETUP: placed in the setup region (runs once, no mask)
+        - TEARDOWN: placed in the teardown region (runs once, no mask)
+    - `numBuffers`: number of buffers for phase and buffer index computation
+      (default 1). At lowering time, for each tile replication where
+      tileMask[tileIdx] is true:
+        tileAccumCnt = outerAccumCnt + tileIdx
+        bufferIdx    = tileAccumCnt % numBuffers
+        phase        = (tileAccumCnt / numBuffers) & 1
+    - `tileMask`: per-tile boolean mask (one entry per tile). The barrier is
+      only emitted for tiles where the mask is true. Empty mask means emit
+      on all tiles. Only used for TILE region annotations.
+  }];
+  let parameters = (ins "unsigned":$barrierIdx, "BarrierPlacement":$placement,
+      "unsigned":$targetOpIdx, "StringAttr":$barrierOpKind,
+      DefaultValuedParameter<"unsigned", "1">:$count,
+      DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region,
+      DefaultValuedParameter<"unsigned", "1">:$numBuffers,
+      OptionalParameter<"DenseI32ArrayAttr">:$tileMask);
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// TokenAnnotation attribute
+//===----------------------------------------------------------------------===//
+
+def TTNG_TokenAnnotationAttr
+    : AttrDef<TritonNvidiaGPU_Dialect, "TokenAnnotation"> {
+  let mnemonic = "token_annotation";
+  let description = [{
+    Describes where to insert a token-based synchronization operation during
+    subtiled region lowering. This is the token-layer analog of
+    `BarrierAnnotationAttr` — it references NVWS tokens (ConsumerWaitOp /
+    ConsumerReleaseOp) instead of mbarrier ops (WaitBarrierOp /
+    ArriveBarrierOp). Token annotations are resolved to barrier annotations
+    during `doTokenLowering`.
+
+    - `tokenIdx`: index into the op's `tokenValues` operand list (the NVWS
+      token Value).
+    - `bufferIdxIdx`: index into `tokenValues` for the buffer index (i32).
+    - `phaseIdx`: index into `tokenValues` for the phase (i1). Set to -1
+      for consumer_release ops that have no phase operand.
+    - `placement`: BEFORE or AFTER the target op.
+    - `targetOpIdx`: index of the target op in the target region body.
+    - `tokenOpKind`: "consumer_wait" or "consumer_release".
+    - `region`: which region the token op targets (default TILE).
+  }];
+  let parameters = (ins "unsigned":$tokenIdx, "unsigned":$bufferIdxIdx,
+      "int":$phaseIdx, "BarrierPlacement":$placement, "unsigned":$targetOpIdx,
+      "StringAttr":$tokenOpKind,
+      DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region);
   let assemblyFormat = "`<` struct(params) `>`";
 }
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Sequence, List, TypeVar, Tuple, Callable, TYPE_CHECKING
+from typing import Optional, Sequence, List, TypeVar, Tuple, Callable, TYPE_CHECKING
 import math
 from triton.language.semantic import TritonSemantic
 from . import _core as ttgl
@@ -197,14 +197,19 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         if axis < 0:
             axis += len(input.shape)
 
-        _check(isinstance(input.type, ttgl.distributed_type),
-               lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}")
+        _check(
+            isinstance(input.type, ttgl.distributed_type),
+            lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}",
+        )
         layout = input.type.layout
-        _check(isinstance(layout, (SliceLayout, AutoLayout, CoalescedLayout)),
-               lambda: f"expected expand_dims input to have a SliceLayout, but got: {layout}")
+        _check(
+            isinstance(layout, (SliceLayout, AutoLayout, CoalescedLayout)),
+            lambda: f"expected expand_dims input to have a SliceLayout, but got: {layout}",
+        )
         _check(
             isinstance(layout, (AutoLayout, CoalescedLayout)) or layout.dim == axis,
-            lambda: f"expected expand_dims input layout to be sliced in axis {axis} but got {layout.dim}")
+            lambda: f"expected expand_dims input layout to be sliced in axis {axis} but got {layout.dim}",
+        )
 
         handle = self.builder.create_expand_dims(input.handle, axis)
         return self._wrap_handle_infer_layout(handle, input.type.scalar, dst_shape)
@@ -224,8 +229,10 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         return self._wrap_tensor_infer_layout(value)
 
     def broadcast_impl_shape(self, input: TensorTy, shape: Tuple[int]) -> TensorTy:
-        _check(isinstance(input.type, ttgl.distributed_type),
-               lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}")
+        _check(
+            isinstance(input.type, ttgl.distributed_type),
+            lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}",
+        )
         src_shape = input.type.get_block_shapes()
         _check(len(src_shape) == len(shape), lambda: f"Cannot broadcast, rank mismatch: {src_shape}, {shape}")
         if shape == src_shape:
@@ -239,6 +246,18 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         handle = self.builder.create_broadcast(input.handle, ret_ty.to_ir(self.builder))
         return self.tensor(handle, ret_ty)
 
+    def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], cache_policy,
+             is_volatile: bool, latency) -> TensorTy:
+        result = super().load(ptr, mask, other, cache_policy, is_volatile, latency)
+        # Triton's load builds a layout-less result type; propagate the
+        # pointer's distributed layout so downstream layout-sensitive ops
+        # (broadcast, cat, fp4_to_fp, ...) see a distributed tensor.
+        if ptr.type.is_block() and isinstance(ptr.type, ttgl.distributed_type):
+            result = self.tensor(
+                result.handle, ttgl.distributed_type(result.type.scalar, result.type.get_block_shapes(),
+                                                     ptr.type.layout))
+        return result
+
     def broadcast_impl_value(self, lhs: TensorTy, rhs: TensorTy) -> TensorTy:
         lhs_ty = lhs.type
         rhs_ty = rhs.type
@@ -246,10 +265,14 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         if not lhs_ty.is_block() or not rhs_ty.is_block():
             return super().broadcast_impl_value(lhs, rhs)
 
-        _check(isinstance(lhs_ty, ttgl.distributed_type),
-               lambda: f"expected broadcast left input to be a distributed_type but got: {lhs_ty!r}")
-        _check(isinstance(rhs_ty, ttgl.distributed_type),
-               lambda: f"expected broadcast right input to be a distributed_type but got: {rhs_ty!r}")
+        _check(
+            isinstance(lhs_ty, ttgl.distributed_type),
+            lambda: f"expected broadcast left input to be a distributed_type but got: {lhs_ty!r}",
+        )
+        _check(
+            isinstance(rhs_ty, ttgl.distributed_type),
+            lambda: f"expected broadcast right input to be a distributed_type but got: {rhs_ty!r}",
+        )
 
         lhs_shape = lhs_ty.get_block_shapes()
         rhs_shape = rhs_ty.get_block_shapes()
@@ -275,8 +298,9 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         ret_ty = ttgl.distributed_type(ttgl.int32, shape, layout)
         return super().arange(start, end, ret_ty=ret_ty)
 
-    def reshape(self, input: TensorTy, dst_shape: List[int]):
-        value = super().reshape(input, dst_shape)
+    def reshape(self, input: TensorTy, dst_shape: List[int], can_reorder: bool):
+        _check(not can_reorder, lambda: "can_reorder is not supported in gluon")
+        value = super().reshape(input, dst_shape, can_reorder)
         return self._wrap_tensor_infer_layout(value)
 
     def splat(self, value, shape, layout):
@@ -370,6 +394,39 @@ class GluonSemantic(TritonSemantic[TensorTy]):
     def shared_scatter(self, mem_desc, values, indices, axis):
         axis = self._check_int_indices_and_normalize_axis(mem_desc, indices, axis)
         values, indices, _ = self._broadcast_shared_scatter_operands(mem_desc, values, indices)
+
+        self.builder.create_local_scatter(mem_desc.handle, values.handle, indices.handle, axis)
+
+    def shared_gather(self, mem_desc, indices, axis):
+        _check(isinstance(indices, ttgl.tensor),
+               lambda: f"expected 'indices' to be a tensor, but got a {type(indices)}")
+        _check(isinstance(axis, int), lambda: f"expected 'axis' to be an int, but got a {type(axis)}")
+        _check(
+            len(indices.shape) == mem_desc.rank,
+            lambda: f"indices rank must match memdesc rank: got {len(indices.shape)} and {mem_desc.rank}")
+        _check(0 <= axis < mem_desc.rank, lambda: f"axis {axis} is out of bounds for memdesc rank {mem_desc.rank}")
+        _check(indices.dtype.is_int(), lambda: f"indices must have integer dtype, got {indices.dtype}")
+
+        ret_ty = ttgl.distributed_type(mem_desc.dtype, indices.shape, indices.type.layout)
+        handle = self.builder.create_local_gather(ret_ty.to_ir(self.builder), mem_desc.handle, indices.handle, axis)
+        return ttgl.tensor(handle, ret_ty)
+
+    def shared_scatter(self, mem_desc, values, indices, axis):
+        _check(isinstance(indices, ttgl.tensor),
+               lambda: f"expected 'indices' to be a tensor, but got a {type(indices)}")
+        _check(isinstance(axis, int), lambda: f"expected 'axis' to be an int, but got a {type(axis)}")
+        _check(isinstance(values, ttgl.tensor), lambda: f"expected 'values' to be a tensor, but got a {type(values)}")
+        _check(
+            len(indices.shape) == mem_desc.rank,
+            lambda: f"indices rank must match memdesc rank: got {len(indices.shape)} and {mem_desc.rank}")
+        _check(0 <= axis < mem_desc.rank, lambda: f"axis {axis} is out of bounds for memdesc rank {mem_desc.rank}")
+        _check(indices.dtype.is_int(), lambda: f"indices must have integer dtype, got {indices.dtype}")
+        _check(values.shape == indices.shape,
+               lambda: f"values must have the same shape as indices: got {values.shape} and {indices.shape}")
+        _check(values.type.layout == indices.type.layout, lambda: "values must have the same layout as indices")
+        _check(
+            values.dtype == mem_desc.dtype,
+            lambda: f"values element type must match destination element type: got {values.dtype} and {mem_desc.dtype}")
 
         self.builder.create_local_scatter(mem_desc.handle, values.handle, indices.handle, axis)
 
@@ -511,8 +568,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         _check(_is_int_list(shape), lambda: f"all elements of 'shape' must be integers but got {shape}")
         _check(
             math.prod(shape) == math.prod(mem_desc.shape),
-            lambda: (f"memdesc_reshape total elements mismatch: "
-                     f"{mem_desc.shape} -> {shape}"),
+            lambda: (f"memdesc_reshape total elements mismatch: {mem_desc.shape} -> {shape}"),
         )
 
         handle = self.builder.create_memdesc_reshape(mem_desc.handle, shape)
@@ -555,7 +611,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
                lambda: f"Expected inputs to have matching layouts, but got: {layouts}")
 
     def associative_scan(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn,
-                         reverse: bool) -> Tuple[TensorTy, ...]:
+                         reverse: bool, reduction_ordering=None) -> Tuple[TensorTy, ...]:
         shape = inputs[0].type.shape
         rank = len(shape)
 
@@ -567,7 +623,8 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         for t in inputs:
             assert t.type.shape == shape, "all scan inputs must have the same shape"
 
-        scan_op = self.builder.create_scan([t.handle for t in inputs], axis, reverse)
+        ordering = reduction_ordering.name if reduction_ordering is not None else ""
+        scan_op = self.builder.create_scan([t.handle for t in inputs], axis, reverse, ordering)
         region_builder_fn(scan_op)
         assert scan_op.verify()
 
@@ -577,7 +634,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
 
     def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn) -> Tuple[TensorTy, ...]:
         if axis is None:
-            inputs = tuple(self.reshape(t, [t.numel.value]) for t in inputs)
+            inputs = tuple(self.reshape(t, [t.numel.value], can_reorder=False) for t in inputs)
             axis = 0
         # get result shape
         shape = inputs[0].type.shape
@@ -645,7 +702,6 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         default_partition, default_args = functions_and_args[0]
         num_partitions = len(functions_and_args) - 1
         workers = functions_and_args[1:]
-
         assert num_partitions == len(
             worker_num_warps
         ), f"warp specialize got {num_partitions} partitions but {len(worker_num_warps)} warp counts"

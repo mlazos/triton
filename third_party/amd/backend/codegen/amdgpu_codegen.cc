@@ -4,6 +4,7 @@
 #include "triton/Tools/LLVMOptions.h"
 
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
@@ -162,6 +163,8 @@ collectOptionSettings(const CodegenOptions *options) {
       if (flag.empty())
         continue;
       auto [name, value] = flag.split('=');
+      if (name.empty())
+        continue;
       settings.emplace_back(name.str(),
                             name.size() == flag.size() ? "true" : value.str());
     }
@@ -281,6 +284,12 @@ int publish(llvm::StringRef value, char **out, size_t *outSize,
   return 0;
 }
 
+} // namespace
+
+extern "C" void triton_amdgpu_free(void *pointer);
+
+namespace {
+
 // Drain the -time-passes report enableTiming asked for. LLVM accumulates into
 // process-global timers, so an entry point that sets the option and does not
 // drain it leaks its numbers into whoever reports next.
@@ -366,7 +375,7 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   std::vector<ScopedLLVMOptions::Setting> settings =
       collectOptionSettings(options);
   // Stop right after the scheduling-DAG pass, which substitutes itself for the
-  // machine scheduler (see LivePipelineDAGEmission). This truncates the
+  // machine scheduler (see armLivePipelineDAGEmission). This truncates the
   // pipeline at exactly the same point -stop-before=machine-scheduler did, so
   // the MIR dumped below is unchanged.
   settings.emplace_back("stop-after", llvm::mir_dag::livePipelineDAGPassName());
@@ -387,7 +396,9 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   std::string mirText;
   std::string dagText;
   {
-    llvm::mir_dag::LivePipelineDAGEmission dagEmission(&dagText);
+    llvm::mir_dag::armLivePipelineDAGEmission(&dagText);
+    llvm::scope_exit disarm(
+        [] { llvm::mir_dag::disarmLivePipelineDAGEmission(); });
     llvm::raw_string_ostream output(mirText);
     llvm::buffer_ostream bufferedOutput(output);
     llvm::legacy::PassManager codegen;
@@ -403,7 +414,7 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
     return status;
   if (int status =
           publish(dagText, dag, dagSize, "scheduling DAG result", error)) {
-    std::free(*mir);
+    triton_amdgpu_free(*mir);
     *mir = nullptr;
     *mirSize = 0;
     return status;
@@ -477,15 +488,18 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
                                         : llvm::CodeGenFileType::AssemblyFile;
 
     // MMI must exist before addPassesToEmitFile so the emitted passes share it,
-    // and the machine functions can only be parsed into it afterwards.
-    llvm::MachineModuleInfoWrapperPass *MMIWP =
-        new llvm::MachineModuleInfoWrapperPass(machine.get());
+    // and the machine functions can only be parsed into it afterwards. The
+    // pass manager only takes ownership once addPassesToEmitFile succeeds.
+    auto MMIWP =
+        std::make_unique<llvm::MachineModuleInfoWrapperPass>(machine.get());
 
     if (machine->addPassesToEmitFile(pass, pstream, nullptr, fileType,
-                                     /*NoVerify*/ false, MMIWP))
+                                     /*NoVerify*/ false, MMIWP.get()))
       return fail("AMD target cannot emit code from MIR", error);
+    llvm::MachineModuleInfo &MMI = MMIWP->getMMI();
+    MMIWP.release();
 
-    if (mirParser->parseMachineFunctions(*module, MMIWP->getMMI()))
+    if (mirParser->parseMachineFunctions(*module, MMI))
       return fail("failed to parse machine functions from MIR", error);
 
     pass.run(*module);

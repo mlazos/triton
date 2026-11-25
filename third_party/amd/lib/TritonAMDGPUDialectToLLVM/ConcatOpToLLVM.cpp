@@ -27,14 +27,12 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
     ArrayRef<int64_t> srcShape = srcType.getShape();
 
     auto kReg = str_attr("register");
-    auto linearLayoutSrc =
-        triton::gpu::toLinearLayout(srcType).removeZeroBasesAlongDim(kReg);
+    auto linearLayoutSrc = triton::gpu::toLinearLayout(srcType);
     auto outDimNames = llvm::to_vector(linearLayoutSrc.getOutDimNames());
     // Call transposeOuts, to ensure that order of input and output tensor
     // element coordinates are compatible on stage 8 in algorithm below.
-    auto linearLayoutDst = triton::gpu::toLinearLayout(resultType)
-                               .removeZeroBasesAlongDim(kReg)
-                               .transposeOuts(outDimNames);
+    auto linearLayoutDst =
+        triton::gpu::toLinearLayout(resultType).transposeOuts(outDimNames);
     auto rank = srcShape.size();
     // Default order is fastest to slowest varying dimension.
     std::vector<unsigned> defaultOrder(rank);
@@ -50,8 +48,8 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
 
     for (size_t i = 0; i < sources.size(); i++) {
       Value currSrc = sources[i];
-      unpackedSources.push_back(
-          unpackUniqueTensorElements(loc, currSrc, rewriter));
+      unpackedSources.push_back(unpackTensorElements(
+          loc, currSrc, rewriter, op.getSources()[i].getType()));
     }
 
     // Algorithm:
@@ -99,8 +97,8 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
       resultVals.push_back(unpackedSources[linearOperandIdx][srcReg.value()]);
     }
 
-    Value packedResult = packUniqueTensorElements(
-        loc, this->getTypeConverter(), resultVals, rewriter, resultType);
+    Value packedResult = packTensorElements(loc, this->getTypeConverter(),
+                                            resultVals, rewriter, resultType);
 
     rewriter.replaceOp(op, packedResult);
     return success();

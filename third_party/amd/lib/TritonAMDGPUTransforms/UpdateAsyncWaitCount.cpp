@@ -66,8 +66,22 @@ int getNumberOfAsyncCopyInstructions(RankedTensorType globalType,
   LinearLayout globalLayout = tt::gpu::toLinearLayout(globalType);
   triton::LinearLayout sharedLayout =
       triton::gpu::toLinearLayoutIgnoringPadding(sharedType);
-  LinearLayout globalToSharedLayout =
-      globalLayout.invertAndCompose(sharedLayout);
+  int numSlabs = 1;
+  LinearLayout globalToSharedLayout;
+  if (globalLayout.isRadix2() && sharedLayout.isRadix2()) {
+    globalToSharedLayout = globalLayout.invertAndCompose(sharedLayout);
+  } else {
+    // A mixed-radix copy lowers to one radix-2 copy per slab; one that
+    // cannot lower counts nothing, which only makes the wait conservative.
+    SmallVector<int32_t> slabOffsets;
+    std::string reason;
+    FailureOr<LinearLayout> cvt = LLVM::AMD::splitDirectToLdsCopy(
+        globalLayout, sharedLayout, slabOffsets, reason);
+    if (failed(cvt))
+      return 0;
+    globalToSharedLayout = *cvt;
+    numSlabs = slabOffsets.size();
+  }
 
   // If the warp dimension has free variables, not all warps execute this async
   // copy — the lowering will predicate execution to canonical warps only (via
@@ -105,7 +119,7 @@ int getNumberOfAsyncCopyInstructions(RankedTensorType globalType,
   auto kReg = StringAttr::get(globalType.getContext(), "register");
   int numberOfRegisters =
       globalToSharedLayout.removeZeroBasesAlongDim(kReg).getInDimSize(kReg);
-  int numInstructions = std::max(1, numberOfRegisters / ptrContig);
+  int numInstructions = numSlabs * std::max(1, numberOfRegisters / ptrContig);
 
   // When a given vector width is unsupported but half of it is, the store
   // lowering splits each async store into two half-width stores.
@@ -131,9 +145,10 @@ int getOpNumberOfAsyncCopyInstructions(Operation *op,
   if (auto copyOp = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
     int contig = LLVM::AMD::getVectorSize(copyOp.getSrc(), axisInfo);
     return getNumberOfAsyncCopyInstructions(
-        copyOp.getSrc().getType(), copyOp.getResult().getType(),
-        copyOp.getMask(), contig, copyOp.getContiguity(), axisInfo,
-        targetFeatures, /*isStore=*/false);
+        cast<RankedTensorType>(copyOp.getSrc().getType()),
+        copyOp.getResult().getType(), copyOp.getMask(), contig,
+        copyOp.getContiguity(), axisInfo, targetFeatures,
+        /*isStore=*/false);
   } else if (auto bufferOp = dyn_cast<amdgpu::BufferLoadToLocalOp>(op)) {
     auto ptrType = cast<RankedTensorType>(LLVM::AMD::getPointerTypeWithShape(
         bufferOp.getPtr(), bufferOp.getOffsets()));
@@ -146,9 +161,9 @@ int getOpNumberOfAsyncCopyInstructions(Operation *op,
   } else if (auto copyOp = dyn_cast<amdgpu::AsyncCopyLocalToGlobalOp>(op)) {
     int contig = LLVM::AMD::getVectorSize(copyOp.getDst(), axisInfo);
     return getNumberOfAsyncCopyInstructions(
-        copyOp.getDst().getType(), copyOp.getSrc().getType(), copyOp.getMask(),
-        contig, copyOp.getContiguity(), axisInfo, targetFeatures,
-        /*isStore=*/true);
+        cast<RankedTensorType>(copyOp.getDst().getType()),
+        copyOp.getSrc().getType(), copyOp.getMask(), contig,
+        copyOp.getContiguity(), axisInfo, targetFeatures, /*isStore=*/true);
   } else if (emitRemarkOnNonAsyncOp) {
     SmallVector<mlir::MemoryEffects::EffectInstance> effects;
     if (auto memEffectIface = dyn_cast<MemoryEffectOpInterface>(op))

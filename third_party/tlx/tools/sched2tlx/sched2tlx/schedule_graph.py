@@ -1,0 +1,591 @@
+# pyre-strict
+"""Typed view over modulo's schedule_graph.json (schema v0.1).
+
+The dump is produced by `dumpScheduleGraphAsJSON` in the modulo pass and is
+self-sufficient — no companion file needed. See SCHEMA.md for the contract.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Operand refs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OpRef:
+    op_id: str
+    result_idx: int = 0  # which result of a multi-result op (0 if single)
+
+
+@dataclass
+class ArgRef:
+    name: str
+
+
+@dataclass
+class IvRef:
+    loop_id: int
+
+
+@dataclass
+class IterArgRef:
+    loop_id: int
+    idx: int
+
+
+@dataclass
+class ConstRef:
+    value: Any
+    type: str
+
+
+@dataclass
+class UnknownBlockArg:
+    pass
+
+
+OperandRef = OpRef | ArgRef | IvRef | IterArgRef | ConstRef | UnknownBlockArg
+
+
+def _parse_operand(d: dict[str, Any]) -> OperandRef:
+    if "op" in d:
+        return OpRef(op_id=d["op"], result_idx=d.get("result", 0))
+    if "arg" in d:
+        return ArgRef(name=d["arg"])
+    if "iv" in d:
+        return IvRef(loop_id=d["iv"])
+    if "iter_arg" in d:
+        return IterArgRef(loop_id=d["iter_arg"]["loop"], idx=d["iter_arg"]["idx"])
+    if "const" in d:
+        return ConstRef(value=d["const"], type=d.get("type", ""))
+    return UnknownBlockArg()
+
+
+# ---------------------------------------------------------------------------
+# Top-level entities
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class KernelArg:
+    name: str
+    type: str  # "*f16", "i32", ...
+
+
+@dataclass
+class Op:
+    """An entry in the top-level ops table — any op in the kernel."""
+
+    op_id: str
+    kind: str  # MLIR op name (e.g., "tt.descriptor_load")
+    scope: str  # "function" or "loop:<id>"
+    operands: list[OperandRef]
+    result_types: list[str]
+    attributes: dict[str, Any]
+    # For scf.if: yielded values from each region (one per result).
+    then_yields: list[OperandRef] = field(default_factory=list)
+    else_yields: list[OperandRef] = field(default_factory=list)
+
+
+@dataclass
+class Buffer:
+    """A multi-buffered allocation inside a loop."""
+
+    id: int
+    kind: str  # "smem" | "tmem" | "barrier" | "register"
+    shape: list[int]
+    element_bits: int
+    count: int  # depth (modulo's lifetime-aware count)
+    size_bytes: int
+    total_bytes: int
+    merge_group_id: int | None
+    paired_buffer_id: int | None  # for SMEM buf, this is the BARRIER buf
+    live_start: int
+    live_end: int
+    def_op: str | None  # op_id of the original alloc op
+    # Pass A.5: when partition_count > 1, this buffer is the TMEM
+    # accumulator for an MMA that A.5 splits into N groups; the emitter
+    # allocates N separate TMEM bufs each of size (m_size, BN).
+    partition_count: int = 1
+    partition_dim: int = 0
+    m_size: int = 0
+
+
+@dataclass
+class Node:
+    """A scheduled op in a loop's graph."""
+
+    id: int  # stable within this loop
+    op_ref: str | None  # key into top-level ops table
+    op_kind: str  # MLIR op name (also reachable via op_ref → ops table)
+    pipeline: str  # "TMA" | "TC" | "CUDA" | "SFU" | "NONE"
+    warp_group: int  # index into loop.warp_groups
+    latency: int
+    self_latency: int
+    frequency_multiplier: int
+    schedule_cycle: int
+    schedule_stage: int
+    schedule_cluster: int
+    produces_buffer: int | None  # buffer.id this node fills
+    consumes_buffers: list[int]
+    child_pipeline_id: int | None = None
+    prologue_latency: int = 0
+    # Pass A.7 epilogue subtiling. When subtile_count > 1, this op is one of
+    # S sibling ops produced by splitting an epilogue chain along N; emitter
+    # groups siblings into a `for sub in range(S)` loop. Defaults mean "not
+    # subtiled" (op operates on the full BN tile).
+    subtile_index: int = -1
+    subtile_count: int = 1
+    n_offset: int = 0
+    n_size: int = 0  # 0 = full BN
+
+    # Pass A.5 data partitioning. When partition_count > 1, the op (and its
+    # companion chain — A-side load+alloc and the TMEM accumulator buf for
+    # an MMA) should be emitted N times in parallel (NUM_MMA_GROUPS style).
+    # `m_size` is the per-group tile width along the partition dim.
+    partition_index: int = -1
+    partition_count: int = 1
+    partition_dim: int = 0  # 0 = M, 1 = N
+    m_size: int = 0
+
+
+@dataclass
+class Edge:
+    src: int  # node id
+    dst: int  # node id
+    kind: str  # "data" | "anti" | ...
+    distance: int  # 0 = intra-iter, 1+ = loop-carried
+    latency: int
+
+
+@dataclass
+class CrossWGBarrier:
+    """Cross-warp-group barrier from Pass B Step 2. Pairs producer node with
+    consumer node and the SMEM/TMEM buffer that ferries the value across."""
+
+    producer_node: int
+    consumer_node: int
+    producer_wg: int
+    consumer_wg: int
+    kind: str  # "mbarrier" | "named"
+    depth: int
+    paired_buffer_id: int | None
+    expect_bytes: int
+    distance: int = 0
+    arrive_after_node: int | None = None
+    wait_before_node: int | None = None
+
+
+@dataclass(frozen=True)
+class LoweringEventTemplate:
+    id: int
+    kind: str
+    owner: str
+    anchor_node: int
+    placement: str
+    pipeline: str
+    issue_duration: int
+    completion_latency: int
+    blocking: bool
+    is_async: bool
+    distance: int
+    frequency: int
+    buffer_id: int | None
+    bytes: int
+    depth: int
+    semaphore: str
+    fusion_group: int | None
+    dedup_group: int | None
+
+
+@dataclass(frozen=True)
+class LoweringTemplate:
+    id: int
+    relation: str
+    src_node: int
+    dst_node: int
+    src_cluster: int
+    dst_cluster: int
+    events: tuple[LoweringEventTemplate, ...]
+
+
+@dataclass(frozen=True)
+class LoweringEvent:
+    id: int
+    cycle: int
+    warp_group: int
+    stream_order: int
+
+
+@dataclass(frozen=True)
+class LoweringTemplatePlan:
+    id: int
+    active: bool
+    events: tuple[LoweringEvent, ...]
+
+
+@dataclass(frozen=True)
+class LoweringPlan:
+    version: str = "lowering-plan-0.1"
+    status: str = "absent"
+    templates: tuple[LoweringTemplatePlan, ...] = ()
+
+
+@dataclass
+class WarpGroup:
+    id: int
+    pipelines: list[str]
+    # Chosen by the schedule pass (Layer B): max minWarps over the WG's ops,
+    # snapped to {1,2,4,8}. Defaults to 4 for backward compatibility with
+    # older JSON dumps that did not record num_warps.
+    num_warps: int = 4
+
+
+@dataclass
+class ScheduleLoop:
+    """The schedule for one scf.for."""
+
+    id: int
+    II: int
+    max_stage: int
+    prologue_latency: int
+    trip_count: int
+    trip_count_estimated: bool
+    induction_var_name: str
+    induction_var_type: str
+    lower_bound: OperandRef
+    upper_bound: OperandRef
+    step: OperandRef
+    buffers: list[Buffer]
+    nodes: list[Node]
+    edges: list[Edge]
+    cross_wg_barriers: list[CrossWGBarrier] = field(default_factory=list)
+    lowering_templates: tuple[LoweringTemplate, ...] = ()
+    lowering_plan: LoweringPlan = field(default_factory=LoweringPlan)
+
+
+@dataclass
+class Loop:
+    """A loop entry under graph.loops."""
+
+    loop_id: int
+    is_outer: bool
+    warp_groups: list[WarpGroup]
+    schedule: ScheduleLoop
+
+
+@dataclass
+class Kernel:
+    name: str
+    args: list[KernelArg]
+
+
+@dataclass
+class ScheduleGraph:
+    schema_version: str
+    kernel: Kernel
+    ops: dict[str, Op]
+    loops: list[Loop]
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+
+def _to_op(op_id: str, d: dict[str, Any]) -> Op:
+    op = Op(
+        op_id=op_id,
+        kind=d["kind"],
+        scope=d["scope"],
+        operands=[_parse_operand(o) for o in d.get("operands", [])],
+        result_types=d.get("result_types", []),
+        attributes=d.get("attributes", {}),
+    )
+    # scf.if regions: then/else yielded values exposed as parsed OperandRefs
+    # in the same shape as `operands`. Stored on the Op object for renderers.
+    if "then_yields" in d:
+        op.then_yields = [_parse_operand(o) for o in d["then_yields"]]
+    if "else_yields" in d:
+        op.else_yields = [_parse_operand(o) for o in d["else_yields"]]
+    return op
+
+
+def _to_buffer(d: dict[str, Any]) -> Buffer:
+    return Buffer(
+        id=d["id"],
+        kind=d["kind"],
+        shape=d["shape"],
+        element_bits=d["element_bits"],
+        count=d["count"],
+        size_bytes=d["size_bytes"],
+        total_bytes=d["total_bytes"],
+        merge_group_id=d.get("merge_group_id"),
+        partition_count=d.get("partition_count", 1),
+        partition_dim=d.get("partition_dim", 0),
+        m_size=d.get("m_size", 0),
+        paired_buffer_id=d.get("paired_buffer_id"),
+        live_start=d["live_start"],
+        live_end=d["live_end"],
+        def_op=d.get("def_op"),
+    )
+
+
+def _to_node(d: dict[str, Any]) -> Node:
+    sched = d.get("schedule", {})
+    return Node(
+        id=d["id"],
+        op_ref=d.get("op_ref"),
+        op_kind=d.get("op_kind", ""),
+        pipeline=d.get("pipeline", "NONE"),
+        warp_group=d.get("warp_group", -1),
+        latency=d.get("latency", 0),
+        self_latency=d.get("self_latency", 0),
+        frequency_multiplier=d.get("frequency_multiplier", 1),
+        schedule_cycle=sched.get("cycle", -1),
+        schedule_stage=sched.get("stage", -1),
+        schedule_cluster=sched.get("cluster", -1),
+        produces_buffer=d.get("produces_buffer"),
+        consumes_buffers=d.get("consumes_buffers", []),
+        child_pipeline_id=d.get("child_pipeline_id"),
+        prologue_latency=d.get("prologue_latency", 0),
+        subtile_index=d.get("subtile_index", -1),
+        subtile_count=d.get("subtile_count", 1),
+        n_offset=d.get("n_offset", 0),
+        n_size=d.get("n_size", 0),
+        partition_index=d.get("partition_index", -1),
+        partition_count=d.get("partition_count", 1),
+        partition_dim=d.get("partition_dim", 0),
+        m_size=d.get("m_size", 0),
+    )
+
+
+def _to_lowering_event_template(d: dict[str, Any]) -> LoweringEventTemplate:
+    return LoweringEventTemplate(
+        id=d["id"],
+        kind=d["kind"],
+        owner=d["owner"],
+        anchor_node=d["anchor_node"],
+        placement=d["placement"],
+        pipeline=d["pipeline"],
+        issue_duration=d["issue_duration"],
+        completion_latency=d["completion_latency"],
+        blocking=d["blocking"],
+        is_async=d["async"],
+        distance=d["distance"],
+        frequency=d["frequency"],
+        buffer_id=d.get("buffer_id"),
+        bytes=d["bytes"],
+        depth=d["depth"],
+        semaphore=d["semaphore"],
+        fusion_group=d.get("fusion_group"),
+        dedup_group=d.get("dedup_group"),
+    )
+
+
+def _to_lowering_template(d: dict[str, Any]) -> LoweringTemplate:
+    return LoweringTemplate(
+        id=d["id"],
+        relation=d["relation"],
+        src_node=d["src_node"],
+        dst_node=d["dst_node"],
+        src_cluster=d["src_cluster"],
+        dst_cluster=d["dst_cluster"],
+        events=tuple(_to_lowering_event_template(e) for e in d.get("events", [])),
+    )
+
+
+def _to_lowering_plan(d: dict[str, Any] | None) -> LoweringPlan:
+    if d is None:
+        return LoweringPlan()
+    return LoweringPlan(
+        version=d["version"],
+        status=d.get("status", "absent"),
+        templates=tuple(
+            LoweringTemplatePlan(
+                id=template["id"],
+                active=template["active"],
+                events=tuple(
+                    LoweringEvent(
+                        id=event["id"],
+                        cycle=event["cycle"],
+                        warp_group=event["wg"],
+                        stream_order=event["stream_order"],
+                    )
+                    for event in template.get("events", [])
+                ),
+            )
+            for template in d.get("templates", [])
+        ),
+    )
+
+
+def _validate_lowering_contract(loop: ScheduleLoop) -> None:
+    plan = loop.lowering_plan
+    if plan.version != "lowering-plan-0.1":
+        raise ValueError(f"unsupported lowering plan version: {plan.version}")
+    if plan.status not in {
+        "absent",
+        "shadow_unmodeled",
+        "shadow_verified",
+        "shadow_stale",
+    }:
+        raise ValueError(f"unsupported lowering plan status: {plan.status}")
+
+    templates = {template.id: template for template in loop.lowering_templates}
+    plans = {template.id: template for template in plan.templates}
+    if len(templates) != len(loop.lowering_templates):
+        raise ValueError("duplicate lowering template id")
+    if len(plans) != len(plan.templates):
+        raise ValueError("duplicate lowering plan template id")
+    if plan.status == "absent":
+        if templates or plans:
+            raise ValueError("absent lowering plan contains templates")
+        return
+    if templates.keys() != plans.keys():
+        raise ValueError("lowering template/plan ids differ")
+
+    nodes = {node.id: node for node in loop.nodes}
+    stream_orders: dict[int, list[int]] = {}
+    for template_id, template in templates.items():
+        if template.relation not in {"always", "same_wg", "different_wg"}:
+            raise ValueError(f"invalid lowering relation in template {template_id}")
+        if template.src_node not in nodes or template.dst_node not in nodes:
+            raise ValueError(f"unknown lowering endpoint in template {template_id}")
+        event_templates = {event.id: event for event in template.events}
+        if len(event_templates) != len(template.events):
+            raise ValueError(f"duplicate lowering event in template {template_id}")
+        for event in template.events:
+            if event.anchor_node not in nodes:
+                raise ValueError(f"unknown lowering anchor in template {template_id}")
+            if event.owner not in {"src", "dst"}:
+                raise ValueError(f"invalid lowering owner in template {template_id}")
+            if event.placement not in {"before", "after"}:
+                raise ValueError(
+                    f"invalid lowering placement in template {template_id}"
+                )
+            if event.issue_duration < 0 or event.completion_latency < 0:
+                raise ValueError(f"negative lowering timing in template {template_id}")
+            if event.frequency <= 0 or event.depth <= 0 or event.bytes < 0:
+                raise ValueError(f"invalid lowering resource in template {template_id}")
+
+        template_plan = plans[template_id]
+        planned_events = {event.id: event for event in template_plan.events}
+        if len(planned_events) != len(template_plan.events):
+            raise ValueError(f"duplicate planned event in template {template_id}")
+        if plan.status == "shadow_stale":
+            continue
+
+        src_wg = nodes[template.src_node].warp_group
+        dst_wg = nodes[template.dst_node].warp_group
+        expected_active = (
+            template.relation == "always"
+            or (template.relation == "same_wg" and src_wg == dst_wg)
+            or (template.relation == "different_wg" and src_wg != dst_wg)
+        )
+        if template_plan.active != expected_active:
+            raise ValueError(f"lowering presence mismatch in template {template_id}")
+        expected_event_ids = event_templates.keys() if expected_active else set()
+        if planned_events.keys() != expected_event_ids:
+            raise ValueError(f"lowering event ids differ in template {template_id}")
+        for event_id, event in planned_events.items():
+            event_template = event_templates[event_id]
+            owner_node = (
+                template.src_node
+                if event_template.owner == "src"
+                else template.dst_node
+            )
+            owner_wg = nodes[owner_node].warp_group
+            if event.warp_group != owner_wg:
+                raise ValueError(f"lowering owner mismatch in template {template_id}")
+            if nodes[event_template.anchor_node].warp_group != owner_wg:
+                raise ValueError(f"lowering anchor mismatch in template {template_id}")
+            stream_orders.setdefault(event.warp_group, []).append(event.stream_order)
+
+    for warp_group, orders in stream_orders.items():
+        if sorted(orders) != list(range(len(orders))):
+            raise ValueError(f"non-contiguous lowering stream for WG {warp_group}")
+
+
+def _to_schedule_loop(d: dict[str, Any]) -> ScheduleLoop:
+    iv = d.get("induction_var", {})
+    g = d.get("graph", {})
+    loop = ScheduleLoop(
+        id=d["id"],
+        II=d["II"],
+        max_stage=d["max_stage"],
+        prologue_latency=d.get("prologue_latency", 0),
+        trip_count=d.get("trip_count", 0),
+        trip_count_estimated=d.get("trip_count_estimated", False),
+        induction_var_name=iv.get("name", "iv"),
+        induction_var_type=iv.get("type", "i32"),
+        lower_bound=_parse_operand(d["lower_bound"]),
+        upper_bound=_parse_operand(d["upper_bound"]),
+        step=_parse_operand(d["step"]),
+        buffers=[_to_buffer(b) for b in d.get("buffers", [])],
+        nodes=[_to_node(n) for n in g.get("nodes", [])],
+        edges=[
+            Edge(
+                src=e["src"],
+                dst=e["dst"],
+                kind=e["kind"],
+                distance=e["distance"],
+                latency=e["latency"],
+            )
+            for e in g.get("edges", [])
+        ],
+        cross_wg_barriers=[
+            CrossWGBarrier(
+                producer_node=b["producer_node"],
+                consumer_node=b["consumer_node"],
+                producer_wg=b["producer_wg"],
+                consumer_wg=b["consumer_wg"],
+                kind=b["kind"],
+                depth=b["depth"],
+                paired_buffer_id=b.get("paired_buffer_id"),
+                expect_bytes=b["expect_bytes"],
+                distance=b.get("distance", 0),
+                arrive_after_node=b.get("arrive_after_node"),
+                wait_before_node=b.get("wait_before_node"),
+            )
+            for b in g.get("cross_wg_barriers", [])
+        ],
+        lowering_templates=tuple(
+            _to_lowering_template(template)
+            for template in d.get("lowering_templates", [])
+        ),
+        lowering_plan=_to_lowering_plan(d.get("lowering_plan")),
+    )
+    _validate_lowering_contract(loop)
+    return loop
+
+
+def load_graph(path: str | Path) -> ScheduleGraph:
+    with open(path) as f:
+        data = json.load(f)
+    return ScheduleGraph(
+        schema_version=data.get("schema_version", "0.0"),
+        kernel=Kernel(
+            name=data["kernel"]["name"],
+            args=[KernelArg(**a) for a in data["kernel"]["args"]],
+        ),
+        ops={
+            op_id: _to_op(op_id, op_data)
+            for op_id, op_data in data.get("ops", {}).items()
+        },
+        loops=[
+            Loop(
+                loop_id=L["loop_id"],
+                is_outer=L.get("is_outer", False),
+                warp_groups=[WarpGroup(**w) for w in L.get("warp_groups", [])],
+                schedule=_to_schedule_loop(L["schedule_loop"]),
+            )
+            for L in data.get("loops", [])
+        ],
+    )

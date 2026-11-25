@@ -1,10 +1,12 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "unittest/Util/ScopedAllowNpot.h"
 
 #include "mlir/Support/LLVM.h"
 #include "llvm/Support/Signals.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <set>
 
 namespace mlir {
 std::ostream &operator<<(std::ostream &os, StringAttr str) {
@@ -57,6 +59,15 @@ TEST_F(LinearLayoutTest, Identity1DSize1) {
   EXPECT_THAT(to_vector(layout.getOutDimNames()), ElementsAre(S("testOuts")));
   EXPECT_THAT(layout.getInDimSizeLog2(S("testIns")), 0);
   EXPECT_THAT(layout.getOutDimSizeLog2(S("testOuts")), 0);
+}
+
+TEST_F(LinearLayoutTest, NpotOutDimIsNotALayout) {
+  BasesT bases;
+  bases[S("in")] = {{1}, {2}};
+  EXPECT_FALSE(LinearLayout::tryCreate(bases, {{S("out"), 3}},
+                                       /*requireSurjective=*/false));
+  EXPECT_TRUE(LinearLayout::tryCreate(bases, {{S("out"), 4}},
+                                      /*requireSurjective=*/false));
 }
 
 TEST_F(LinearLayoutTest, Zeros1D) {
@@ -131,9 +142,13 @@ TEST_F(LinearLayoutTest, TimesEquals) {
 }
 
 TEST_F(LinearLayoutTest, ConcatRequiresDisjointDimensions) {
+#ifdef NDEBUG
+  SUCCEED();
+#else
   auto layout = LinearLayout::identity1D(2, S("in"), S("out"));
   ASSERT_DEATH((void)layout.concatIns(layout), "disjoint input dimensions");
   ASSERT_DEATH((void)layout.concatOuts(layout), "disjoint output dimensions");
+#endif
 }
 
 TEST_F(LinearLayoutTest, GetOutDimSizeLog2) {
@@ -192,7 +207,6 @@ TEST_F(LinearLayoutTest, TransposeIns) {
 }
 
 TEST_F(LinearLayoutTest, EmptyToString) {
-  // Mostly I just want to make sure it doesn't crash.
   EXPECT_EQ(LinearLayout::empty().toString(), "\n(empty layout)");
 }
 
@@ -651,38 +665,6 @@ TEST_F(LinearLayoutTest, InvertAndComposeBlockLocal) {
                                     {S("dim")});
   EXPECT_EQ(invertAndComposeLocal(partitionedMem, transposedReg, {S("block")}),
             transposedReg.invertAndCompose(partitionedMem));
-}
-
-TEST_F(LinearLayoutTest, LocalStoreReplicasSkipOffsetHoles) {
-  auto reg = S("register");
-  auto offset = S("offset");
-  auto block = S("block");
-  auto dim = S("dim");
-  LinearLayout shared({{offset, {{1}, {0}}}, {block, {{0}, {0}}}}, {dim});
-  LinearLayout sharded({{reg, {}}, {block, {{1}, {0}}}}, {dim});
-
-  auto store = invertAndComposeStore(shared, sharded);
-  // CTA bit 1 already has a source copy. Repeat the value only across CTA
-  // bit 0, leaving the high offset bit clear.
-  EXPECT_EQ(store, LinearLayout({{reg, {{0, 1}}}, {block, {{1, 1}, {0, 2}}}},
-                                {{offset, 4}, {block, 4}},
-                                /*requireSurjective=*/false));
-}
-
-TEST_F(LinearLayoutTest, LocalStoreReplicasWithCorrelatedBlockBits) {
-  auto reg = S("register");
-  auto offset = S("offset");
-  auto block = S("block");
-  auto dim = S("dim");
-  LinearLayout src({{reg, {}}, {block, {{1}, {1}, {2}}}}, {dim});
-  LinearLayout shared({{offset, {{1}}}, {block, {{0}, {2}, {0}}}}, {dim});
-
-  // Source CTAs 0 and 3 already store element 0 in CTAs 0 and 1.
-  // A single register basis reaches the remaining copies in CTAs 4 and 5.
-  auto store = invertAndComposeStore(shared, src);
-  EXPECT_EQ(store,
-            LinearLayout({{reg, {{0, 4}}}, {block, {{1, 1}, {1, 0}, {0, 6}}}},
-                         {offset, block}));
 }
 
 TEST_F(LinearLayoutTest, InvertAndCompose_IdentityInDim) {
@@ -1359,6 +1341,677 @@ TEST_F(LinearLayoutTest, invertAndCompose1) {
   auto cvt = regLayout.invertAndCompose(sharedLayout);
 
   EXPECT_TRUE(cvt.isTrivialOver(S("block")));
+}
+
+class MixedRadixTest : public LinearLayoutTest {
+protected:
+  // register = 3 * d1 + d0 with d0 < 3 (zero basis) and d1 < 2; lane < 2.
+  LinearLayout mixed(ArrayRef<int32_t> regRadices = {3, 2}) {
+    BasesT bases;
+    bases[S("register")] = {{0}, {1}};
+    bases[S("lane")] = {{2}};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = regRadices.vec();
+    radices[S("lane")] = {2};
+    return LinearLayout(bases, radices, {{S("dim0"), 4}}, true);
+  }
+};
+
+TEST_F(MixedRadixTest, TryCreateRejectsInvalidRadices) {
+  auto tryCreate = [&](BasesT bases, LinearLayout::RadicesT radices) {
+    return LinearLayout::tryCreate(std::move(bases), std::move(radices),
+                                   {{S("dim0"), 2}}, false);
+  };
+  BasesT reg;
+  reg[S("register")] = {{0}, {1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {3};
+  EXPECT_FALSE(tryCreate(reg, radices)); // one radix for two bases
+  radices[S("register")] = {1, 2};
+  EXPECT_FALSE(tryCreate(reg, radices));
+  radices[S("register")] = {2, 3};
+  EXPECT_FALSE(tryCreate(reg, radices)); // radix 3 with basis 1
+  BasesT big;
+  big[S("register")].assign(20, {0});
+  LinearLayout::RadicesT bigRadices;
+  bigRadices[S("register")].assign(20, 3);
+  EXPECT_FALSE(tryCreate(big, bigRadices)); // 3^20 > INT32_MAX
+  // Controls: the same digits with valid radices, and a radix-2 layout above
+  // INT32_MAX.
+  radices[S("register")] = {3, 2};
+  EXPECT_TRUE(tryCreate(reg, radices));
+  big[S("register")].assign(31, {0});
+  EXPECT_TRUE(tryCreate(big, {}));
+}
+
+TEST_F(MixedRadixTest, Sizes) {
+  LinearLayout ll = mixed();
+  EXPECT_FALSE(ll.isRadix2());
+  EXPECT_EQ(ll.getInDimSize(S("register")), 6);
+  EXPECT_EQ(ll.getTotalInDimSize(), 12);
+  EXPECT_TRUE(ll.isSurjective());
+  EXPECT_FALSE(ll.isInjective());
+  EXPECT_EQ(mixed({2, 2}).getInDimSize(S("register")), 4);
+}
+
+TEST_F(MixedRadixTest, Apply) {
+  LinearLayout ll = mixed();
+  for (int32_t reg = 0; reg < 6; ++reg) {
+    EXPECT_EQ(
+        ll.apply({{S("register"), reg}, {S("lane"), 1}}),
+        (SmallVector<std::pair<StringAttr, int32_t>>{{S("dim0"), 2 + reg / 3}}))
+        << reg;
+  }
+  // Radix-2 control: register 2 sets d1.
+  EXPECT_EQ(mixed({2, 2}).apply({{S("register"), 2}, {S("lane"), 0}}),
+            (SmallVector<std::pair<StringAttr, int32_t>>{{S("dim0"), 1}}));
+}
+
+TEST_F(MixedRadixTest, PreconditionAsserts) {
+#ifdef NDEBUG
+  SUCCEED();
+#else
+  LinearLayout ll = mixed(), pow2 = mixed({2, 2});
+  ColumnAction action({0, 1}, S("register"), 2, {3, 2});
+  // Radix-2-only operations.
+  EXPECT_DEATH((void)ll.getFreeVariableMasks(), "isRadix2");
+  EXPECT_DEATH(
+      (void)ll.compose(LinearLayout::identity1D(4, S("dim0"), S("out"))),
+      "isRadix2");
+  EXPECT_DEATH((void)ll.invertAndCompose(ll), "isRadix2");
+  EXPECT_DEATH((void)lstsq(ll, ll), "isRadix2");
+  EXPECT_DEATH((void)divideLeft(ll, ll), "isRadix2");
+  EXPECT_DEATH((void)divideRight(ll, ll), "isRadix2");
+  EXPECT_DEATH((void)ColumnAction::identity(S("register"), 2).apply(ll),
+               "isRadix2");
+  EXPECT_DEATH((void)action.apply(pow2), "isRadix2");
+  EXPECT_DEATH((void)action.leftCompose(action), "isRadix2");
+  // concatOuts needs equal radices, reshapeIns whole digits, and
+  // ColumnAction::apply one value per index.
+  BasesT zeros;
+  zeros[S("register")] = {{0}, {0}};
+  zeros[S("lane")] = {{0}};
+  LinearLayout::RadicesT swapped;
+  swapped[S("register")] = {2, 3};
+  swapped[S("lane")] = {2};
+  EXPECT_DEATH((void)ll.concatOuts(
+                   LinearLayout(zeros, swapped, {{S("dim1"), 1}}, false)),
+               "same input radices");
+  LinearLayout flat = ll.flattenIns();
+  EXPECT_DEATH((void)flat.reshapeIns({{S("register"), 2}, {S("lane"), 6}}),
+               "end on a digit");
+  EXPECT_DEATH((void)flat.reshapeIns({{S("register"), 6}}), "take every digit");
+  SmallVector<Value> four(4);
+  EXPECT_DEATH((void)action.apply(four), "different size");
+#endif
+}
+
+TEST_F(MixedRadixTest, EqualityAndHashSeeRadices) {
+  EXPECT_EQ(mixed(), mixed());
+  EXPECT_EQ(hash_value(mixed()), hash_value(mixed()));
+  EXPECT_NE(mixed(), mixed({2, 2}));
+  EXPECT_NE(hash_value(mixed()), hash_value(mixed({2, 2})));
+}
+
+TEST_F(MixedRadixTest, PrintShowsRadicesAndWeights) {
+  EXPECT_THAT(mixed().toString(),
+              ::testing::HasSubstr("register=1 (radix 3) -> (0)\n"
+                                   "   register=3 -> (1)\n"));
+}
+
+TEST_F(MixedRadixTest, ReshapeInsCutsAtDigitBoundaries) {
+  LinearLayout flat = mixed().flattenIns();
+  EXPECT_THAT(flat.getInputRadices(S("register")), ElementsAre(3, 2, 2));
+  EXPECT_EQ(flat.getInDimSize(S("register")), 12);
+  EXPECT_EQ(flat.reshapeIns({{S("register"), 6}, {S("lane"), 2}}), mixed());
+}
+
+TEST_F(MixedRadixTest, MixedRadixConcatenatesDigits) {
+  auto reg2 = LinearLayout::identity1D(2, S("register"), S("dim1"));
+  EXPECT_THAT((mixed() * reg2).getInputRadices(S("register")),
+              ElementsAre(3, 2, 2));
+  EXPECT_THAT((reg2 * mixed()).getInputRadices(S("register")),
+              ElementsAre(2, 3, 2));
+}
+
+TEST_F(MixedRadixTest, StructuralOpsKeepRadices) {
+  LinearLayout ll = mixed() * LinearLayout::identity1D(2, S("lane"), S("dim1"));
+  auto keeps = [&](const LinearLayout &other) {
+    return llvm::equal(other.getInputRadices(), ll.getInputRadices());
+  };
+  EXPECT_EQ(
+      ll.sublayout({S("register")}, {S("dim0")}).getInputRadices(S("register")),
+      ll.getInputRadices(S("register")));
+  EXPECT_TRUE(keeps(ll.transposeOuts({S("dim1"), S("dim0")})));
+  EXPECT_TRUE(keeps(ll.transposeIns({S("lane"), S("register")})
+                        .transposeIns({S("register"), S("lane")})));
+  EXPECT_TRUE(
+      keeps(ll.sublayout({S("register")}, {S("dim0"), S("dim1")})
+                .concatIns(ll.sublayout({S("lane")}, {S("dim0"), S("dim1")}))));
+  BasesT zeros;
+  zeros[S("register")] = {{0}, {0}};
+  zeros[S("lane")] = {{0}, {0}};
+  EXPECT_TRUE(keeps(ll.concatOuts(
+      LinearLayout(zeros, ll.getInputRadices(), {{S("dim2"), 1}}, false))));
+  EXPECT_TRUE(keeps(ll.resizeOutDim(S("dim0"), 2)));
+  EXPECT_TRUE(keeps(ll.reshapeOuts({{S("flat"), 8}})));
+}
+
+TEST_F(MixedRadixTest, RemoveZeroBasesDropsTheirRadices) {
+  LinearLayout ll = mixed().removeZeroBasesAlongDim(S("register"));
+  EXPECT_THAT(ll.getInputRadices(S("register")), ElementsAre(2));
+  EXPECT_TRUE(ll.isRadix2());
+}
+
+TEST_F(MixedRadixTest, ColumnActionApplyValues) {
+  SmallVector<Value> values;
+  for (intptr_t i = 0; i < 6; ++i)
+    values.push_back(Value::getFromOpaquePointer(reinterpret_cast<void *>(i)));
+  auto ids = [](ArrayRef<Value> vals) {
+    return llvm::map_to_vector(vals, [](Value v) {
+      return reinterpret_cast<intptr_t>(v.getAsOpaquePointer());
+    });
+  };
+  // Output digit 0 is input digit 1 (radix 2), output digit 1 is input digit
+  // 0 (radix 3).
+  EXPECT_THAT(ids(ColumnAction({1, 0}, S("register"), 2, {3, 2}).apply(values)),
+              ElementsAre(0, 3, 1, 4, 2, 5));
+  EXPECT_THAT(ids(ColumnAction({1}, S("register"), 2, {3, 2}).apply(values)),
+              ElementsAre(0, 3));
+  ColumnAction swap({1, 0}, S("register"), 2, {3, 2});
+  EXPECT_THAT(ids(swap.inverse().apply(swap.apply(values))),
+              ElementsAre(0, 1, 2, 3, 4, 5));
+}
+
+class MixedRadixLayoutTest : public LinearLayoutTest {
+protected:
+  LinearLayout mixedRadix(std::vector<std::vector<int32_t>> regBases,
+                          std::vector<int32_t> regRadices,
+                          ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
+    BasesT bases;
+    bases[S("register")] = std::move(regBases);
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    return LinearLayout(std::move(bases), std::move(radices), outDims,
+                        /*requireSurjective=*/false);
+  }
+
+  // in -> out identity of a non-power-of-two size: binary digits, then one odd
+  // digit.
+  LinearLayout exactIdentity1D(int32_t size, StringAttr in, StringAttr out) {
+    int32_t twoPart = LinearLayout::twoPartOf(size);
+    BasesT bases;
+    LinearLayout::RadicesT radices;
+    for (int32_t bit = 1; bit < twoPart; bit *= 2) {
+      bases[in].push_back({bit});
+      radices[in].push_back(2);
+    }
+    bases[in].push_back({twoPart});
+    radices[in].push_back(size / twoPart);
+    return LinearLayout(std::move(bases), std::move(radices), {{out, size}},
+                        /*requireSurjective=*/true);
+  }
+};
+
+TEST_F(MixedRadixLayoutTest, InvariantsReject) {
+  auto build = [&](std::vector<std::vector<int32_t>> regBases,
+                   std::vector<int32_t> regRadices,
+                   ArrayRef<std::pair<StringAttr, int32_t>> outDims) {
+    (void)mixedRadix(std::move(regBases), std::move(regRadices), outDims);
+  };
+  EXPECT_DEATH(build({}, {}, {{S("x"), 0}}), "Out-dim sizes must be positive");
+  EXPECT_DEATH(build({{3}}, {2}, {{S("x"), 6}}),
+               "invalid radix-2 digit: it has an odd mixed-radix");
+  EXPECT_DEATH(build({{3}}, {3}, {{S("x"), 6}}),
+               "invalid non-binary digit: it has a binary mixed-radix");
+  EXPECT_DEATH(build({{2, 1}}, {3}, {{S("x"), 6}, {S("y"), 2}}),
+               "invalid input digit of radix 3 in in-dim 'register': its "
+               "basis must be zero on Binary outputs");
+  const char *unsupported = "NPOT layout not yet supported: each odd part "
+                            "needs one non-binary digit of that radix";
+  EXPECT_DEATH(build({{2, 2}}, {3}, {{S("x"), 6}, {S("y"), 6}}), unsupported);
+  EXPECT_DEATH(build({{2}, {4}}, {3, 3}, {{S("x"), 6}}), unsupported);
+  EXPECT_DEATH(build({{2}}, {5}, {{S("x"), 6}}), unsupported);
+  EXPECT_DEATH(build({{6}}, {9}, {{S("x"), 18}}), unsupported);
+}
+
+TEST_F(MixedRadixLayoutTest, OnlyRadicesAllowMixedRadixSizes) {
+  BasesT bases;
+  bases[S("register")] = {{1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {2};
+  EXPECT_FALSE(LinearLayout::tryCreate(bases, {{S("x"), 6}}, false));
+  EXPECT_TRUE(LinearLayout::tryCreate(bases, radices, {{S("x"), 6}}, false));
+  EXPECT_TRUE(LinearLayout::tryCreate({}, {}, {{S("x"), 6}}, false));
+  EXPECT_DEATH((void)LinearLayout(bases, {{S("x"), 6}}, false),
+               "Out-dim sizes must be powers of 2");
+}
+
+TEST_F(MixedRadixLayoutTest, SublayoutWithoutInDimsKeepsMixedRadixSize) {
+  // No in-dims leave an empty radices map, which still allows the size.
+  LinearLayout sub =
+      mixedRadix({{1}}, {2}, {{S("dim"), 6}}).sublayout({}, {S("dim")});
+  EXPECT_EQ(sub.getOutDimSize(S("dim")), 6);
+}
+
+TEST_F(MixedRadixLayoutTest, RankCountsOwnedOddCoordinates) {
+  // Odd part 5: the codomain rank is countr_zero(20) + 1, below Log2(20).
+  LinearLayout twenty = exactIdentity1D(20, S("register"), S("dim"));
+  EXPECT_TRUE(twenty.isSurjective());
+  EXPECT_TRUE(twenty.isInjective());
+  EXPECT_EQ(twenty.getTotalOutDimSize(), 20);
+  LinearLayout mixedRadixBit = mixedRadix({{1}}, {2}, {{S("dim"), 6}});
+  EXPECT_FALSE(mixedRadixBit.isSurjective());
+  // A mixed-radix output alone keeps a layout off the radix-2 algorithms.
+  EXPECT_FALSE(mixedRadixBit.isRadix2());
+  // A zero radix-2 digit after the odd digit: registers 0 and 6 collide.
+  EXPECT_FALSE(
+      mixedRadix({{1}, {2}, {0}}, {2, 3, 2}, {{S("dim"), 6}}).isInjective());
+  // A broadcast non-binary digit adds no rank.
+  EXPECT_TRUE(
+      mixedRadix({{1}, {2}, {0}}, {2, 3, 3}, {{S("dim"), 6}}).isSurjective());
+  // Odd coefficient 4: basis 16 is above the Log2(20) binary rows.
+  EXPECT_TRUE(
+      mixedRadix({{1}, {2}, {16}}, {2, 2, 5}, {{S("dim"), 20}}).isSurjective());
+}
+
+TEST_F(MixedRadixLayoutTest, EqualIgnoringOutDimSizesComparesTwoParts) {
+  // Basis 4 is odd coordinate 2 at size 6 and odd coordinate 1 at size 12.
+  EXPECT_FALSE(mixedRadix({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
+                   .equalIgnoringOutDimSizes(
+                       mixedRadix({{1}, {4}}, {2, 3}, {{S("dim"), 12}})));
+  EXPECT_TRUE(
+      mixedRadix({{1}}, {2}, {{S("dim"), 6}})
+          .equalIgnoringOutDimSizes(mixedRadix({{1}}, {2}, {{S("dim"), 10}})));
+}
+
+TEST_F(MixedRadixLayoutTest, ReshapeInsAndRemoveZeroBasesKeepMixedRadix) {
+  BasesT bases;
+  LinearLayout::RadicesT radices;
+  bases[S("register")] = {{1, 0}, {2, 0}};
+  radices[S("register")] = {2, 3};
+  bases[S("lane")] = {{0, 1}};
+  radices[S("lane")] = {2};
+  LinearLayout ll(bases, radices, {{S("x"), 6}, {S("y"), 2}},
+                  /*requireSurjective=*/true);
+  EXPECT_EQ(ll.flattenIns().reshapeIns({{S("register"), 6}, {S("lane"), 2}}),
+            ll);
+  bases[S("register")].push_back({0, 0});
+  radices[S("register")].push_back(2);
+  EXPECT_EQ(LinearLayout(bases, radices, ll.getOutDims(),
+                         /*requireSurjective=*/false)
+                .removeZeroBasesAlongDim(S("register")),
+            ll);
+}
+
+TEST_F(MixedRadixLayoutTest, FreeVariableMasksFreeNonOwningDigits) {
+  // Digit 1 repeats digit 0's binary part and digit 3 is a zero odd digit;
+  // digit 2 owns the odd coordinates.
+  EXPECT_EQ(mixedRadix({{1}, {1}, {2}, {0}}, {2, 2, 3, 3}, {{S("dim"), 6}})
+                .getFreeVariableMasks()
+                .lookup(S("register")),
+            0b1010);
+}
+
+TEST_F(MixedRadixLayoutTest, MultiplyPlacesOddPartOnTop) {
+  auto kReg = S("register"), kOut = S("out");
+  // Inner's odd digit moves above outer's binary digits.
+  EXPECT_EQ(exactIdentity1D(6, kReg, kOut) *
+                LinearLayout::identity1D(4, kReg, kOut),
+            mixedRadix({{1}, {8}, {2}, {4}}, {2, 3, 2, 2}, {{kOut, 24}}));
+  EXPECT_EQ(LinearLayout::identity1D(2, kReg, kOut) *
+                exactIdentity1D(6, kReg, kOut),
+            exactIdentity1D(12, kReg, kOut));
+}
+
+TEST_F(MixedRadixLayoutTest, MultiplyRejectsTwoMixedRadixFactorsOnOneOutput) {
+  auto kReg = S("register"), kOut = S("out");
+  EXPECT_DEATH(
+      (void)(exactIdentity1D(3, kReg, kOut) * exactIdentity1D(5, kReg, kOut)),
+      "each odd part needs one non-binary digit");
+}
+
+TEST_F(MixedRadixLayoutTest, Apply) {
+  LinearLayout six = exactIdentity1D(6, S("register"), S("dim"));
+  for (int32_t i = 0; i < 24; ++i)
+    EXPECT_EQ(six.apply({{S("register"), i}}).front().second, i % 6) << i;
+  // A Binary output beside a mixed-radix output keeps XOR arithmetic.
+  LinearLayout twoDims =
+      six * LinearLayout::identity1D(4, S("lane"), S("other"));
+  for (int32_t lane = 0; lane < 4; ++lane)
+    EXPECT_THAT(twoDims.apply({{S("register"), 5}, {S("lane"), lane}}),
+                ElementsAre(Pair(S("dim"), 5), Pair(S("other"), lane)));
+  // Odd coefficient 2 is a unit mod 3: digit 2 wraps to odd coordinate 1.
+  EXPECT_EQ(mixedRadix({{1}, {4}}, {2, 3}, {{S("dim"), 6}})
+                .apply({{S("register"), 4}})
+                .front()
+                .second,
+            2);
+}
+
+// fp16 [rows, *] tile in swizzled panels of swizzleBytes / 2 columns, panel
+// after panel.
+int32_t nvmmaOffset(int32_t row, int32_t col, int32_t swizzleBytes,
+                    int32_t rows) {
+  int32_t width = swizzleBytes / 2, c = col % width;
+  int32_t phase = row / (128 / swizzleBytes) % (width / 8);
+  return col / width * rows * width + row * width + (c / 8 ^ phase) * 8 + c % 8;
+}
+
+class OffsetTableTest : public MixedRadixLayoutTest {
+protected:
+  using Point = SmallVector<std::pair<StringAttr, int32_t>>;
+
+  void forEachPoint(const LinearLayout &layout,
+                    function_ref<void(const Point &)> fn) {
+    Point point;
+    SmallVector<int32_t> sizes;
+    for (StringAttr inDim : layout.getInDimNames()) {
+      point.push_back({inDim, 0});
+      sizes.push_back(layout.getInDimSize(inDim));
+    }
+    for (size_t d = 0; d < point.size();) {
+      fn(point);
+      for (d = 0; d < point.size() && ++point[d].second == sizes[d]; ++d)
+        point[d].second = 0;
+    }
+  }
+
+  // (dim0 = col, dim1 = row) -> offset of the fp16 [96, 128] tile in two
+  // 128B-swizzled panels; the panel digit p has basis `panelBasis`.
+  std::optional<LinearLayout>
+  denseShared(int32_t panelBasis,
+              SmallVector<std::pair<StringAttr, int32_t>> digits,
+              std::vector<int32_t> offsets, std::string *diagnostic = nullptr) {
+    BasesT bases;
+    LinearLayout::RadicesT radices;
+    for (int32_t i = 0; i < 6; ++i)
+      bases[S("dim0")].push_back({1 << i});
+    bases[S("dim0")].push_back({panelBasis});
+    radices[S("dim0")] = std::vector<int32_t>(7, 2);
+    for (int32_t i = 0; i < 5; ++i)
+      bases[S("dim1")].push_back({nvmmaOffset(1 << i, 0, 128, 96)});
+    bases[S("dim1")].push_back({0});
+    radices[S("dim1")] = {2, 2, 2, 2, 2, 3};
+    llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+        tableDigits;
+    tableDigits[S("offset")] = std::move(digits);
+    llvm::MapVector<StringAttr, std::vector<int32_t>> tableOffsets;
+    tableOffsets[S("offset")] = std::move(offsets);
+    return LinearLayout::tryCreate(bases, radices, {{S("offset"), 96 * 128}},
+                                   tableDigits, tableOffsets,
+                                   /*requireSurjective=*/true, diagnostic);
+  }
+  std::optional<LinearLayout> denseShared() {
+    return denseShared(0, {{S("dim0"), 6}, {S("dim1"), 5}},
+                       {0, 6144, 2048, 8192, 4096, 10240});
+  }
+
+  // fp16 [96, cols] over 4 warps: the col 64 digit (radix cols / 64), row 16
+  // and the odd row digit are in registers.
+  LinearLayout tile96(int32_t cols) {
+    BasesT bases;
+    LinearLayout::RadicesT radices;
+    bases[S("register")] = {{1, 0}, {2, 0}, {4, 0}, {0, 16}, {64, 0}, {0, 32}};
+    radices[S("register")] = {2, 2, 2, 2, cols / 64, 3};
+    bases[S("lane")] = {{8, 0}, {16, 0}, {32, 0}, {0, 1}, {0, 2}};
+    radices[S("lane")] = std::vector<int32_t>(5, 2);
+    bases[S("warp")] = {{0, 4}, {0, 8}};
+    radices[S("warp")] = {2, 2};
+    return LinearLayout(bases, radices, {{S("dim0"), cols}, {S("dim1"), 96}},
+                        /*requireSurjective=*/true);
+  }
+
+  // x -> f(x) with x digit 1 unused. Over odd radices {3, 5} the table has
+  // two odd factors, so it is not in odd-part form; over {3} it is.
+  static int32_t f(int32_t x) { return x % 2 + 2 * (x / 4 % 2) + 4 * (x / 8); }
+  LinearLayout oddTable(ArrayRef<int32_t> odd, StringRef in = "x",
+                        StringRef out = "offset") {
+    BasesT bases;
+    bases[S(in)] = {{1}, {0}, {2}};
+    LinearLayout::RadicesT radices;
+    radices[S(in)] = {2, 2, 2};
+    llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+        digits;
+    llvm::MapVector<StringAttr, std::vector<int32_t>> offsets;
+    int32_t oddSize = 1;
+    for (int32_t radix : odd) {
+      digits[S(out)].push_back({S(in), int32_t(bases[S(in)].size())});
+      bases[S(in)].push_back({4 * oddSize});
+      radices[S(in)].push_back(radix);
+      oddSize *= radix;
+    }
+    for (int32_t t = 0; t < oddSize; ++t)
+      offsets[S(out)].push_back(4 * t);
+    return *LinearLayout::tryCreate(bases, radices, {{S(out), 4 * oddSize}},
+                                    digits, offsets,
+                                    /*requireSurjective=*/false);
+  }
+  // The general layout first, then the odd-part control.
+  SmallVector<SmallVector<int32_t>> oddRadices() { return {{3, 5}, {3}}; }
+
+  // Expects result(x) == f(old(x)) on every input of the 1D result.
+  void expectOld(const LinearLayout &result,
+                 function_ref<int32_t(int32_t)> old) {
+    forEachPoint(result, [&](const Point &x) {
+      EXPECT_EQ(result.apply(x)[0].second, f(old(x[0].second))) << x[0].second;
+    });
+  }
+};
+
+TEST_F(OffsetTableTest, ProductOfGeneralTable) {
+  for (const auto &odd : oddRadices()) {
+    LinearLayout inner = oddTable(odd);
+    EXPECT_EQ(inner.hasOddPartForm(), odd.size() == 1);
+    LinearLayout outer = LinearLayout::identity1D(2, S("y"), S("offset"));
+    LinearLayout product = inner * outer;
+    forEachPoint(product, [&](const Point &x) {
+      int32_t v = f(x[0].second);
+      EXPECT_EQ(product.apply(x)[0].second,
+                v % 4 + 4 * (x[1].second + 2 * (v / 4)));
+    });
+  }
+}
+
+TEST_F(OffsetTableTest, ReshapeOutsOfGeneralTable) {
+  for (const auto &odd : oddRadices()) {
+    LinearLayout layout = oddTable(odd);
+    int32_t oddSize = layout.getOutDimSize(S("offset")) / 4;
+    LinearLayout split = layout.reshapeOuts({{S("lo"), 4}, {S("hi"), oddSize}});
+    forEachPoint(split, [&](const Point &x) {
+      int32_t v = f(x[0].second);
+      EXPECT_EQ(split.apply(x), (Point{{S("lo"), v % 4}, {S("hi"), v / 4}}));
+    });
+    EXPECT_EQ(split.reshapeOuts({{S("offset"), 4 * oddSize}}), layout);
+  }
+}
+
+TEST_F(OffsetTableTest, ConcatInsOfGeneralTable) {
+  for (const auto &odd : oddRadices()) {
+    LinearLayout lhs = oddTable(odd);
+    BasesT bases;
+    bases[S("y")] = {{1}, {2}};
+    LinearLayout::RadicesT radices;
+    radices[S("y")] = {2, 2};
+    LinearLayout rhs(bases, radices, lhs.getOutDims(), false);
+    LinearLayout both = lhs.concatIns(rhs);
+    forEachPoint(both, [&](const Point &x) {
+      EXPECT_EQ(both.apply(x)[0].second, f(x[0].second) ^ x[1].second);
+    });
+  }
+}
+
+TEST_F(OffsetTableTest, ConcatOutsOfGeneralTable) {
+  for (const auto &odd : oddRadices()) {
+    LinearLayout lhs = oddTable(odd);
+    BasesT bases = lhs.getBases();
+    for (auto &basis : bases[S("x")])
+      basis[0] = basis[0] < 4 ? basis[0] : 0;
+    LinearLayout rhs(bases, lhs.getInputRadices(), {{S("low"), 4}}, false);
+    LinearLayout both = lhs.concatOuts(rhs);
+    forEachPoint(both, [&](const Point &x) {
+      int32_t v = f(x[0].second);
+      EXPECT_EQ(both.apply(x), (Point{{S("offset"), v}, {S("low"), v % 4}}));
+    });
+  }
+}
+
+TEST_F(OffsetTableTest, RenameGeneralTable) {
+  for (const auto &odd : oddRadices()) {
+    LinearLayout renamed = renameLinearLayoutDims(
+        oddTable(odd), {{S("x"), S("y")}}, {{S("offset"), S("out")}});
+    EXPECT_EQ(renamed, oddTable(odd, "y", "out"));
+    expectOld(renamed, [](int32_t x) { return x; });
+  }
+}
+
+TEST_F(OffsetTableTest, RemoveZeroBasesOfGeneralTable) {
+  for (const auto &odd : oddRadices()) {
+    LinearLayout stripped = oddTable(odd).removeZeroBasesAlongDim(S("x"));
+    EXPECT_EQ(stripped.getInDimSizeLog2(S("x")), int32_t(odd.size()) + 2);
+    expectOld(stripped, [](int32_t x) { return x % 2 + 4 * (x / 2); });
+  }
+}
+
+TEST_F(OffsetTableTest, ColumnActionOnGeneralTable) {
+  for (const auto &odd : oddRadices()) {
+    LinearLayout layout = oddTable(odd);
+    auto radices = layout.getInputRadices(S("x")).vec();
+    // Odd digit 3 first and digit 2 last; digit 1 is dropped.
+    SmallVector<size_t> action = {3, 0};
+    for (size_t d = 4; d < radices.size(); ++d)
+      action.push_back(d);
+    action.push_back(2);
+    LinearLayout result =
+        ColumnAction(action, S("x"), radices.size(), radices).apply(layout);
+    expectOld(result, [&](int32_t x) {
+      SmallVector<int32_t> digits(radices.size(), 0);
+      for (size_t a : action) {
+        digits[a] = x % radices[a];
+        x /= radices[a];
+      }
+      int32_t old = 0;
+      for (size_t d = radices.size(); d-- > 0;)
+        old = old * radices[d] + digits[d];
+      return old;
+    });
+  }
+}
+
+TEST_F(OffsetTableTest, ResizeInDimOfGeneralTable) {
+  for (const auto &odd : oddRadices()) {
+    LinearLayout layout = oddTable(odd);
+    int32_t size = layout.getInDimSize(S("x"));
+    expectOld(layout.resizeInDim(S("x"), 24), [](int32_t x) { return x; });
+    expectOld(layout.resizeInDim(S("x"), 2 * size),
+              [&](int32_t x) { return x % size; });
+  }
+}
+
+TEST_F(OffsetTableTest, DenseTwoPanelTableIsCanonical) {
+  auto shared = denseShared();
+  ASSERT_TRUE(shared);
+  forEachPoint(*shared, [&](const Point &x) {
+    EXPECT_EQ(shared->apply(x)[0].second,
+              nvmmaOffset(x[1].second, x[0].second, 128, 96));
+  });
+  // XORing the panel's 6144 is the same function, but binary bases must stay
+  // below the table's 2048s, so p joins the table: 2048 * (q + 3p).
+  auto binaryPanel = denseShared(6144, {{S("dim1"), 5}}, {0, 2048, 4096});
+  ASSERT_TRUE(binaryPanel);
+  EXPECT_EQ(*binaryPanel, *shared);
+  EXPECT_EQ(hash_value(*binaryPanel), hash_value(*shared));
+  EXPECT_THAT(binaryPanel->getTableDigits(S("offset")),
+              ElementsAre(Pair(S("dim0"), 6), Pair(S("dim1"), 5)));
+  EXPECT_THAT(binaryPanel->getTableOffsets(S("offset")),
+              ElementsAre(0, 6144, 2048, 8192, 4096, 10240));
+}
+
+TEST_F(OffsetTableTest, ComposeAndInvertPromoteDigits) {
+  auto shared = denseShared();
+  ASSERT_TRUE(shared);
+  LinearLayout tile = tile96(128);
+  // The register panel digit is promoted into the composed table.
+  LinearLayout toShared = tile.compose(*shared);
+  EXPECT_THAT(toShared.getTableDigits(S("offset")),
+              ElementsAre(Pair(S("register"), 4), Pair(S("register"), 5)));
+  forEachPoint(tile, [&](const Point &x) {
+    auto coords = tile.apply(x);
+    EXPECT_EQ(toShared.apply(x)[0].second,
+              nvmmaOffset(coords[1].second, coords[0].second, 128, 96));
+  });
+  EXPECT_EQ(toShared.invertAndCompose(*shared), tile);
+  LinearLayout identity = shared->invertAndCompose(*shared);
+  forEachPoint(identity,
+               [&](const Point &x) { EXPECT_EQ(identity.apply(x), x); });
+  ScopedAllowNpot npot;
+  EXPECT_EQ(LinearLayout::identity1D(96, S("in"), S("out")).invert(),
+            LinearLayout::identity1D(96, S("out"), S("in")));
+}
+
+TEST_F(OffsetTableTest, ResizeNpotOutDim) {
+  LinearLayout tile = tile96(128);
+  EXPECT_EQ(tile.resizeOutDim(S("dim1"), 96), tile);
+  LinearLayout rows = tile.resizeOutDim(S("dim1"), 1);
+  forEachPoint(tile, [&](const Point &x) {
+    EXPECT_EQ(rows.apply(x),
+              (Point{{S("dim0"), tile.apply(x)[0].second}, {S("dim1"), 0}}));
+  });
+  auto shared = denseShared();
+  ASSERT_TRUE(shared);
+  LinearLayout flat = shared->resizeOutDim(S("offset"), 1);
+  forEachPoint(*shared, [&](const Point &x) {
+    EXPECT_EQ(flat.apply(x), (Point{{S("offset"), 0}}));
+  });
+}
+
+TEST_F(OffsetTableTest, MalformedTableIsRejected) {
+  std::string diagnostic;
+  EXPECT_FALSE(denseShared(0, {{S("dim0"), 6}, {S("dim1"), 5}},
+                           {0, 6144, 2048, 8192, 4096, 12288}, &diagnostic));
+  EXPECT_THAT(diagnostic, ::testing::HasSubstr("reaches 12288"));
+}
+
+TEST_F(OffsetTableTest, PaddingTable) {
+  // 4 elements of padding after every 64: P(off) = off + 4 * (off / 64).
+  auto pad = [](int32_t off) { return off + 4 * (off / 64); };
+  BasesT bases;
+  bases[S("offset")] = std::vector<std::vector<int32_t>>(13, {0});
+  LinearLayout::RadicesT radices;
+  radices[S("offset")] = std::vector<int32_t>(13, 2);
+  llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+      digits;
+  llvm::MapVector<StringAttr, std::vector<int32_t>> offsets;
+  for (int32_t i = 0; i < 13; ++i)
+    digits[S("offset")].push_back({S("offset"), i});
+  for (int32_t off = 0; off < 8192; ++off)
+    offsets[S("offset")].push_back(pad(off));
+  auto padded = LinearLayout::tryCreate(bases, radices, {{S("offset"), 8704}},
+                                        digits, offsets,
+                                        /*requireSurjective=*/false);
+  ASSERT_TRUE(padded);
+  ArrayRef<int32_t> table = padded->getTableOffsets(S("offset"));
+  EXPECT_THAT(padded->getTableDigits(S("offset")).front(),
+              Pair(S("offset"), 6));
+  ASSERT_EQ(table.size(), 128u);
+  for (int32_t hi = 0; hi < 128; ++hi)
+    EXPECT_EQ(table[hi], 68 * hi);
+  for (int32_t off = 0; off < 8192; ++off)
+    EXPECT_EQ(padded->apply({{S("offset"), off}})[0].second, pad(off));
+
+  // After the inverse of a radix-2 [64, 128] shared layout.
+  BasesT coordBases;
+  for (int32_t i = 0; i < 7; ++i)
+    coordBases[S("dim0")].push_back({nvmmaOffset(0, 1 << i, 128, 64)});
+  for (int32_t i = 0; i < 6; ++i)
+    coordBases[S("dim1")].push_back({nvmmaOffset(1 << i, 0, 128, 64)});
+  LinearLayout shared =
+      LinearLayout(coordBases, {{S("offset"), 8192}}, true).invert();
+  LinearLayout toPadded = shared.invert().compose(*padded);
+  forEachPoint(toPadded, [&](const Point &x) {
+    EXPECT_EQ(toPadded.apply(x)[0].second,
+              pad(nvmmaOffset(x[1].second, x[0].second, 128, 64)));
+  });
 }
 
 } // anonymous namespace

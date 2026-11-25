@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -19,9 +20,11 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include <list>
 #include <unordered_set>
@@ -57,10 +60,130 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
                         AsyncTaskId asyncTaskId);
 
+/// Check if `value` is transitively needed by an operation with the given
+/// asyncTaskId.
+static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId,
+                                bool followBackedge = true) {
+  SmallVector<Value> worklist;
+  DenseSet<Value> visited;
+  worklist.push_back(value);
+  visited.insert(value);
+  while (!worklist.empty()) {
+    Value curr = worklist.pop_back_val();
+    for (Operation *user : curr.getUsers()) {
+      // Follow only this operand through a shared control-flow yield.
+      if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+        if (auto forOp = dyn_cast<scf::ForOp>(yield->getParentOp())) {
+          for (auto [index, operand] : llvm::enumerate(yield.getOperands())) {
+            if (operand != curr)
+              continue;
+            if (index >= forOp.getNumResults())
+              continue;
+            Value iterArg = forOp.getRegionIterArg(index);
+            if (followBackedge && visited.insert(iterArg).second)
+              worklist.push_back(iterArg);
+            Value result = forOp.getResult(index);
+            if (visited.insert(result).second)
+              worklist.push_back(result);
+          }
+          continue;
+        }
+      }
+      // Follow an init only through its matching loop-carried value.
+      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+        bool isInit = false;
+        for (auto [index, init] : llvm::enumerate(forOp.getInitArgs())) {
+          if (init != curr)
+            continue;
+          isInit = true;
+          Value iterArg = forOp.getRegionIterArg(index);
+          if (visited.insert(iterArg).second)
+            worklist.push_back(iterArg);
+          Value result = forOp.getResult(index);
+          if (visited.insert(result).second)
+            worklist.push_back(result);
+        }
+        bool isLoopControl = curr == forOp.getLowerBound() ||
+                             curr == forOp.getUpperBound() ||
+                             curr == forOp.getStep();
+        if (isInit && !isLoopControl)
+          continue;
+      }
+      if (hasAsyncTaskId(user, asyncTaskId))
+        return true;
+      for (Value result : user->getResults()) {
+        if (visited.insert(result).second)
+          worklist.push_back(result);
+      }
+    }
+  }
+  return false;
+}
+
+/// Check if any result of `op` is transitively needed by an operation
+/// with the given asyncTaskId. This handles the case where an op doesn't
+/// have the target asyncTaskId but produces values consumed (directly or
+/// through a chain of ops) by ops that do.
+static bool isNeededByTask(Operation *op, AsyncTaskId asyncTaskId,
+                           bool followBackedge = true) {
+  for (Value result : op->getResults()) {
+    if (isValueNeededByTask(result, asyncTaskId, followBackedge))
+      return true;
+  }
+  return false;
+}
+
+static bool isYieldedValueAvailableForTask(Value value,
+                                           AsyncTaskId asyncTaskId) {
+  if (Operation *def = value.getDefiningOp())
+    return hasAsyncTaskId(def, asyncTaskId);
+
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg)
+    return false;
+
+  Operation *owner = blockArg.getOwner()->getParentOp();
+  if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
+    unsigned argNumber = blockArg.getArgNumber();
+    if (argNumber < forOp.getNumInductionVars())
+      return false;
+    Value initArg =
+        forOp.getInitArgs()[argNumber - forOp.getNumInductionVars()];
+    if (Operation *def = initArg.getDefiningOp())
+      return hasAsyncTaskId(def, asyncTaskId);
+  } else if (auto whileOp = dyn_cast<scf::WhileOp>(owner)) {
+    if (blockArg.getOwner() == whileOp.getBeforeBody()) {
+      Value initArg = whileOp.getInits()[blockArg.getArgNumber()];
+      if (Operation *def = initArg.getDefiningOp())
+        return hasAsyncTaskId(def, asyncTaskId);
+    } else if (blockArg.getOwner() == whileOp.getAfterBody()) {
+      Value forwarded =
+          whileOp.getConditionOp().getArgs()[blockArg.getArgNumber()];
+      if (Operation *def = forwarded.getDefiningOp())
+        return hasAsyncTaskId(def, asyncTaskId);
+    }
+  }
+
+  return false;
+}
+
+static bool shouldKeepIfResultForTask(scf::IfOp ifOp, unsigned resultIdx,
+                                      Value result, AsyncTaskId asyncTaskId) {
+  if (isValueNeededByTask(result, asyncTaskId))
+    return true;
+  if (isYieldedValueAvailableForTask(ifOp.thenYield().getOperand(resultIdx),
+                                     asyncTaskId))
+    return true;
+  return ifOp.elseBlock() &&
+         isYieldedValueAvailableForTask(ifOp.elseYield().getOperand(resultIdx),
+                                        asyncTaskId);
+}
+
 unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
                       unsigned requestedRegisters) {
   assert(asyncTaskId != 0 && "producer group should not request registers");
   // TODO: scan ops to estimate register usage
+  // only tma loads, or tma stores, or gen5
   return requestedRegisters == 0 ? 232 : requestedRegisters;
 }
 
@@ -73,11 +196,24 @@ SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
   std::function<void(scf::ForOp, Value, unsigned)> dfs =
       [&](scf::ForOp nestedForOp, Value arg, unsigned argIdx) {
         for (auto user : arg.getUsers()) {
-          // Skip ops that are not in the same async task
-          if (!hasAsyncTaskId(user, asyncTaskId))
+          if (!hasAsyncTaskId(user, asyncTaskId) &&
+              !isNeededByTask(user, asyncTaskId))
             continue;
 
           if (isa<scf::YieldOp>(user)) {
+            if (auto parentForOp = dyn_cast<scf::ForOp>(user->getParentOp())) {
+              if (parentForOp == nestedForOp) {
+                for (auto [yieldIdx, operand] :
+                     llvm::enumerate(user->getOperands())) {
+                  if (operand == arg &&
+                      isValueNeededByTask(parentForOp.getResult(yieldIdx),
+                                          asyncTaskId)) {
+                    argIndices.insert(argIdx);
+                    return;
+                  }
+                }
+              }
+            }
             if (auto ifOp = dyn_cast<scf::IfOp>(user->getParentOp())) {
               // For block arguments, we need to check the initial value as
               // well.
@@ -101,6 +237,19 @@ SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
 
           // If use is the initial value of ForOp argument.
           if (auto userFor = dyn_cast<scf::ForOp>(user)) {
+            for (auto [initArgIdx, initArg] :
+                 llvm::enumerate(userFor.getInitArgs())) {
+              if (initArg != arg)
+                continue;
+              dfs(userFor, userFor.getRegionIterArg(initArgIdx), argIdx);
+              if (argIndices.count(argIdx))
+                return;
+              if (isValueNeededByTask(userFor.getResult(initArgIdx),
+                                      asyncTaskId)) {
+                argIndices.insert(argIdx);
+                return;
+              }
+            }
             // For block arguments, we need to check the initial value as well.
             if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
               auto initArg =
@@ -145,19 +294,33 @@ SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
         }
       };
 
-  // check dependency with DFS traversal for loop args and results.
+  // Collect loop arguments and results needed by this task.
   mlir::Block &block = forOp.getRegion().front();
+  DenseSet<unsigned> nonBackedgeArgs;
   for (unsigned i = forOp.getNumInductionVars(); i < block.getNumArguments();
        ++i) {
     auto arg = block.getArgument(i);
-    dfs(forOp, arg, i - forOp.getNumInductionVars());
+    unsigned argIdx = i - forOp.getNumInductionVars();
+    dfs(forOp, arg, argIdx);
+    if (isValueNeededByTask(arg, asyncTaskId, /*followBackedge=*/false))
+      nonBackedgeArgs.insert(argIdx);
   }
+  DenseSet<unsigned> nonBackedgeResults;
   for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
     auto result = forOp->getResult(i);
+    if (isValueNeededByTask(result, asyncTaskId, /*followBackedge=*/false))
+      nonBackedgeResults.insert(i);
+    if (isValueNeededByTask(result, asyncTaskId))
+      argIndices.insert(i);
     dfs(forOp, result, i);
   }
 
-  SmallVector<unsigned> args(argIndices.begin(), argIndices.end());
+  // Ignore slots whose only path to this task is their own backedge.
+  SmallVector<unsigned> args;
+  for (unsigned i : argIndices) {
+    if (nonBackedgeArgs.count(i) || nonBackedgeResults.count(i))
+      args.push_back(i);
+  }
   llvm::sort(args);
   return args;
 }
@@ -170,40 +333,15 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
     ifOp.dump();
   });
 
-  // It is possible that we need to reduce the results. One example
-  // is that the defining op for the yield operation is not for this
-  // taskId and the defining op is not specialized, thus we should
-  // remove the result.
+  // It is possible that we need to reduce the results. Keep results that are
+  // needed by this task's users, plus branch-local state values produced by
+  // this task such as synthetic accumulator counters.
   // We need to update the result types correctly here.
-  unsigned resultIdx = 0;
   SmallVector<unsigned> keptResultVec;
   if (!ifOp->getResultTypes().empty()) {
-    for (Value yieldV : ifOp.thenYield().getOperands()) {
-      // Check the defining op for the corresponding result.
-      if (Operation *def = yieldV.getDefiningOp()) {
-        bool hasTaskId = hasAsyncTaskId(def, asyncTaskId);
-        if (hasTaskId) {
-          keptResultVec.push_back(resultIdx);
-        }
-      } else {
-        assert(isa<BlockArgument>(yieldV) && "Unexpected yield value");
-        auto bbArg = cast<BlockArgument>(yieldV);
-        // Find transitive defining op for the block arg
-        Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
-        if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
-          // track initial value
-          auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
-          if (Operation *def = initArg.getDefiningOp()) {
-            if (hasAsyncTaskId(def, asyncTaskId))
-              keptResultVec.push_back(resultIdx);
-          } else {
-            llvm_unreachable("Initial value should have a defining op");
-          }
-        } else {
-          llvm_unreachable("Unexpected block argument owner");
-        }
-      }
-      ++resultIdx;
+    for (auto [resultIdx, result] : llvm::enumerate(ifOp->getResults())) {
+      if (shouldKeepIfResultForTask(ifOp, resultIdx, result, asyncTaskId))
+        keptResultVec.push_back(resultIdx);
     }
   }
 
@@ -211,9 +349,11 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   for (auto idx : keptResultVec) {
     newResultTypes.push_back(ifOp->getResultTypes()[idx]);
   }
+  builder.setLoopScheduleInfoFromOp(ifOp);
   auto newIfOp = builder.createWithAsyncTaskIds<scf::IfOp>(
       ifOp.getLoc(), newResultTypes, mapping.lookup(ifOp.getCondition()), true,
       ifOp.elseBlock());
+  builder.clearLoopScheduleInfo();
 
   OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
   ifBuilder.setAsynTaskIdsFromArray({asyncTaskId});
@@ -227,7 +367,9 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   // Update yields
   auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
     ifBuilder.setInsertionPoint(yield);
+    ifBuilder.setLoopScheduleInfoFromOp(yield);
     ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(yield.getLoc(), operands);
+    ifBuilder.clearLoopScheduleInfo();
     yield.erase();
   };
   if (keptResultVec.size() < ifOp->getResultTypes().size()) {
@@ -282,16 +424,34 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   auto newStep = mapping.lookupOrDefault(forOp.getStep());
 
   // Create newForOp.
+  builder.setLoopScheduleInfoFromOp(forOp);
   auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
       forOp.getLoc(), newLowerBound, newUpperBound, newStep, newLoopArgs);
-  if (forOp->getAttr("tt.loop_schedule"))
-    newForOp->setAttr("tt.loop_schedule", forOp->getAttr("tt.loop_schedule"));
+  builder.clearLoopScheduleInfo();
+  // Propagate the attributes of forOp to newForOp.
+  // This is needed to preserve tt.warp_specialize,
+  // and tt.loop_schedule among others.
+  for (auto attr : forOp->getAttrs()) {
+    // async_task_id is set in the creation step.
+    if (attr.getName() != "async_task_id") {
+      newForOp->setAttr(attr.getName(), attr.getValue());
+    }
+  }
 
   // Initialize Value mapping from forOp to newForOp
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  {
+    auto parentForOp = forOp->getParentOfType<scf::ForOp>();
+    if (parentForOp)
+      LDBG("-- inner ForOp");
+    else
+      LDBG("-- outer ForOp");
+  }
   for (unsigned i = 0; i < usedArgs.size(); ++i) {
     auto oldArg = forOp.getRegionIterArgs()[usedArgs[i]];
     auto newArg = newForOp.getRegionIterArgs()[i];
+    LDBG("ForOp args mapping of task " << asyncTaskId << " argIdx "
+                                       << usedArgs[i]);
     mapping.map(oldArg, newArg);
   }
 
@@ -306,8 +466,14 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   // Create YieldOp for newForOp.
   auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   SmallVector<Value> newYieldOperands;
-  for (unsigned i : usedArgs)
-    newYieldOperands.push_back(mapping.lookup(yieldOp.getOperand(i)));
+  for (unsigned i : usedArgs) {
+    Value operand = yieldOp.getOperand(i);
+    bool isDefinedOutsideLoop =
+        !forOp.getRegion().isAncestor(operand.getParentRegion());
+    Value mapped = isDefinedOutsideLoop ? mapping.lookupOrDefault(operand)
+                                        : mapping.lookup(operand);
+    newYieldOperands.push_back(mapped);
+  }
 
   bool createNewYield = true;
   if (newForOp.getBody()->mightHaveTerminator()) {
@@ -334,14 +500,92 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   return newForOp;
 }
 
+Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
+                             OpBuilderWithAsyncTaskIds &builder,
+                             AsyncTaskId asyncTaskId) {
+  SmallVector<Value> newInits;
+  for (Value init : whileOp.getInits())
+    newInits.push_back(mapping.lookupOrDefault(init));
+
+  builder.setLoopScheduleInfoFromOp(whileOp);
+  auto newWhileOp = builder.createWithAsyncTaskIds<scf::WhileOp>(
+      whileOp.getLoc(), whileOp->getResultTypes(), newInits);
+  builder.clearLoopScheduleInfo();
+  for (auto attr : whileOp->getAttrs()) {
+    if (attr.getName() != "async_task_id")
+      newWhileOp->setAttr(attr.getName(), attr.getValue());
+  }
+
+  SmallVector<Type> beforeTypes;
+  for (Value init : newInits)
+    beforeTypes.push_back(init.getType());
+  SmallVector<Type> afterTypes(whileOp->getResultTypes());
+  SmallVector<Location> beforeLocs(beforeTypes.size(), whileOp.getLoc());
+  SmallVector<Location> afterLocs(afterTypes.size(), whileOp.getLoc());
+  if (newWhileOp.getBefore().empty())
+    newWhileOp.getBefore().emplaceBlock();
+  if (newWhileOp.getAfter().empty())
+    newWhileOp.getAfter().emplaceBlock();
+  newWhileOp.getBeforeBody()->addArguments(beforeTypes, beforeLocs);
+  newWhileOp.getAfterBody()->addArguments(afterTypes, afterLocs);
+
+  IRMapping localMapping = mapping;
+  for (auto [oldArg, newArg] :
+       llvm::zip(whileOp.getBeforeArguments(), newWhileOp.getBeforeArguments()))
+    localMapping.map(oldArg, newArg);
+  for (auto [oldArg, newArg] :
+       llvm::zip(whileOp.getAfterArguments(), newWhileOp.getAfterArguments()))
+    localMapping.map(oldArg, newArg);
+
+  OpBuilderWithAsyncTaskIds whileBuilder(whileOp.getContext());
+  whileBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+
+  whileBuilder.setInsertionPointToStart(newWhileOp.getBeforeBody());
+  for (Operation &op : whileOp.getBeforeBody()->without_terminator())
+    SpecializeOp(&op, localMapping, whileBuilder, asyncTaskId);
+  auto condOp = whileOp.getConditionOp();
+  SmallVector<Value> condArgs;
+  for (Value arg : condOp.getArgs())
+    condArgs.push_back(localMapping.lookupOrDefault(arg));
+  whileBuilder.setLoopScheduleInfoFromOp(condOp);
+  whileBuilder.createWithAsyncTaskIds<scf::ConditionOp>(
+      condOp.getLoc(), localMapping.lookupOrDefault(condOp.getCondition()),
+      condArgs);
+  whileBuilder.clearLoopScheduleInfo();
+
+  whileBuilder.setInsertionPointToStart(newWhileOp.getAfterBody());
+  for (Operation &op : whileOp.getAfterBody()->without_terminator())
+    SpecializeOp(&op, localMapping, whileBuilder, asyncTaskId);
+  auto yieldOp = whileOp.getYieldOp();
+  SmallVector<Value> yieldArgs;
+  for (Value arg : yieldOp.getOperands())
+    yieldArgs.push_back(localMapping.lookupOrDefault(arg));
+  whileBuilder.setLoopScheduleInfoFromOp(yieldOp);
+  whileBuilder.createWithAsyncTaskIds<scf::YieldOp>(yieldOp.getLoc(),
+                                                    yieldArgs);
+  whileBuilder.clearLoopScheduleInfo();
+
+  for (auto [oldResult, newResult] :
+       llvm::zip(whileOp.getResults(), newWhileOp.getResults()))
+    mapping.map(oldResult, newResult);
+
+  return newWhileOp;
+}
+
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
                         AsyncTaskId asyncTaskId) {
   auto taskIds = getAsyncTaskIds(op);
   // yieldOp are sometimes implict, meaning they do not necessarily have a task
   // id, but they should be shared by all async tasks.
-  if (!hasAsyncTaskId(op, asyncTaskId) && !isa<scf::YieldOp>(op))
-    return nullptr;
+  if (!hasAsyncTaskId(op, asyncTaskId) && !isa<scf::YieldOp>(op)) {
+    // Before skipping, check if any result is transitively needed by an op
+    // with the target asyncTaskId. This handles ops (e.g. MemDescIndexOp)
+    // that weren't assigned the right task IDs but produce values consumed
+    // by ops in this partition.
+    if (!isNeededByTask(op, asyncTaskId))
+      return nullptr;
+  }
 
   if (op->getNumRegions() == 0) {
     Operation *newOp = builder.clone(*op, mapping);
@@ -354,9 +598,28 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
       return SpecializeIfOp(ifOp, mapping, builder, asyncTaskId);
     } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       return SpecializeForOp(forOp, mapping, builder, asyncTaskId);
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+      return SpecializeWhileOp(whileOp, mapping, builder, asyncTaskId);
     } else if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
       Operation *newOp = builder.clone(*op, mapping);
       // recursively set async task ids for child ops
+      newOp->walk(
+          [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
+      for (unsigned i = 0; i < op->getNumResults(); ++i)
+        mapping.map(op->getResult(i), newOp->getResult(i));
+      return newOp;
+    } else if (isa<triton::MapElementwiseOp>(op)) {
+      Operation *newOp = builder.clone(*op, mapping);
+      // recursively set async task ids for child ops
+      newOp->walk(
+          [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
+      for (unsigned i = 0; i < op->getNumResults(); ++i)
+        mapping.map(op->getResult(i), newOp->getResult(i));
+      return newOp;
+    } else if (isa<triton::nvidia_gpu::SubtiledRegionOp>(op)) {
+      // Single-task SubtiledRegionOp: clone wholesale and set task IDs.
+      // Multi-task ops are lowered before specializeRegion is called.
+      Operation *newOp = builder.clone(*op, mapping);
       newOp->walk(
           [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
       for (unsigned i = 0; i < op->getNumResults(); ++i)
@@ -368,6 +631,103 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
   }
 
   return nullptr;
+}
+
+static void logOpStillHasUsers(Operation *op) {
+  LLVM_DEBUG({
+    llvm::errs() << "Op still has users: " << op->getName();
+    if (auto partitionAttr =
+            op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
+      llvm::errs() << " (partition: " << partitionAttr << ")";
+    }
+    auto taskIds = getAsyncTaskIds(op);
+    if (!taskIds.empty()) {
+      llvm::errs() << " (taskIds: ";
+      for (size_t i = 0; i < taskIds.size(); ++i) {
+        if (i > 0)
+          llvm::errs() << ", ";
+        llvm::errs() << taskIds[i];
+      }
+      llvm::errs() << ")";
+    }
+    auto attrs = op->getAttrs();
+    if (!attrs.empty()) {
+      llvm::errs() << " [attrs: ";
+      bool first = true;
+      for (auto namedAttr : attrs) {
+        if (!first)
+          llvm::errs() << ", ";
+        llvm::errs() << namedAttr.getName().str();
+        first = false;
+      }
+      llvm::errs() << "]";
+    }
+    // llvm::errs() << "  Full IR: ";
+    // op->print(llvm::errs());
+    llvm::errs() << "\n";
+    for (unsigned i = 0; i < op->getNumResults(); ++i) {
+      for (Operation *user : op->getResult(i).getUsers()) {
+        llvm::errs() << "  User: " << user->getName();
+        // llvm::errs() << "  Full IR: ";
+        // user->print(llvm::errs());
+        if (auto userPartitionAttr = user->getAttrOfType<DenseI32ArrayAttr>(
+                ttg::kPartitionAttrName)) {
+          llvm::errs() << " (partition: " << userPartitionAttr << ")";
+        }
+        auto userTaskIds = getAsyncTaskIds(user);
+        if (!userTaskIds.empty()) {
+          llvm::errs() << " (taskIds: ";
+          for (size_t j = 0; j < userTaskIds.size(); ++j) {
+            if (j > 0)
+              llvm::errs() << ", ";
+            llvm::errs() << userTaskIds[j];
+          }
+          llvm::errs() << ")";
+        }
+        llvm::errs() << "\n";
+      }
+    }
+  });
+}
+
+// Topologically sort operations to ensure dependencies are cloned before uses
+static SmallVector<Operation *> topologicalSort(ArrayRef<Operation *> opList) {
+  DenseSet<Operation *> opsInList(opList.begin(), opList.end());
+  DenseMap<Operation *, unsigned>
+      visitState; // 0=unvisited, 1=visiting, 2=visited
+  SmallVector<Operation *> sortedOpList;
+
+  std::function<void(Operation *)> topoVisit = [&](Operation *op) {
+    auto state = visitState.lookup(op);
+    if (state == 2)
+      return; // Already visited
+    if (state == 1) {
+      // Cycle detected - just skip, maintain original order for cycles
+      return;
+    }
+
+    visitState[op] = 1; // Mark as visiting
+
+    // Visit dependencies first (operands defined by ops in opList)
+    for (auto operand : op->getOperands()) {
+      if (auto defOp = operand.getDefiningOp()) {
+        if (opsInList.count(defOp)) {
+          topoVisit(defOp);
+        }
+      }
+    }
+
+    visitState[op] = 2; // Mark as visited
+    sortedOpList.push_back(op);
+  };
+
+  // Visit all operations in original order, which will recursively visit
+  // dependencies
+  for (Operation *op : opList) {
+    topoVisit(op);
+  }
+
+  return sortedOpList;
 }
 
 } // namespace
@@ -392,6 +752,12 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         opList.push_back(&op);
     }
   }
+  // FIXME:
+  // Topologically sort opList to ensure dependencies are cloned before uses
+  // This is necessary because operations can appear out of order in the IR
+  opList = topologicalSort(opList);
+
+  DenseSet<Operation *> opsInList(opList.begin(), opList.end());
 
   LLVM_DEBUG({
     LDBG("ops to be specialized: ");
@@ -407,17 +773,36 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   // Instead of a new IfOp for each task, we create one partitionRegion.
   auto nTaskIds = getNestedAsyncTaskIds(funcOp);
+  int defaultNumWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
   SmallVector<int32_t> partitionNumWarps;
   for (AsyncTaskId asyncTaskId : nTaskIds) {
     if (asyncTaskId == 0)
       continue;
-    partitionNumWarps.push_back(4);
+    partitionNumWarps.push_back(defaultNumWarps);
   }
   ArrayRef<Type> dummyTypes;
   ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
   impB.setInsertionPoint(returnOp);
   auto wsOp = ttg::WarpSpecializeOp::create(impB, dummyTypes, partitionNumWarps,
                                             nTaskIds.size() - 1);
+
+  // Copy partition types attribute from the loop to the WarpSpecializeOp.
+  // This is needed by OptimizePartitionWarps for type-aware warp assignment.
+  funcOp.walk([&](LoopLikeOpInterface forOp) {
+    if (auto typesAttr =
+            forOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+      wsOp->setAttr(kPartitionTypesAttrName, typesAttr);
+    }
+  });
+
+  // Copy partition types attribute from the loop to the WarpSpecializeOp.
+  // This is needed by OptimizePartitionWarps for type-aware warp assignment.
+  funcOp.walk([&](LoopLikeOpInterface forOp) {
+    if (auto typesAttr =
+            forOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+      wsOp->setAttr(kPartitionTypesAttrName, typesAttr);
+    }
+  });
 
   // Clone all operations into the corresponding if blocks. If the operation
   // has multiple taskIds, it will be cloned for multiple if blocks.
@@ -431,6 +816,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     Block *defaultBlock = impB.createBlock(&wsOp.getDefaultRegion());
     taskBuilder.setInsertionPointToStart(defaultBlock);
     IRMapping mapping;
+
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
@@ -439,7 +825,6 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   }
 
   unsigned idx = 1;
-  SmallVector<int32_t> estRegUsage;
   for (Region *region : wsOp.getPartitionRegions()) {
     AsyncTaskId asyncTaskId = nTaskIds[idx];
     OpBuilderWithAsyncTaskIds taskBuilder(context);
@@ -450,17 +835,55 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     taskBuilder.setInsertionPointToStart(partitionBlock);
 
     IRMapping mapping;
+
+    // Pre-populate mapping for ForOp results.
+    // When a ForOp result is used by operations that appear before the ForOp
+    // in the IR, we need to map those results to their init args before we
+    // start cloning operations.
+    for (Operation *op : opList) {
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        for (unsigned resIdx = 0; resIdx < forOp.getNumResults(); ++resIdx) {
+          auto result = forOp.getResult(resIdx);
+          // Check if this result is used by any operation in this partition
+          bool usedInPartition = false;
+          for (Operation *user : result.getUsers()) {
+            if (hasAsyncTaskId(user, asyncTaskId)) {
+              usedInPartition = true;
+              break;
+            }
+          }
+          // Pre-map the result to its init arg.
+          // This will be updated later when the ForOp is specialized if the
+          // result is actually produced in this partition.
+          if (usedInPartition) {
+            Value initArg = forOp.getInitArgs()[resIdx];
+            mapping.map(result, initArg);
+          }
+        }
+      } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+        for (unsigned resIdx = 0; resIdx < whileOp.getNumResults(); ++resIdx) {
+          auto result = whileOp.getResult(resIdx);
+          bool usedInPartition = false;
+          for (Operation *user : result.getUsers()) {
+            if (hasAsyncTaskId(user, asyncTaskId)) {
+              usedInPartition = true;
+              break;
+            }
+          }
+          if (usedInPartition) {
+            Value forwarded = whileOp.getConditionOp().getArgs()[resIdx];
+            mapping.map(result, forwarded);
+          }
+        }
+      }
+    }
+
+    // Now clone operations in order
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
     ttg::WarpReturnOp::create(taskBuilder, loc);
-    auto regAlloc =
-        scanRegUsage(partitionBlock, asyncTaskId, requestedRegisters);
-    estRegUsage.push_back(regAlloc);
   }
-
-  // The default region doesn't request registers.
-  wsOp.setRequestedRegisters(estRegUsage);
 
   // The capture set is the same for every partition region, so now find the
   // captures and thread them in to the regions.
@@ -475,6 +898,13 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         Value copy = impB.clone(*capture.getDefiningOp())->getResult(0);
         replaceAllUsesInRegionWith(capture, copy, *region);
       }
+      continue;
+    }
+
+    // Skip captures that are defined by operations in opList.
+    // These operations will be erased, and their results have already been
+    // cloned within the partition regions, so we don't need to capture them.
+    if (capture.getDefiningOp() && opsInList.count(capture.getDefiningOp())) {
       continue;
     }
 
@@ -493,27 +923,78 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     }
   }
 
+  // Run dead code elimination before manually erasing operations.
+  IRRewriter rewriter(context);
+  (void)runRegionDCE(rewriter, funcOp->getRegions());
+
+  // Recover wsOp after DCE as it may have been modified.
+  ttg::WarpSpecializeOp newWsOp;
+  funcOp.walk([&](ttg::WarpSpecializeOp op) { newWsOp = op; });
+  assert(newWsOp && "WarpSpecializeOp should still exist after DCE");
+
   LLVM_DEBUG({
     LDBG("\n\nWith task Id checks");
     funcOp.dump();
   });
 
+  SmallVector<Operation *> toErase;
+  newWsOp.walk([&](Operation *op) {
+    unsigned numUsers = std::distance(op->user_begin(), op->user_end());
+    bool isYield = isa<scf::YieldOp>(op);
+    bool isAdd = isa<arith::AddIOp>(op);
+    if (numUsers == 0 && !isYield && isAdd && op->getNumRegions() == 0)
+      toErase.push_back(op);
+  });
+  for (auto *op : toErase) {
+    LLVM_DEBUG({
+      LDBG("erasing op due to no use ");
+      op->dump();
+    });
+    op->erase();
+  }
+
   // Remove original operations that have been cloned in reverse order.
+  // Recompute opList after DCE as some operations may have been erased.
+  opList.clear();
+  for (auto &block : funcOp.getBody().getBlocks()) {
+    for (Operation &op : block.getOperations()) {
+      auto taskIds = getAsyncTaskIds(&op);
+      if (!taskIds.empty())
+        opList.push_back(&op);
+    }
+  }
+  opList = topologicalSort(opList);
+
   for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
     Operation *op = *it;
+
     LLVM_DEBUG({
       LDBG("erasing op ");
       op->dump();
-
-      // For debugging purposes, check to see if the original op is still in
-      // use.
-      for (unsigned i = 0; i < op->getNumResults(); ++i) {
-        for (Operation *user : op->getResult(i).getUsers()) {
+    });
+    // For debugging purposes, check to see if the original op is still in use.
+    bool hasUse = false;
+    for (unsigned i = 0; i < op->getNumResults(); ++i) {
+      for (Operation *user : op->getResult(i).getUsers()) {
+        hasUse = true;
+        LLVM_DEBUG({
           LDBG("op has use ");
           user->dump();
-        }
+        });
       }
-    });
+    }
+    if (hasUse) {
+      logOpStillHasUsers(op);
+      // The op has been cloned into partition regions but still has users
+      // outside the WS regions (e.g. a MemDescIndexOp at the function level
+      // that wasn't given asyncTaskIds). Keep the op alive by removing its
+      // async_task_id so it stays at the function level as a shared value.
+      op->removeAttr("async_task_id");
+      if (op->hasAttr(ttg::kPartitionAttrName))
+        op->removeAttr(ttg::kPartitionAttrName);
+      continue;
+    }
+
     op->erase();
   }
 }

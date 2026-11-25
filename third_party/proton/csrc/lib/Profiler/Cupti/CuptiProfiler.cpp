@@ -683,8 +683,10 @@ void CuptiProfiler::CuptiProfilerPimpl::doStop() {
   profiler.correlation.clear();
   setGraphCallbacks(subscriber, /*enable=*/false);
   setLaunchCallbacks(subscriber, /*enable=*/false);
-  nvtx::disable();
-  setNvtxCallbacks(subscriber, /*enable=*/false);
+  if (getBoolEnv("TRITON_ENABLE_NVTX", true)) {
+    nvtx::disable();
+    setNvtxCallbacks(subscriber, /*enable=*/false);
+  }
   cupti::unsubscribe<true>(subscriber);
   cupti::finalize<true>();
 }

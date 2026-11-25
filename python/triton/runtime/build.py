@@ -60,7 +60,7 @@ def _language_from_filename(source_name: str) -> str:
 def _build(name: str, src: str, srcdir: str, library_dirs: list[str], include_dirs: list[str], libraries: list[str],
            ccflags: list[str], language: str = "c") -> str:
     if impl := knobs.build.impl:
-        return impl(name, src, srcdir, library_dirs, include_dirs, libraries)
+        return impl(name, src, srcdir, library_dirs, include_dirs, libraries, ccflags)
     suffix = sysconfig.get_config_var('EXT_SUFFIX')
     so = os.path.join(srcdir, f'{name}{suffix}')
     cc = _find_compiler(language)
@@ -146,8 +146,15 @@ def _compile_so(src: bytes, src_path: str, name: str, library_dirs: list[str] | 
             log.warning(f"Triton cache error: compiled module {name}.so could not be loaded")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        so = _build(name, src_path, tmpdir, library_dirs or [], include_dirs or [], libraries or [], ccflags or [],
-                    language=language)
+        # beta's fb build impl (knobs.build.impl -> re_build_helper) compiles
+        # "<name>.c" relative to srcdir, so the source must live inside the build
+        # dir. Upstream's default builder passes the full src_path and doesn't need
+        # this, but src_path here comes from a *different* tmpdir, so stage it in.
+        build_src_path = os.path.join(tmpdir, os.path.basename(src_path))
+        with open(build_src_path, "wb") as f:
+            f.write(src)
+        so = _build(name, build_src_path, tmpdir, library_dirs or [], include_dirs or [], libraries or [], ccflags
+                    or [], language=language)
         with open(so, "rb") as f:
             cache_path = cache.put(f.read(), f"{name}{suffix}", binary=True)
 

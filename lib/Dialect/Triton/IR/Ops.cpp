@@ -13,6 +13,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -43,27 +44,6 @@ void LoadOp::getEffects(
 
 namespace mlir {
 namespace triton {
-
-OpFoldResult AnnotateOp::fold(FoldAdaptor adaptor) {
-  if ((*this)->getAttrs().empty())
-    return getSrc();
-  return {};
-}
-
-void AnnotateOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
-                                             MLIRContext *context) {
-  patterns.add(+[](AnnotateOp op, PatternRewriter &rewriter) -> LogicalResult {
-    Operation *definingOp = op.getSrc().getDefiningOp();
-    if (!definingOp || definingOp->getNumResults() != 1)
-      return failure();
-    rewriter.modifyOpInPlace(definingOp, [&] {
-      for (NamedAttribute attr : op->getAttrs())
-        definingOp->setDiscardableAttr(attr.getName(), attr.getValue());
-    });
-    rewriter.replaceOp(op, op.getSrc());
-    return success();
-  });
-}
 
 LogicalResult
 verifyCacheModifier(CacheModifier modifier, CachePolicyOperation operation,
@@ -135,12 +115,35 @@ LogicalResult LoadOp::verify() {
                            CachePolicyOperation::Load);
 }
 
-LogicalResult LoadOp::canonicalize(LoadOp op, PatternRewriter &rewriter) {
-  // Without "other", a false-masked load produces an undefined value.
-  if (!op.getOther() || !op.getMask() || !matchPattern(op.getMask(), m_Zero()))
-    return failure();
-  rewriter.replaceOp(op, op.getOther());
-  return success();
+// load(ptr, splat(1), ...)        -> load(ptr, ...)
+// load(ptr, splat(0), other, ...) -> other
+struct CanonicalizeMaskedLoadPattern : public OpRewritePattern<LoadOp> {
+  CanonicalizeMaskedLoadPattern(MLIRContext *context)
+      : OpRewritePattern<LoadOp>(context, 1) {}
+
+  LogicalResult matchAndRewrite(LoadOp loadOp,
+                                PatternRewriter &rewriter) const override {
+    auto mask = loadOp.getMask();
+    if (!mask)
+      return failure();
+
+    if (matchPattern(mask, m_One())) {
+      rewriter.replaceOpWithNewOp<LoadOp>(
+          loadOp, loadOp.getType(), loadOp.getPtr(), Value(), Value(),
+          loadOp.getCachePolicyAttr(), loadOp.getIsVolatile());
+      return success();
+    }
+    // Without "other", a false-masked load produces an undefined value.
+    if (!matchPattern(mask, m_Zero()) || !loadOp.getOther())
+      return failure();
+    rewriter.replaceOp(loadOp, loadOp.getOther());
+    return success();
+  }
+};
+
+void LoadOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                         MLIRContext *context) {
+  results.add<CanonicalizeMaskedLoadPattern>(context);
 }
 
 //-- StoreOp --
@@ -167,9 +170,25 @@ LogicalResult StoreOp::verify() {
                            CachePolicyOperation::Store);
 }
 
-LogicalResult StoreOp::canonicalize(StoreOp op, PatternRewriter &rewriter) {
-  return eraseIfPredicateIsFalse(op, rewriter);
-}
+// store(ptr, value, splat(1), ...) -> store(ptr, value, ...)
+// store(ptr, value, splat(0), ...) -> [none]
+struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
+  CanonicalizeMaskedStorePattern(MLIRContext *context)
+      : OpRewritePattern<StoreOp>(context, 1) {}
+
+  LogicalResult matchAndRewrite(StoreOp storeOp,
+                                PatternRewriter &rewriter) const override {
+    if (succeeded(eraseIfPredicateIsFalse(storeOp, rewriter)))
+      return success();
+    auto mask = storeOp.getMask();
+    if (!mask || !matchPattern(mask, m_One()))
+      return failure();
+    rewriter.replaceOpWithNewOp<StoreOp>(
+        storeOp, storeOp.getPtr(), storeOp.getValue(), Value(),
+        storeOp.getCachePolicyAttr(), storeOp.getIgnoreCta());
+    return success();
+  }
+};
 
 Value AtomicRMWOp::getPredicateOperand() { return getMask(); }
 
@@ -221,6 +240,29 @@ LogicalResult AtomicStoreOp::verify() {
   return verifyAtomicLoadStoreType(getOperation(), getPtr().getType());
 }
 
+// A used result with duplicates is broadcast back through pow2-only
+// shared-memory algebra.
+static std::optional<std::string>
+getAtomicMixedRadixUnsupportedReason(Operation *op,
+                                     const LinearLayout &layout) {
+  if (!op->getResult(0).use_empty() &&
+      llvm::any_of(layout.getFreeVariableMasks(),
+                   [](auto mask) { return mask.second != 0; }))
+    return "NPOT mixed-radix layout with broadcast elements is not yet "
+           "supported on an atomic whose result is used";
+  return std::nullopt;
+}
+
+std::optional<std::string>
+AtomicRMWOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getAtomicMixedRadixUnsupportedReason(*this, layout);
+}
+
+std::optional<std::string>
+AtomicCASOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getAtomicMixedRadixUnsupportedReason(*this, layout);
+}
+
 LogicalResult AtomicPollOp::verify() {
   if (getSem() != MemSemantic::ACQUIRE && getSem() != MemSemantic::RELAXED)
     return emitOpError("only supports acquire and relaxed semantics");
@@ -231,6 +273,11 @@ LogicalResult AtomicPollOp::verify() {
     return emitOpError(
         "only supports integer elements with width {16, 32, 64}");
   return success();
+}
+
+void StoreOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                          MLIRContext *context) {
+  results.add<CanonicalizeMaskedStorePattern>(context);
 }
 
 //-- TransOp --
@@ -319,8 +366,11 @@ DotOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   auto aEnc = cast<RankedTensorType>(operands[0].getType()).getEncoding();
   auto bEnc = cast<RankedTensorType>(operands[1].getType()).getEncoding();
   auto retEnc = accTy.getEncoding();
-  if (aEnc) {
-    assert(bEnc && retEnc);
+  if (encodingContainsTlxNoVerifyLayout(aEnc) ||
+      encodingContainsTlxNoVerifyLayout(bEnc) ||
+      encodingContainsTlxNoVerifyLayout(retEnc))
+    return success();
+  if (aEnc && bEnc && retEnc) {
     Dialect &dialect = retEnc.getDialect();
     auto interface = cast<DialectInferLayoutInterface>(&dialect);
     if (interface->inferDotOpEncoding(aEnc, 0, retEnc, location).failed())
@@ -340,19 +390,113 @@ LogicalResult DotOp::verify() {
         "element types of operands A and B must have same bit width");
   auto aEncoding = aTy.getEncoding();
   auto bEncoding = bTy.getEncoding();
+  auto accTy = getC().getType();
+  auto retEnc = accTy.getEncoding();
+  // A no_verify layout marks a frontend graph whose layout constraints are
+  // intentionally incomplete until TLX placeholder resolution. Helper ABI
+  // reconciliation can therefore expose a pinned operand/result beside an
+  // unencoded peer. Defer the whole compatibility check; the wrapper is
+  // removed before final layout verification.
+  if (encodingContainsTlxNoVerifyLayout(aEncoding) ||
+      encodingContainsTlxNoVerifyLayout(bEncoding) ||
+      encodingContainsTlxNoVerifyLayout(retEnc))
+    return success();
   if (!aEncoding && !bEncoding)
     return success();
   // Verify that the encodings are valid.
   if (!aEncoding || !bEncoding)
     return emitError("mismatching encoding between A and B operands");
-  auto accTy = getC().getType();
-  auto retEnc = accTy.getEncoding();
   if (!retEnc)
     return emitError("miss encoding of C operand");
   Dialect &dialect = retEnc.getDialect();
   auto interface = cast<DialectInferLayoutInterface>(&dialect);
   return interface->verifyDotOpEncodingCompatibility(getOperation(), aEncoding,
                                                      bEncoding);
+}
+
+// The NpotTargetLegality whose prefix matches `target`, or nullptr.
+static const NpotTargetLegality *lookupNpotTargetLegality(MLIRContext *ctx,
+                                                          StringRef target) {
+  for (Dialect *dialect : ctx->getLoadedDialects()) {
+    auto *legality = dyn_cast<NpotTargetLegality>(dialect);
+    if (legality && target.split(':').first == legality->getTargetPrefix())
+      return legality;
+  }
+  return nullptr;
+}
+
+std::optional<std::string>
+getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                            StringRef target, int numWarps, int nonKDim) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotUnsupportedReason(dot, layout, target, numWarps,
+                                             nonKDim);
+  return std::string("NPOT dot is not yet supported without an MMA target");
+}
+
+std::optional<std::string>
+getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
+                     int numWarps, int threadsPerWarp, int nonKDim,
+                     StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotSlowReason(dot, operands, numWarps, threadsPerWarp,
+                                      nonKDim, target);
+  return std::nullopt;
+}
+
+StringRef getModuleTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  auto target = mod ? mod->getAttrOfType<StringAttr>("ttg.target") : nullptr;
+  return target ? target.getValue() : StringRef();
+}
+
+std::optional<std::string>
+getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout) {
+  StringRef target = getModuleTarget(copy);
+  if (auto *legality = lookupNpotTargetLegality(copy->getContext(), target))
+    return legality->getAsyncCopyUnsupportedReason(copy, layout, target);
+  return std::string("NPOT async copy is not yet supported without a target");
+}
+
+bool npotStoreTakesPredicatedVector(Operation *op) {
+  auto store = dyn_cast<StoreOp>(op);
+  if (!store)
+    return false;
+  SmallVector<Value> work{store.getValue()};
+  DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    // A value forwarded along control flow comes from what is forwarded.
+    auto arg = dyn_cast<BlockArgument>(v);
+    Operation *def = arg ? arg.getOwner()->getParentOp() : v.getDefiningOp();
+    if (auto branch = dyn_cast_or_null<RegionBranchOpInterface>(def)) {
+      RegionBranchInverseSuccessorMapping forwarded;
+      branch.getSuccessorInputOperandMapping(forwarded);
+      for (OpOperand *operand : forwarded.lookup(v))
+        work.push_back(operand->get());
+      continue;
+    }
+    if (!def || arg)
+      continue;
+    if (isa<LoadOp>(def))
+      return false;
+    if (def->hasTrait<OpTrait::Elementwise>() ||
+        def->hasTrait<OpTrait::SameOperandsAndResultShape>() ||
+        def->hasTrait<OpTrait::SameOperandsAndResultType>())
+      llvm::append_range(work, def->getOperands());
+  }
+  return true;
+}
+
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(op->getContext(), target))
+    return legality->getDescriptorUnsupportedReason(op, layout, target);
+  return std::string(
+      "NPOT tensor descriptor is not yet supported without a target");
 }
 
 //-- DotScaledOp --
@@ -366,9 +510,23 @@ bool DotScaledOp::verifyDims() {
     if (this->getLhsKPack())
       aKdim *= 2;
   }
+  if (isMXFP6ScaleType(this->getAElemType())) {
+    // fp6 shapes count logical values; global storage is dense,
+    // consumed in groups of 16 values (12 bytes).
+    if (this->getLhsKPack()) {
+      if (aKdim % 16 != 0)
+        return false;
+    }
+  }
   if (this->getBElemType() == ScaleDotElemType::E2M1) {
     if (this->getRhsKPack())
       bKdim *= 2;
+  }
+  if (isMXFP6ScaleType(this->getBElemType())) {
+    if (this->getRhsKPack()) {
+      if (bKdim % 16 != 0)
+        return false;
+    }
   }
 
   return aKdim == bKdim;
@@ -401,10 +559,29 @@ LogicalResult DotScaledOp::verify() {
   if (rank < 2)
     return this->emitError("operands must be at least 2D");
 
+  // fp6 has no non-K-packed representation (unlike e2m1, which can pack
+  // along M/N): dense packing exists only along K, so reject it here
+  // rather than failing obscurely in lowering.
+  if (isMXFP6ScaleType(this->getAElemType()) && !this->getLhsKPack())
+    return this->emitError("fp6 lhs operand must be packed along K "
+                           "(lhs_k_pack must be true)");
+  if (isMXFP6ScaleType(this->getBElemType()) && !this->getRhsKPack())
+    return this->emitError("fp6 rhs operand must be packed along K "
+                           "(rhs_k_pack must be true)");
+
   auto k = aShape[rank - 1];
   if (this->getAElemType() == ScaleDotElemType::E2M1) {
     if (this->getLhsKPack())
       k *= 2;
+  }
+  if (isMXFP6ScaleType(this->getAElemType())) {
+    // fp6 shapes count logical values; global storage is dense,
+    // consumed in groups of 16 values (12 bytes).
+    if (this->getLhsKPack()) {
+      if (k % 16 != 0)
+        return this->emitError("logical K dim must be a multiple of 16 for "
+                               "fp6 (groups of 16 values / 12 bytes)");
+    }
   }
   auto cShape = this->getC().getType().getShape();
   int64_t mDim = cShape[cShape.size() - 2];
@@ -459,15 +636,31 @@ LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
                                  std::optional<ArrayRef<int64_t>> scaleShape,
                                  int opIdx, ScaleDotElemType format,
                                  bool kPack) -> int32_t {
+    if (isMXFP6ScaleType(format) && !kPack) {
+      errMsg = "fp6 operands must be packed along K (kPack must be true)";
+      return 0;
+    }
     if (!scaleShape)
       return 0;
     if (llvm::product_of(*scaleShape) == 1)
       return 0;
 
-    int64_t unpackFactor = (format == ScaleDotElemType::E2M1 && kPack) ? 2 : 1;
     int64_t kdim = operandShape[opIdx == 0 ? operandShape.size() - 1
-                                           : operandShape.size() - 2] *
-                   unpackFactor;
+                                           : operandShape.size() - 2];
+    if (format == ScaleDotElemType::E2M1 && kPack) {
+      kdim *= 2;
+    } else if (isMXFP6ScaleType(format) && kPack) {
+      // fp6 shapes count logical values; global storage is dense,
+      // consumed in groups of 16 values (12 bytes).
+      if (kdim % 16 != 0) {
+        std::ostringstream oss;
+        oss << "logical K dim " << kdim
+            << " must be a multiple of 16 for fp6 (groups of 16 values / "
+               "12 bytes)";
+        errMsg = oss.str();
+        return 0;
+      }
+    }
     int32_t scaleFactor = kdim / (*scaleShape)[scaleShape->size() - 1];
     if (scaleFactor != 16 && scaleFactor != 32) {
       std::ostringstream oss;
@@ -751,6 +944,20 @@ llvm::SmallVector<Type> ReduceOp::getElementTypes() {
   return reduceOp;
 }
 
+bool ReduceOp::hasDefinedOrdering() {
+  auto attr = getReductionOrderingAttr();
+  return attr && attr.getValue() != "unordered";
+}
+
+std::optional<std::string>
+ReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  auto ordering = getReductionOrderingAttr();
+  if (ordering && ordering.getValue() == "inner_tree")
+    return "NPOT mixed-radix layout is not yet supported on an inner_tree "
+           "reduce";
+  return std::nullopt;
+}
+
 bool ReduceOp::isCommutative() {
   Block &block = getCombineOp().front();
   // Restrict the proof to a pure, straight-line expression DAG.
@@ -826,11 +1033,13 @@ bool ReduceOp::isCommutative() {
 
 //-- ScanOp --
 void ScanOp::build(OpBuilder &builder, OperationState &state,
-                   ValueRange operands, int axis, bool reverse) {
+                   ValueRange operands, int axis, bool reverse,
+                   StringAttr reductionOrdering) {
   SmallVector<Type> inferredReturnTypes;
   for (auto arg : operands)
     inferredReturnTypes.push_back(arg.getType());
-  ScanOp::build(builder, state, inferredReturnTypes, operands, axis, reverse);
+  ScanOp::build(builder, state, inferredReturnTypes, operands, axis, reverse,
+                reductionOrdering);
 }
 
 LogicalResult
@@ -843,7 +1052,14 @@ ScanOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   return success();
 }
 
-LogicalResult ScanOp::verify() { return verifyReduceScan(*this); }
+LogicalResult ScanOp::verify() {
+  if (auto ordering = getReductionOrderingAttr()) {
+    if (ordering.getValue() != "unordered" &&
+        ordering.getValue() != "inner_tree")
+      return emitOpError("unsupported scan reduction ordering: ") << ordering;
+  }
+  return verifyReduceScan(*this);
+}
 
 LogicalResult ScanOp::verifyRegions() {
   return verifyRegionsImpl<ScanReturnOp>(*this);
@@ -855,6 +1071,58 @@ llvm::SmallVector<RankedTensorType> ScanOp::getInputTypes() {
 
 llvm::SmallVector<Type> ScanOp::getElementTypes() {
   return getElementTypesImpl(this->getOperands());
+}
+
+// Walks bases: LinearEncodingAttr's per-dim counts lose the order checked here.
+std::optional<SmallVector<unsigned>>
+ScanOp::getBlockedTile(const LinearLayout &layout) {
+  // A general offset table hides its digits' steps from the bases.
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
+  MLIRContext *ctx = layout.getOutDimNames().begin()->getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  LinearLayout ll = layout.removeZeroBasesAlongDim(kReg);
+  auto nonZero = [](int32_t b) { return b != 0; };
+  SmallVector<unsigned> tile(ll.getNumOutDims(), 1);
+  // A thread's contiguous run, as LinearEncodingAttr::getContigPerThread.
+  const auto &regs = ll.getBases().lookup(kReg);
+  int runDim = -1;
+  for (const auto &basis :
+       ArrayRef(regs).take_front(ll.getNumLeadingRadix2Digits(kReg))) {
+    unsigned dim = llvm::find_if(basis, nonZero) - basis.begin();
+    if (llvm::count_if(basis, nonZero) != 1 || basis[dim] != tile[dim] ||
+        (int(dim) != runDim && tile[dim] != 1))
+      break;
+    runDim = dim;
+    tile[dim] *= 2;
+  }
+  for (const char *inDim : {"lane", "warp"}) {
+    SmallVector<int> last(tile.size(), -1);
+    const auto &bases = ll.getBases().lookup(StringAttr::get(ctx, inDim));
+    for (auto [pos, basis] : llvm::enumerate(bases)) {
+      auto count = llvm::count_if(basis, nonZero);
+      if (count == 0)
+        continue;
+      unsigned dim = llvm::find_if(basis, nonZero) - basis.begin();
+      if (count != 1 || basis[dim] != tile[dim] ||
+          (last[dim] >= 0 && last[dim] + 1 != int(pos)))
+        return std::nullopt;
+      last[dim] = pos;
+      tile[dim] *= 2;
+    }
+  }
+  return tile;
+}
+
+std::optional<std::string>
+ScanOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  auto ordering = getReductionOrderingAttr();
+  if (ordering && ordering.getValue() == "inner_tree")
+    return "NPOT mixed-radix layout is not yet supported on an inner_tree scan";
+  if (!getBlockedTile(layout))
+    return "NPOT mixed-radix layout is not yet supported on a scan whose lanes "
+           "or warps are not blocked";
+  return std::nullopt;
 }
 
 //-- MapElementwiseOp
@@ -1055,18 +1323,41 @@ std::optional<unsigned> ReshapeOp::getExpandDimsAxis() {
 }
 
 void ReshapeOp::build(OpBuilder &builder, OperationState &state,
-                      ArrayRef<int64_t> shape, Value src) {
+                      ArrayRef<int64_t> shape, Value src, bool allowReorder) {
   auto srcTy = cast<RankedTensorType>(src.getType());
   auto srcEnc = srcTy.getEncoding();
   Attribute dstEnc;
   if (srcEnc) {
-    auto result = cast<DialectInferLayoutInterface>(&srcEnc.getDialect())
-                      ->inferReshapeOpEncoding(srcTy.getShape(), srcEnc, shape,
-                                               dstEnc, state.location);
+    auto result =
+        cast<DialectInferLayoutInterface>(&srcEnc.getDialect())
+            ->inferReshapeOpEncoding(srcTy.getShape(), srcEnc, shape, dstEnc,
+                                     allowReorder, state.location);
     assert(succeeded(result));
   }
   auto dstTy = RankedTensorType::get(shape, srcTy.getElementType(), dstEnc);
-  build(builder, state, dstTy, src, false);
+  build(builder, state, dstTy, src, allowReorder);
+}
+
+// The reshape verifier's layout rule; the reshape(reshape) fold asks it too.
+static LogicalResult verifyReshapeEncoding(RankedTensorType srcTy,
+                                           RankedTensorType dstTy,
+                                           bool allowReorder,
+                                           std::optional<Location> loc) {
+  Attribute srcEnc = srcTy.getEncoding();
+  Attribute dstEnc = dstTy.getEncoding();
+  if (!srcEnc || !dstEnc || encodingContainsTlxPlaceholder(srcEnc) ||
+      encodingContainsTlxPlaceholder(dstEnc))
+    return success();
+  Attribute inferredDstEnc = dstEnc;
+  auto layoutInterface =
+      cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
+  auto result = layoutInterface->inferReshapeOpEncoding(
+      srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc, allowReorder,
+      loc);
+  if (failed(result))
+    return failure();
+  return layoutInterface->verifyLayoutsAreEqual(dstTy.getShape(),
+                                                inferredDstEnc, dstEnc, loc);
 }
 
 LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
@@ -1080,7 +1371,8 @@ LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
 
   // reshape(expand_dims(x)) -> x
   if (auto expandDims = dyn_cast<ExpandDimsOp>(definingOp)) {
-    if (op.getType() == expandDims.getSrc().getType()) {
+    if (!op.getAllowReorder() &&
+        op.getType() == expandDims.getSrc().getType()) {
       rewriter.replaceOp(op, expandDims.getSrc());
       return success();
     }
@@ -1088,8 +1380,17 @@ LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
 
   // reshape(reshape) -> reshape
   if (auto parentReshape = dyn_cast<ReshapeOp>(definingOp)) {
-    rewriter.replaceOpWithNewOp<ReshapeOp>(
-        op, op.getType(), parentReshape.getSrc(), op.getEfficientLayout());
+    // Allow reorder if either reshape allowed it
+    const bool allowReorder =
+        (op.getAllowReorder() || parentReshape.getAllowReorder());
+    // Keep both reshapes when the merged one would fail the verifier.
+    if (failed(verifyReshapeEncoding(parentReshape.getSrc().getType(),
+                                     op.getType(), allowReorder,
+                                     /*loc=*/std::nullopt)))
+      return failure();
+    rewriter.replaceOpWithNewOp<ReshapeOp>(op, op.getType(),
+                                           parentReshape.getSrc(), allowReorder,
+                                           op.getEfficientLayout());
     return success();
   }
 
@@ -1103,7 +1404,7 @@ LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
 }
 
 OpFoldResult ReshapeOp::fold(FoldAdaptor adaptor) {
-  if (getType() == getSrc().getType()) {
+  if (getType() == getSrc().getType() && !getAllowReorder()) {
     // no-op
     return getSrc();
   }
@@ -1121,6 +1422,14 @@ LogicalResult ReshapeOp::verify() {
 
   Attribute srcEnc = srcTy.getEncoding();
   Attribute dstEnc = dstTy.getEncoding();
+  // If either side carries a TLX placeholder wrapper (#tlx.user_layout /
+  // #tlx.no_verify_layout) -- at the top or nested inside a ttg encoding (e.g.
+  // a slice/expand parent) -- defer all reshape layout verification to
+  // resolve-placeholder-layouts (make_ttgir); the concrete src/dst may not be
+  // consistent yet at this point.
+  if (encodingContainsTlxPlaceholder(srcEnc) ||
+      encodingContainsTlxPlaceholder(dstEnc))
+    return success();
   if (!!srcEnc != !!dstEnc) {
     return emitError("Op requires that either (a) src and dst both have "
                      "encodings, or (b) neither does.");
@@ -1131,19 +1440,32 @@ LogicalResult ReshapeOp::verify() {
   }
 
   // Check that we can infer the dst encoding from the src encoding and that the
-  // inferred dst encoding is the same as the given dst encoding.
-  Attribute inferredDstEnc;
-  auto layoutInterface =
-      cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
-  auto result = layoutInterface->inferReshapeOpEncoding(
-      srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc, getLoc());
-  if (failed(result))
-    return failure();
-  return layoutInterface->verifyLayoutsAreEqual(
-      dstTy.getShape(), inferredDstEnc, dstEnc, getLoc());
+  // inferred dst encoding is the same as the given dst encoding. We pass the
+  // current dst encoding as a hint so that allowReorder reshapes are guaranteed
+  // to produce the current encoding iff it is valid.
+  return verifyReshapeEncoding(srcTy, dstTy, getAllowReorder(), getLoc());
 }
 
 //-- FpToFpOp --
+
+// Builder for FpToFpOp without rbits (regular conversion)
+void FpToFpOp::build(OpBuilder &builder, OperationState &state, Type resultType,
+                     Value src, Attribute rounding) {
+  state.addOperands(src);
+  state.addTypes(resultType);
+  if (rounding)
+    state.addAttribute("rounding", rounding);
+}
+
+// Builder for FpToFpOp with rbits (stochastic rounding)
+void FpToFpOp::build(OpBuilder &builder, OperationState &state, Type resultType,
+                     Value src, Value rbits, Attribute rounding) {
+  state.addOperands(src);
+  state.addOperands(rbits);
+  state.addTypes(resultType);
+  if (rounding)
+    state.addAttribute("rounding", rounding);
+}
 
 // Fold FpToFpOp when the input operand is a constant zero.
 OpFoldResult FpToFpOp::fold(FoldAdaptor adaptor) {
@@ -1175,7 +1497,112 @@ OpFoldResult FpToFpOp::fold(FoldAdaptor adaptor) {
   return {};
 }
 
+//-- FpToFpOp --
+ParseResult FpToFpOp::parse(OpAsmParser &parser, OperationState &result) {
+  // Parse: $src (`, rbits = ` $rbits `:` type($rbits))? (`, rounding = `
+  // $rounding)? attr-dict `:` type($src) `->` type($result)
+
+  OpAsmParser::UnresolvedOperand src;
+  Type srcType, resultType;
+
+  // Parse src operand
+  if (parser.parseOperand(src))
+    return failure();
+
+  // Try to parse optional clauses after comma
+  OpAsmParser::UnresolvedOperand rbits;
+  Type rbitsType;
+  bool hasRbits = false;
+  bool hasRounding = false;
+
+  while (succeeded(parser.parseOptionalComma())) {
+    // Check which clause we have
+    if (!hasRbits && succeeded(parser.parseOptionalKeyword("rbits"))) {
+      if (parser.parseEqual() || parser.parseOperand(rbits) ||
+          parser.parseColon() || parser.parseType(rbitsType))
+        return failure();
+      hasRbits = true;
+    } else if (!hasRounding &&
+               succeeded(parser.parseOptionalKeyword("rounding"))) {
+      // Parse rounding mode enum value
+      StringRef roundingStr;
+      if (parser.parseEqual() || parser.parseKeyword(&roundingStr))
+        return failure();
+
+      // Convert string to RoundingMode enum
+      auto roundingMode = triton::symbolizeRoundingMode(roundingStr);
+      if (!roundingMode) {
+        return parser.emitError(parser.getCurrentLocation(),
+                                "invalid rounding mode: ")
+               << roundingStr;
+      }
+
+      // Create RoundingModeAttr
+      auto roundingAttr =
+          triton::RoundingModeAttr::get(parser.getContext(), *roundingMode);
+      result.attributes.append("rounding", roundingAttr);
+      hasRounding = true;
+    } else {
+      return failure();
+    }
+  }
+
+  // Parse attr-dict (for any additional attributes)
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Parse `:` type($src) `->` type($result)
+  if (parser.parseColon() || parser.parseType(srcType) || parser.parseArrow() ||
+      parser.parseType(resultType))
+    return failure();
+
+  // Resolve operands
+  if (parser.resolveOperand(src, srcType, result.operands))
+    return failure();
+
+  if (hasRbits) {
+    if (parser.resolveOperand(rbits, rbitsType, result.operands))
+      return failure();
+  }
+
+  // Add result type
+  result.addTypes(resultType);
+
+  return success();
+}
+
+void FpToFpOp::print(OpAsmPrinter &p) {
+  // Print: $src (`, rbits = ` $rbits `:` type($rbits))? (`, rounding = `
+  // $rounding)? `:` type($src) `->` type($result)
+
+  p << " " << getSrc();
+
+  // Print rbits if present
+  if (getRbits()) {
+    p << ", rbits = " << getRbits() << " : " << getRbits().getType();
+  }
+
+  // Print rounding if present
+  if (getRounding()) {
+    p << ", rounding = " << getRounding();
+  }
+
+  // Don't print attributes that were explicitly handled
+  SmallVector<StringRef> elidedAttrs;
+  if (getRounding())
+    elidedAttrs.push_back("rounding");
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+
+  p << " : " << getSrc().getType() << " -> " << getType();
+}
+
 LogicalResult FpToFpOp::verify() {
+  if (getRounding() == RoundingMode::RS) {
+    if (!getRbits())
+      return emitOpError("stochastic rounding requires an rbits operand");
+  } else if (getRbits()) {
+    return emitOpError("rbits is only allowed with stochastic rounding");
+  }
   auto dstType = getType();
   auto srcType = getSrc().getType();
   if (auto dstTensorType = dyn_cast<RankedTensorType>(dstType))
@@ -1186,6 +1613,16 @@ LogicalResult FpToFpOp::verify() {
       (!getRounding().has_value())) {
     return emitError("Rounding mode is required for FP downcast");
   }
+  return success();
+}
+
+LogicalResult SrStoreOp::verify() {
+  auto ptrTy = cast<PointerType>(getElementTypeOrSelf(getPtr()));
+  if (!isa<FloatType>(ptrTy.getPointeeType()) ||
+      ptrTy.getAddressSpace() != PtrAddrSpace::Global)
+    return emitOpError("requires ordinary floating-point global pointers");
+  if (getSite().empty() || getSiteId() < 0)
+    return emitOpError("requires a named site with a nonnegative numeric ID");
   return success();
 }
 
@@ -1301,7 +1738,151 @@ void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
   SmallVector<int64_t> blockShape64(blockShape);
   auto descTy = TensorDescType::get(blockShape64, elemTy, isSignedInteger);
   auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
-  return build(builder, state, descTy, base, shape, strides, paddingAttr);
+  return build(builder, state, descTy, base, shape, strides,
+               /*descPtr=*/Value(), paddingAttr);
+}
+
+void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
+                             Value base, ValueRange shape, ValueRange strides,
+                             Value descPtr, ArrayRef<int32_t> blockShape,
+                             bool isSignedInteger,
+                             triton::PaddingOption padding) {
+  auto ptrTy = dyn_cast<triton::PointerType>(base.getType());
+  if (!ptrTy) {
+    llvm::report_fatal_error("Expected pointer type");
+  }
+  auto elemTy = ptrTy.getPointeeType();
+  SmallVector<int64_t> blockShape64(blockShape);
+  auto descTy = TensorDescType::get(blockShape64, elemTy, isSignedInteger);
+  auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
+  return build(builder, state, descTy, base, shape, strides, descPtr,
+               paddingAttr);
+}
+
+ParseResult MakeTensorDescOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  // Parse: $base `,` `[` $shape `]` `,` `[` $strides `]`
+  //        (`,` `descPtr` `=` $descPtr `:` type($descPtr))?
+  //        attr-dict `:` type($base) `,` type($result)
+
+  OpAsmParser::UnresolvedOperand base;
+  SmallVector<OpAsmParser::UnresolvedOperand> shape;
+  SmallVector<OpAsmParser::UnresolvedOperand> strides;
+  Type baseType, resultType;
+
+  // Parse base operand
+  if (parser.parseOperand(base) || parser.parseComma())
+    return failure();
+
+  // Parse shape: `[` $shape `]`
+  if (parser.parseLSquare() ||
+      parser.parseOperandList(shape, OpAsmParser::Delimiter::None) ||
+      parser.parseRSquare() || parser.parseComma())
+    return failure();
+
+  // Parse strides: `[` $strides `]`
+  if (parser.parseLSquare() ||
+      parser.parseOperandList(strides, OpAsmParser::Delimiter::None) ||
+      parser.parseRSquare())
+    return failure();
+
+  // Optional descPtr
+  OpAsmParser::UnresolvedOperand descPtr;
+  Type descPtrType;
+  bool hasDescPtr = false;
+
+  if (succeeded(parser.parseOptionalComma())) {
+    if (succeeded(parser.parseOptionalKeyword("descPtr"))) {
+      if (parser.parseEqual() || parser.parseOperand(descPtr) ||
+          parser.parseColon() || parser.parseType(descPtrType))
+        return failure();
+      hasDescPtr = true;
+    } else {
+      // If we see a comma but not "descPtr", it's an error
+      return parser.emitError(parser.getCurrentLocation(),
+                              "expected 'descPtr' keyword");
+    }
+  }
+
+  // Attr-dict
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Parse `:` type($base) `,` type($result)
+  if (parser.parseColon() || parser.parseType(baseType) ||
+      parser.parseComma() || parser.parseType(resultType))
+    return failure();
+
+  // Resolve operands
+  if (parser.resolveOperand(base, baseType, result.operands))
+    return failure();
+
+  // Shape operands are I32
+  auto i32Type = parser.getBuilder().getI32Type();
+  if (parser.resolveOperands(shape, i32Type, result.operands))
+    return failure();
+
+  // Strides operands are I64
+  auto i64Type = parser.getBuilder().getI64Type();
+  if (parser.resolveOperands(strides, i64Type, result.operands))
+    return failure();
+
+  // Resolve optional descPtr
+  if (hasDescPtr) {
+    if (parser.resolveOperand(descPtr, descPtrType, result.operands))
+      return failure();
+  }
+
+  // Tell MLIR how many operands belong to each segment:
+  // [ base, shape..., strides..., descPtr? ]
+  SmallVector<int32_t, 4> segmentSizes;
+  segmentSizes.push_back(1);                  // base
+  segmentSizes.push_back(shape.size());       // shape (Variadic<I32>)
+  segmentSizes.push_back(strides.size());     // strides (Variadic<I64>)
+  segmentSizes.push_back(hasDescPtr ? 1 : 0); // descPtr (Optional<TT_Ptr>)
+
+  auto &builder = parser.getBuilder();
+  result.addAttribute("operand_segment_sizes",
+                      builder.getDenseI32ArrayAttr(segmentSizes));
+
+  // Result type
+  result.addTypes(resultType);
+
+  return success();
+}
+
+void MakeTensorDescOp::print(OpAsmPrinter &p) {
+  // Print: $base `,` `[` $shape `]` `,` `[` $strides `]`
+  //        (`,` `descPtr` `=` $descPtr `:` type($descPtr))?
+  //        attr-dict `:` type($base) `,` type($result)
+
+  p << " " << getBase() << ", [" << getShape() << "], [" << getStrides() << "]";
+
+  // Print descPtr if present
+  if (getDescPtr()) {
+    p << ", descPtr = " << getDescPtr() << " : " << getDescPtr().getType();
+  }
+
+  // Print attributes (excluding any that were explicitly handled)
+  SmallVector<StringRef> elidedAttrs;
+  elidedAttrs.push_back("operandSegmentSizes");
+  // Elide padding if it's the default value
+  if (getPadding() == triton::PaddingOption::PAD_ZERO) {
+    elidedAttrs.push_back("padding");
+  }
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+
+  p << " : " << getBase().getType() << ", " << getType();
+}
+
+void MakeTensorDescOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  // If descPtr operand is present, this operation writes to global memory
+  if (getDescPtr()) {
+    effects.emplace_back(MemoryEffects::Write::get(), GlobalMemory::get());
+  }
+  // Otherwise, the operation is pure (no effects)
 }
 
 //-- IntToPtrOp --
@@ -1688,8 +2269,12 @@ LogicalResult ElementwiseInlineAsmOp::verify() {
       continue;
     if (tensorType && tensor.getShape() != tensorType.getShape())
       return emitOpError("requires matching tensor shapes");
-    if (tensorType && tensor.getEncoding() != tensorType.getEncoding())
-      return emitOpError("requires matching tensor encodings");
+    if (tensorType) {
+      Attribute encodingA = unwrapTlxWrappers(tensor.getEncoding());
+      Attribute encodingB = unwrapTlxWrappers(tensorType.getEncoding());
+      if (encodingA && encodingB && encodingA != encodingB)
+        return emitOpError("requires matching tensor encodings");
+    }
     tensorType = tensor;
     size_t numInputElems = tensor.getNumElements();
     if (numInputElems % getPackedElement() != 0) {
@@ -1888,6 +2473,36 @@ LogicalResult DescriptorStoreOp::verify() {
 LogicalResult DescriptorReduceOp::verify() {
   return verifyDescriptorLoadStoreOp(*this, getDesc().getType(),
                                      getSrc().getType());
+}
+
+std::optional<std::string>
+DescriptorLoadOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorStoreOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorGatherOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string> DescriptorScatterOp::getMixedRadixUnsupportedReason(
+    const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
 }
 
 } // namespace triton

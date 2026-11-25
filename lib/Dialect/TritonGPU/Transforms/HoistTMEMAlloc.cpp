@@ -3,17 +3,20 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
+namespace tlx = mlir::triton::tlx;
 
 namespace mlir {
 namespace triton {
@@ -40,6 +43,25 @@ template <typename OpT> struct HasToken : public OpT {
 using TMEMTokenLoadOp = HasToken<ttng::TMEMLoadOp>;
 using TMEMTokenStoreOp = HasToken<ttng::TMEMStoreOp>;
 using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
+
+// Helper: return true if the value is a constant boolean with the expected
+// value.
+static bool isConstBool(Value v, bool expected) {
+  if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
+    if (auto attr = dyn_cast<BoolAttr>(cst.getValueAttr()))
+      return attr.getValue() == expected;
+  }
+  return false;
+}
+
+// A scalar condition used by a tensor-shaped consumer is represented as a
+// splat. Recover the scalar it was built from, so a predicate stays scalar and
+// remains traceable to the reduction that produced it.
+static Value extractScalarOrigin(Value v) {
+  if (auto splat = v.getDefiningOp<tt::SplatOp>())
+    return splat.getSrc();
+  return v;
+}
 
 class CombineTMEMStoreAndSelect : public OpRewritePattern<ttng::TMEMStoreOp> {
 public:
@@ -68,13 +90,11 @@ public:
     if (valueFromTMEM == kUnknown) {
       return failure();
     }
-    // The store predicate is a scalar i1, so only a uniform condition can be
-    // folded into it. A splatted condition is uniform; use its scalar source.
     Value pred = select.getCondition();
-    if (auto splat = pred.getDefiningOp<tt::SplatOp>())
-      pred = splat.getSrc();
-    if (!pred.getType().isInteger(1))
-      return failure();
+    // Keep the TMEM store predicate scalar so data partitioning can trace and
+    // slice the reduction that produced it, and so it can later become the
+    // condition of an scf.if.
+    pred = extractScalarOrigin(pred);
     // In case the false operand is overwriting, we need to negate the predicate
     // (owerwrite when select would be false)
     if (valueFromTMEM == kTrue) {
@@ -101,6 +121,164 @@ public:
     if (!load.getResult().use_empty())
       return failure();
     rewriter.replaceAllUsesWith(load.getToken(), load.getDep());
+    return success();
+  }
+};
+
+// Materialize a predicated read-modify-write as control flow after software
+// pipelining and warp specialization. Before this point the eager SSA select
+// is useful: data partitioning can slice it into one predicate and one TMEM
+// accumulator per consumer task. Once the tasks exist, retaining a predicated
+// store alone is insufficient because the TMEM load and arithmetic feeding it
+// would still execute eagerly.
+class MaterializeConditionalTMEMStore
+    : public OpRewritePattern<ttng::TMEMStoreOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  static bool isSameIndexedView(Value lhs, Value rhs) {
+    if (lhs == rhs)
+      return true;
+    auto lhsIndex = lhs.getDefiningOp<ttg::MemDescIndexOp>();
+    auto rhsIndex = rhs.getDefiningOp<ttg::MemDescIndexOp>();
+    return lhsIndex && rhsIndex && lhsIndex.getSrc() == rhsIndex.getSrc() &&
+           lhsIndex.getIndex() == rhsIndex.getIndex();
+  }
+
+  LogicalResult matchAndRewrite(ttng::TMEMStoreOp store,
+                                PatternRewriter &rewriter) const override {
+    if (isConstBool(store.getPred(), true) ||
+        isConstBool(store.getPred(), false))
+      return failure();
+
+    Block *block = store->getBlock();
+    ttng::TMEMLoadOp load;
+    if (store.getDep()) {
+      load = store.getDep().getDefiningOp<TMEMTokenLoadOp>();
+    } else {
+      // Code specialization has already converted the TMEM token edge into
+      // barriers. Recover the accumulator load from the pure expression tree
+      // feeding the store. There can be other TMEM loads in that tree (alpha,
+      // for example), so match the same indexed accumulator view precisely.
+      SmallVector<Value> worklist = {store.getSrc()};
+      DenseSet<Value> seen;
+      while (!worklist.empty()) {
+        Value value = worklist.pop_back_val();
+        if (!seen.insert(value).second)
+          continue;
+        Operation *def = value.getDefiningOp();
+        if (!def || def->getBlock() != block)
+          continue;
+        if (auto candidate = dyn_cast<ttng::TMEMLoadOp>(def)) {
+          if (isSameIndexedView(candidate.getSrc(), store.getDst())) {
+            if (load && load != candidate)
+              return failure();
+            load = candidate;
+          }
+          continue;
+        }
+        if (!isPure(def))
+          continue;
+        llvm::append_range(worklist, def->getOperands());
+      }
+    }
+    if (!load || load->getBlock() != block ||
+        !isSameIndexedView(load.getSrc(), store.getDst()))
+      return failure();
+
+    // Find the pure expression path from the TMEM load to the value being
+    // stored. Values independent of the load (for example alpha) remain
+    // outside the branch and are captured by it.
+    DenseSet<Value> dependsOnLoad;
+    DenseSet<Operation *> toMove;
+    dependsOnLoad.insert(load.getResult());
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (Operation &op : *block) {
+        if (&op == store.getOperation() || &op == load.getOperation() ||
+            !isPure(&op) || toMove.contains(&op))
+          continue;
+        if (llvm::any_of(op.getOperands(), [&](Value operand) {
+              return dependsOnLoad.contains(operand);
+            })) {
+          toMove.insert(&op);
+          for (Value result : op.getResults())
+            dependsOnLoad.insert(result);
+          changed = true;
+        }
+      }
+    }
+    if (!dependsOnLoad.contains(store.getSrc()))
+      return failure();
+
+    // Moving an op into the branch is only legal when all of its users move
+    // with it (apart from the root store).
+    for (Operation *op : toMove) {
+      for (Operation *user : op->getUsers()) {
+        if (user != store.getOperation() && !toMove.contains(user))
+          return failure();
+      }
+    }
+    for (Operation *user : load.getResult().getUsers()) {
+      if (!toMove.contains(user))
+        return failure();
+    }
+    // The load is sunk into the then region, so its token result must not be
+    // observed from the outer block either -- an ordering consumer left behind
+    // would no longer be dominated by its def. The store is expected (it is
+    // moved in with the load); anything else means someone else is sequencing
+    // against this load and we must not move it.
+    if (load.getToken()) {
+      for (Operation *user : load.getToken().getUsers()) {
+        if (user != store.getOperation() && !toMove.contains(user))
+          return failure();
+      }
+    }
+
+    bool threadsToken = static_cast<bool>(store.getDep());
+    if (!threadsToken && store.getToken() && !store.getToken().use_empty())
+      return failure();
+    Value incomingToken = load.getDep();
+    Value condition = store.getPred();
+    Location loc = store.getLoc();
+    // Insert at the store, after all values independent of the accumulator
+    // load (notably the alpha channel) have been produced. The accumulator
+    // load and its dependent arithmetic are then sunk into the branch.
+    rewriter.setInsertionPoint(store);
+    SmallVector<Type> resultTypes;
+    if (threadsToken)
+      resultTypes.push_back(rewriter.getType<AsyncTokenType>());
+    auto ifOp = scf::IfOp::create(rewriter, loc, resultTypes, condition,
+                                  /*withElseRegion=*/true);
+    if (threadsToken) {
+      // scf::IfOp::build only materializes the region terminators when the op
+      // has no results; with a token result the blocks come back empty.
+      OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPointToEnd(ifOp.thenBlock());
+      scf::YieldOp::create(rewriter, loc, ValueRange{incomingToken});
+      rewriter.setInsertionPointToEnd(ifOp.elseBlock());
+      scf::YieldOp::create(rewriter, loc, ValueRange{incomingToken});
+    }
+
+    auto thenYield = cast<scf::YieldOp>(ifOp.thenBlock()->getTerminator());
+    rewriter.setInsertionPoint(thenYield);
+    rewriter.moveOpBefore(load, thenYield);
+    for (Operation &op : llvm::make_early_inc_range(*block)) {
+      if (toMove.contains(&op))
+        rewriter.moveOpBefore(&op, thenYield);
+    }
+    rewriter.modifyOpInPlace(store, [&] {
+      store.getPredMutable().assign(
+          arith::ConstantIntOp::create(rewriter, loc, 1, 1));
+    });
+    rewriter.moveOpBefore(store, thenYield);
+    if (threadsToken) {
+      auto elseYield = cast<scf::YieldOp>(ifOp.elseBlock()->getTerminator());
+      elseYield.getResultsMutable().assign(incomingToken);
+      rewriter.replaceAllUsesWith(store.getToken(), ifOp.getResult(0));
+      thenYield.getResultsMutable().assign(store.getToken());
+    }
     return success();
   }
 };
@@ -164,8 +342,17 @@ public:
     Value newToken = sinkValueRedefinition(rewriter, load.getDep(),
                                            load.getToken(), domOp->getBlock());
     if (newToken != load.getToken()) {
-      for (OpOperand *use : uses)
-        use->set(newToken);
+      // Iterate the live use list with make_early_inc_range: the OpOperand*
+      // captured above may dangle (sinkValueRedefinition can reallocate operand
+      // storage) and set() mutates the list. Skip uses newToken does not
+      // dominate -- when threaded out of an enclosing region it is that
+      // region's result, which does not dominate uses inside the region; those
+      // keep the original token, which still dominates them.
+      DominanceInfo postSinkDomInfo;
+      for (OpOperand &use :
+           llvm::make_early_inc_range(load.getToken().getUses()))
+        if (postSinkDomInfo.properlyDominates(newToken, use.getOwner()))
+          use.set(newToken);
     }
     return success();
   }
@@ -432,16 +619,6 @@ public:
   }
 };
 
-// Helper: return true if the value is a constant boolean with the expected
-// value.
-static bool isConstBool(Value v, bool expected) {
-  if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
-    if (auto attr = dyn_cast<BoolAttr>(cst.getValueAttr()))
-      return attr.getValue() == expected;
-  }
-  return false;
-}
-
 // Helper to detect if the use of an alloc fully overwrites it.
 struct AllocUse {
   Operation *useOp;
@@ -642,6 +819,13 @@ struct HoistTMEMAlloc
   using impl::TritonGPUHoistTMEMAllocBase<
       HoistTMEMAlloc>::TritonGPUHoistTMEMAllocBase;
 
+  // check whether we should bail early due to using TLX
+  bool shouldBail(ModuleOp &mod) const {
+    auto hasTLX =
+        mod->getAttrOfType<BoolAttr>(tlx::AttrHasExplicitLocalMemAccessName);
+    return hasTLX != nullptr && hasTLX.getValue() == true;
+  }
+
   void runOnOperation() override {
     ModuleOp m = getOperation();
     if (!postPipeline) {
@@ -680,7 +864,8 @@ struct HoistTMEMAlloc
                  SinkTMEMLoad, RemoveUnusedTMEMLoad>(&getContext());
     if (postPipeline) {
       patterns.add<CombineTMEMStoreAndAlloc, HoistTMEMAllocOutOfIf,
-                   TMEMLoadForwarding>(&getContext());
+                   MaterializeConditionalTMEMStore, TMEMLoadForwarding>(
+          &getContext());
     }
     scf::ForOp::getCanonicalizationPatterns(patterns, &getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {

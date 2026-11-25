@@ -662,6 +662,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: missing_proxy_fence_local_store_before_async_tma_copy_local_to_global
+  tt.func @missing_proxy_fence_local_store_before_async_tma_copy_local_to_global(%arg0: !tt.tensordesc<128x256xf32, #shared>, %arg1: tensor<128x256xf32, #blocked>) {
+    // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
+    // CHECK-NEXT: ttg.local_store
+    // CHECK-NEXT: ttng.fence_async_shared
+    // CHECK-NEXT: ttng.async_tma_copy_local_to_global
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc {allocation.offset = 16 : i32} : () -> !ttg.memdesc<128x256xf32, #shared, #smem, mutable>
+    ttng.async_tma_store_wait {pendings = 1 : i32}
+    ttg.local_store %arg1, %0 : tensor<128x256xf32, #blocked> -> !ttg.memdesc<128x256xf32, #shared, #smem, mutable>
+    ttng.async_tma_copy_local_to_global %arg0[%c0_i32, %c0_i32] %0 : !tt.tensordesc<128x256xf32, #shared>, !ttg.memdesc<128x256xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: missing_proxy_fence_local_store_before_tmem_copy
+  tt.func @missing_proxy_fence_local_store_before_tmem_copy(%arg0: tensor<128x4xi8, #blocked>,
+      %arg1: !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable>) {
+    // CHECK: ttg.local_store
+    // CHECK-NEXT: ttng.fence_async_shared
+    // CHECK-NEXT: ttng.tmem_copy
+    %0 = ttg.local_alloc {allocation.offset = 16 : i32} : () -> !ttg.memdesc<128x4xi8, #shared1, #smem, mutable>
+    ttg.local_store %arg0, %0 : tensor<128x4xi8, #blocked> -> !ttg.memdesc<128x4xi8, #shared1, #smem, mutable>
+    ttng.tmem_copy %0, %arg1 : !ttg.memdesc<128x4xi8, #shared1, #smem, mutable>, !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked_a = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked_b = #ttg.blocked<{sizePerThread = [16, 1], threadsPerWarp = [2, 16], warpsPerCTA = [1, 4], order = [0, 1]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -1790,6 +1831,85 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
     ttng.async_tma_copy_global_to_local %desc[%c0] %page, %bar, %true : !tt.tensordesc<64xi32, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<64xi32, #shared, #smem, mutable>
     ttng.wait_barrier %bar, %c0, %true deps %page : !ttg.memdesc<1xi64, #barrier, #smem, mutable>, !ttg.memdesc<64xi32, #shared, #smem, mutable>
     ttng.inval_barrier %bar : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// The non-tensor bulk store/reduce reads its source through the async proxy,
+// so a generic write to that buffer needs a proxy fence before it.
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @async_store_reduce_after_local_store
+  tt.func @async_store_reduce_after_local_store(%dst: !tt.ptr<f32>, %data: tensor<512xf32, #blocked>) {
+    %size = arith.constant 2048 : i32
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<512xf32, #shared, #smem, mutable>
+    ttg.local_store %data, %buf : tensor<512xf32, #blocked> -> !ttg.memdesc<512xf32, #shared, #smem, mutable>
+    // CHECK: ttg.local_store
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
+    // CHECK-NEXT: ttng.async_store
+    ttng.async_store %buf, %dst, %size {store_reduce = 1 : i32} : !ttg.memdesc<512xf32, #shared, #smem, mutable>, !tt.ptr<f32>
+    tt.return
+  }
+}
+
+// -----
+
+// autoWS marks the release of a buffer that the releasing partition read with
+// a local_load and another partition refills with TMA. The refill is not in
+// this region, so only the mark tells the pass to fence before the release.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 16, rank = 1}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @fence_marked_ws_release
+  tt.func @fence_marked_ws_release(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.wait_barrier %full, %c0, %true : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%v) : (tensor<128xbf16, #blocked>) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    // An unmarked release gets no fence.
+    %w = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%w) : (tensor<128xbf16, #blocked>) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    // A marked release that already follows a fence gets no second one.
+    // CHECK-NEXT: ttng.fence_async_shared
+    // CHECK-NEXT: ttng.arrive_barrier
+    // CHECK-NOT: ttng.fence_async_shared
+    // CHECK: tt.return
+    ttng.fence_async_shared {bCluster = false}
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+
+  // The release may already be a named barrier.
+  // CHECK-LABEL: @fence_marked_named_release
+  tt.func @fence_marked_named_release(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %id: !ttng.named_barrier_id) {
+    %c0 = arith.constant 0 : i32
+    %c64 = arith.constant 64 : i32
+    %true = arith.constant true
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.wait_barrier %full, %c0, %true : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%v) : (tensor<128xbf16, #blocked>) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
+    // CHECK-NEXT: ttng.arrive_barrier_named
+    ttng.arrive_barrier_named %id, %c64 {ttng.fence_generic_reads} : !ttng.named_barrier_id, i32
     tt.return
   }
 }

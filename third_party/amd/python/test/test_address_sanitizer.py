@@ -1,16 +1,21 @@
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 import triton
+
+import pytest
 
 
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
+pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
+
+
 def test_address_sanitizer():
-    if not is_hip():
-        return  #not supported on NV backend
 
     # It is recommended to disable various memory caching strategies both within the ROCm stack and PyTorch
     # This will give the address sanitizer the best chance at finding the memory fault where it originates,
@@ -32,6 +37,11 @@ def test_address_sanitizer():
     # Disable buffer ops given it has builtin support for out of bound access.
     os.environ["AMDGCN_USE_BUFFER_OPS"] = "0"
 
-    out = subprocess.Popen(["python", "address_sanitizer_helper.py"], stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-    assert "Begin function __asan_report" in out.stdout.read().decode()
-    assert "heap-buffer-overflow" in out.stderr.read().decode()
+    out = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("address_sanitizer_helper.py"))],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert "Begin function __asan_report" in out.stdout
+    assert "heap-buffer-overflow" in out.stderr

@@ -35,8 +35,7 @@ namespace NVIDIA {
 class TargetInfo;
 
 Value shuffleXor(Location loc, RewriterBase &rewriter, Value val, int i);
-std::pair<Value, Value> shuffleUp(Location loc, RewriterBase &rewriter,
-                                  Value val, int delta);
+Value shuffleUp(Location loc, RewriterBase &rewriter, Value val, int i);
 Value shuffleIdx(Location loc, RewriterBase &rewriter, Value val, int i);
 Value shuffleIdx(Location loc, RewriterBase &rewriter, Value val, Value i);
 Value permute(Location loc, RewriterBase &rewriter, Value a, Value b,
@@ -48,6 +47,7 @@ Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
 /// Create a predicate with just single active thread.
 Value createElectPredicate(Location loc, OpBuilder &rewriter);
 Value createElectPredicateWarp0(Location loc, OpBuilder &rewriter);
+Value createLeaderCTAPredicate(Location loc, OpBuilder &rewriter);
 
 // Create bar.warp.sync
 void createSyncWarp(Location loc, OpBuilder &builder);
@@ -64,7 +64,8 @@ LogicalResult lowerLdStMatrix(
 // where for ctaId, it sets as 1's the positions that are in the same broadcast
 // group
 Value createTMAMulticastMask(Location loc, ConversionPatternRewriter &rewriter,
-                             uint16_t broadcastBits, Value ctaId = {});
+                             uint16_t broadcastBits, Value ctaId = {},
+                             std::optional<int> physicalNumCTAs = std::nullopt);
 
 uint32_t getCGABroadcastMask(mlir::triton::gpu::MemDescType barrierTy);
 

@@ -30,11 +30,27 @@
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 namespace mlir::triton::AMD {
 namespace {
+
+static std::optional<mlir::triton::LinearLayout>
+wmmaRepLayoutForTensor(const mlir::triton::LinearLayout &wholeTileLL,
+                       const mlir::triton::LinearLayout &tileLL) {
+  // Clamp the tileLL to the tensor's output dims so that divideLeft succeeds
+  // when the tensor is smaller than the WMMA instruction shape.
+  auto clampedTileLL = ensureLayoutNotLargerThan(
+      tileLL, llvm::to_vector(wholeTileLL.getOutDimNames()),
+      SmallVector<int64_t>(wholeTileLL.getOutDimSizes()));
+
+  auto quot = divideLeft(wholeTileLL, clampedTileLL);
+  if (quot.has_value())
+    return zerosLike(clampedTileLL) * *quot;
+  return {};
+}
 
 #define S(v) StringAttr::get(ctx, (v))
 using ::mlir::triton::gpu::AMDWmmaEncodingAttr;
@@ -93,22 +109,6 @@ static int computeKPadding(int kBase, int64_t tensorK,
   return kBase - kBase * tensorK / kInstrSize;
 }
 
-// Returns the number of consecutive wmma instructions that consume one chunk
-// of kWidth K registers in a lane. This is 1 unless kWidth exceeds the K
-// registers one instruction takes per lane and nonK subtile. E.g. for wmma v2
-// 16x16x16 f16 (kBase = 8) with kWidth = 16, lanes 0-15 hold k[0-15] and lanes
-// 16-31 hold k[16-31]; the first instruction takes regs 0-7 and the second
-// regs 8-15. This permutes K the same way for both operands, so the sum over
-// K is unchanged.
-static int getInstrsPerKChunk(DotOperandEncodingAttr dotEnc, int kBase) {
-  auto wmmaLayout = cast<AMDWmmaEncodingAttr>(dotEnc.getParent());
-  constexpr int wmmaTileDim = 16;
-  int nonKRepeat =
-      wmmaLayout.getOperandNonKDim(dotEnc.getOpIdx()) / wmmaTileDim;
-  int kPerSubtile = kBase / nonKRepeat;
-  return std::max<int>(dotEnc.getKWidth() / kPerSubtile, 1);
-}
-
 // Returns a bitmask of the lane bits that will move in K direction. For WMMA
 // v2+ operand layouts the first nonKDim(=16) lanes (log2(nonKDim) bits) walk
 // the non-K dimension and then wrap around moving in K dimension.
@@ -165,23 +165,8 @@ Value getOperandVals(ConversionPatternRewriter &rewriter,
 
   Value rawElems = tb.undef(vecTy);
 
-  // The register layout splits kBase into nonKRepeat subtiles of kPerSubtile
-  // registers:
-  //   regs [0, kPerSubtile)             -> M=0..15
-  //   regs [kPerSubtile, 2*kPerSubtile) -> M=16..31
-  auto wmmaLayout = cast<AMDWmmaEncodingAttr>(dotEnc.getParent());
-  int nonKDim = wmmaLayout.getOperandNonKDim(dotEnc.getOpIdx());
-  const int nonKTileDim = 16;
-  int nonKRepeat = nonKDim / nonKTileDim;
-  int kPerSubtile = kBase / nonKRepeat;
-
-  // kIdx is expressed in "instructions"; convert to element indexing. When a
-  // kWidth chunk spans several instructions, locate the start of the chunk;
-  // the instruction's registers are at an offset within it.
-  const int instrsPerChunk = isScale ? 1 : getInstrsPerKChunk(dotEnc, kBase);
-  assert((instrsPerChunk == 1 || kDimTensor >= instrsPerChunk * kInstrSize) &&
-         "the dot verifier requires K to cover whole kWidth chunks");
-  const int kElemIdx = (kIdx / instrsPerChunk) * instrsPerChunk * kInstrSize;
+  // kIdx is expressed in "instructions"; convert to element indexing.
+  const int kElemIdx = kIdx * kInstrSize;
 
   // Choose which output dimension gets nonK vs K depending on opIdx.
   const int mCoord = (opIdx == 0) ? nonK : kElemIdx;
@@ -202,10 +187,8 @@ Value getOperandVals(ConversionPatternRewriter &rewriter,
 
   auto inDims = dotLayout.pseudoinvert().apply(outCoords);
 
-  // inDims are ("register", "lane") of the chunk start; offset the register to
-  // this instruction's part of the chunk.
-  const int startReg = inDims[0].second + (kIdx % instrsPerChunk) * kPerSubtile;
-  const int lane = inDims[1].second;
+  const int startReg = inDims[0].second; // "register"
+  const int lane = inDims[1].second;     // "lane"
 
   if (isScale && lane != 0) {
     assert(opSel && "opSel must be provided when isScale is true");
@@ -223,18 +206,22 @@ Value getOperandVals(ConversionPatternRewriter &rewriter,
                                     rewriter.getZeroAttr(elemTy));
   }
 
+  // The register layout splits kBase into nonKRepeat subtiles of kPerSubtile
+  // registers:
+  //   regs [0, kPerSubtile)             -> M=0..15
+  //   regs [kPerSubtile, 2*kPerSubtile) -> M=16..31
   // Padding must be applied per-subtile so each nonK half is padded
-  // independently. Subtiles are a whole kWidth chunk apart when the chunk
-  // spans several instructions.
+  // independently.
+  auto wmmaLayout = cast<AMDWmmaEncodingAttr>(dotEnc.getParent());
+  int nonKDim = wmmaLayout.getOperandNonKDim(dotEnc.getOpIdx());
+  const int nonKTileDim = 16;
+  int nonKRepeat = nonKDim / nonKTileDim;
+  int kPerSubtile = kBase / nonKRepeat;
   int validKPerSubTile = validK / nonKRepeat;
-  int subTileStride = kPerSubtile * instrsPerChunk;
 
   for (int k = 0; k < kBase; ++k) {
-    int subTile = k / kPerSubtile;
     int subTilePos = k % kPerSubtile;
-    Value elem = (subTilePos < validKPerSubTile)
-                     ? elems[startReg + subTile * subTileStride + subTilePos]
-                     : zero;
+    Value elem = (subTilePos < validKPerSubTile) ? elems[startReg + k] : zero;
     rawElems = tb.insert_element(vecTy, rawElems, elem, tb.i32_val(k));
   }
 
@@ -639,23 +626,33 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
 
   unsigned kInstrSize = mnkDim[2];
 
-  auto aElemType = op.getAElemType();
-  bool isFp4A = aElemType == triton::ScaleDotElemType::E2M1;
-  int kDimA = isFp4A ? kInstrSize / 2 : kInstrSize;
+  auto packedKDim = [](triton::ScaleDotElemType elemType,
+                       int kInstrSize) -> FailureOr<int> {
+    if (elemType == triton::ScaleDotElemType::E2M1)
+      return kInstrSize / 2;
+    if (triton::isMXFP6ScaleType(elemType)) {
+      // fp6 packs groups of 16 values per 12 bytes; the x3/4 byte
+      // conversion steps within a group by 4 values.
+      if (kInstrSize % 4 != 0)
+        return failure();
+      return kInstrSize * 3 / 4;
+    }
+    return kInstrSize;
+  };
 
+  auto aElemType = op.getAElemType();
+  auto kDimAOr = packedKDim(aElemType, kInstrSize);
   auto bElemType = op.getBElemType();
-  bool isFp4B = bElemType == triton::ScaleDotElemType::E2M1;
-  int kDimB = isFp4B ? kInstrSize / 2 : kInstrSize;
+  auto kDimBOr = packedKDim(bElemType, kInstrSize);
+  if (failed(kDimAOr) || failed(kDimBOr))
+    return op.emitError("fp6 WMMA instruction K size ")
+           << kInstrSize << " is not a multiple of 4, so it cannot be "
+           << "converted to packed bytes (x3/4)";
+  int kDimA = *kDimAOr;
+  int kDimB = *kDimBOr;
 
   unsigned scaleFactor = op.deduceScaleFactor();
   int kDimScale = kInstrSize / scaleFactor;
-
-  bool isFp6A = (aElemType == triton::ScaleDotElemType::E2M3) ||
-                (aElemType == triton::ScaleDotElemType::E3M2);
-  bool isFp6B = (bElemType == triton::ScaleDotElemType::E2M3) ||
-                (bElemType == triton::ScaleDotElemType::E3M2);
-  if (isFp6A || isFp6B)
-    return op.emitError("NYI: FP6 scaled dot");
 
   Type scaledAElemType =
       LLVM::AMD::scaleDotElemTypeToMLIRType(op.getContext(), op.getAElemType());

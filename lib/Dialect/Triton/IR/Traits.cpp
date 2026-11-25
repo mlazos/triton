@@ -6,6 +6,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
@@ -40,6 +41,12 @@ static LogicalResult verifySameEncoding(Type typeA, Type typeB) {
     if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
       ret = tensorType.getEncoding();
     }
+    // Peel any TLX placeholder wrapper(s) (#tlx.user_layout / no_verify) and
+    // verify the underlying concrete layout, rather than skipping verification.
+    // The wrapper itself is retired later by resolve-placeholder-layouts; a
+    // still-null inner (unresolved) is accepted by the null short-circuit
+    // below.
+    ret = triton::unwrapTlxWrappers(ret);
     return ret;
   };
   auto encodingA = getEncoding(typeA);
@@ -92,6 +99,7 @@ LogicalResult OpTrait::impl::verifySameResultsType(Operation *op) {
 }
 
 LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
+  static const bool allowNpot = mlir::triton::tools::isNpotAllowed();
   for (auto opType : op->getOperandTypes()) {
     if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
       int64_t numElements = 1;
@@ -101,7 +109,7 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-      if ((numElements & (numElements - 1)) != 0)
+      if (!allowNpot && (numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";
@@ -116,7 +124,7 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-      if ((numElements & (numElements - 1)) != 0)
+      if (!allowNpot && (numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";
@@ -141,9 +149,10 @@ LogicalResult OpTrait::impl::verifyTensorLayouts(Operation *op) {
       return success();
 
     mlir::Attribute layout = rankedTy.getEncoding();
-    if (!layout)
+    if (!layout || triton::encodingContainsTlxNoVerifyLayout(layout))
       return success();
 
+    layout = triton::unwrapTlxWrappers(layout);
     Dialect &dialect = layout.getDialect();
     auto verifyLayoutInterface =
         dyn_cast<mlir::triton::DialectVerifyTensorLayoutInterface>(&dialect);

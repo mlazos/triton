@@ -1,0 +1,164 @@
+// RUN: triton-opt %s --allocate-shared-memory --convert-triton-gpu-to-llvm --convert-nv-gpu-to-llvm | mlir-translate -mlir-to-llvmir | opt -S -O1 | FileCheck %s
+
+// Test that the inner_tree reduction ordering produces count-up shuffle order
+// (stride 2, 4, 8, 16) instead of the default count-down order (16, 8, 4, 2).
+// For this layout, each register value belongs to a distinct contiguous group
+// along the reduction axis. INNER_TREE keeps those groups separate through the
+// warp reduction and combines the groups later when packing the result.
+
+#linear = #ttg.linear<{register = [[0, 2], [2, 0]], lane = [[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]], warp = [[0, 1], [0, 4]], block = []}>
+#lane_interleaved = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [0, 2], [2, 0], [0, 4], [4, 0]], warp = [[0, 8], [0, 16]], block = []}>
+#interleaved_warps = #ttg.linear<{register = [], lane = [[1, 0], [0, 1], [2, 0], [0, 2], [0, 4]], warp = [[4, 0], [8, 0]], block = []}>
+#contiguous_warps = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [0, 1], [0, 2], [0, 4]], warp = [[4, 0], [8, 0]], block = []}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+
+// CHECK-LABEL: @reduce_inner_tree
+tt.func private @reduce_inner_tree(%arg0: tensor<32x16xi32, #linear>) -> tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>> {
+  // CHECK: [[SRC0:%.*]] = extractvalue {{.*}} %0, 0
+  // CHECK: [[SRC1:%.*]] = extractvalue {{.*}} %0, 1
+  // CHECK: [[SRC2:%.*]] = extractvalue {{.*}} %0, 2
+  // CHECK: [[SRC3:%.*]] = extractvalue {{.*}} %0, 3
+
+  // INNER_TREE count-up warp shuffle for each register group.
+  // CHECK: [[S0_W0:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC0]], i32 2, i32 31)
+  // CHECK: [[S0_A0:%.*]] = add i32 [[S0_W0]], [[SRC0]]
+  // CHECK: [[S0_W1:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S0_A0]], i32 4, i32 31)
+  // CHECK: [[S0_A1:%.*]] = add i32 [[S0_A0]], [[S0_W1]]
+  // CHECK: [[S0_W2:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S0_A1]], i32 8, i32 31)
+  // CHECK: [[S0_A2:%.*]] = add i32 [[S0_A1]], [[S0_W2]]
+  // CHECK: [[S0_W3:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S0_A2]], i32 16, i32 31)
+
+  // CHECK: [[S1_W0:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC1]], i32 2, i32 31)
+  // CHECK: [[S1_A0:%.*]] = add i32 [[S1_W0]], [[SRC1]]
+  // CHECK: [[S1_W1:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S1_A0]], i32 4, i32 31)
+  // CHECK: [[S1_A1:%.*]] = add i32 [[S1_A0]], [[S1_W1]]
+  // CHECK: [[S1_W2:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S1_A1]], i32 8, i32 31)
+  // CHECK: [[S1_A2:%.*]] = add i32 [[S1_A1]], [[S1_W2]]
+  // CHECK: [[S1_W3:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S1_A2]], i32 16, i32 31)
+
+  // CHECK: [[S2_W0:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC2]], i32 2, i32 31)
+  // CHECK: [[S2_A0:%.*]] = add i32 [[S2_W0]], [[SRC2]]
+  // CHECK: [[S2_W1:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S2_A0]], i32 4, i32 31)
+  // CHECK: [[S2_A1:%.*]] = add i32 [[S2_A0]], [[S2_W1]]
+  // CHECK: [[S2_W2:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S2_A1]], i32 8, i32 31)
+  // CHECK: [[S2_A2:%.*]] = add i32 [[S2_A1]], [[S2_W2]]
+  // CHECK: [[S2_W3:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S2_A2]], i32 16, i32 31)
+
+  // CHECK: [[S3_W0:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[SRC3]], i32 2, i32 31)
+  // CHECK: [[S3_A0:%.*]] = add i32 [[S3_W0]], [[SRC3]]
+  // CHECK: [[S3_W1:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S3_A0]], i32 4, i32 31)
+  // CHECK: [[S3_A1:%.*]] = add i32 [[S3_A0]], [[S3_W1]]
+  // CHECK: [[S3_W2:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S3_A1]], i32 8, i32 31)
+  // CHECK: [[S3_A2:%.*]] = add i32 [[S3_A1]], [[S3_W2]]
+  // CHECK: [[S3_W3:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 [[S3_A2]], i32 16, i32 31)
+
+  // CHECK: add i32 [[S0_A2]], [[S0_W3]]
+  // CHECK: add i32 [[S1_A2]], [[S1_W3]]
+
+  %0 = "tt.reduce"(%arg0) ({
+  ^bb0(%arg1: i32, %arg2: i32):
+    %1 = arith.addi %arg1, %arg2 : i32
+    tt.reduce.return %1 : i32
+  }) {axis = 0 : i32, reduction_ordering = "inner_tree"} : (tensor<32x16xi32, #linear>) -> tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>>
+
+  // CHECK: ret { i32, i32 }
+  tt.return %0 : tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>>
+}
+
+// A lane distribution may interleave reduction and non-reduction lane-id
+// bits. Reduce exactly the bits that move axis 0: 4, 2, and 0, corresponding
+// to XOR masks 16, 4, and 1 in the established count-down order.
+// CHECK-LABEL: @reduce_lane_interleaved
+tt.func private @reduce_lane_interleaved(%arg0: tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>> {
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 16, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 4, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 1, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 16, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 4, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 1, i32 31)
+  // CHECK-NOT: call i32 @llvm.nvvm.shfl.sync.bfly.i32
+  %0 = "tt.reduce"(%arg0) ({
+  ^bb0(%arg1: i32, %arg2: i32):
+    %1 = arith.addi %arg1, %arg2 : i32
+    tt.reduce.return %1 : i32
+  }) {axis = 0 : i32} : (tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+  tt.return %0 : tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+}
+
+tt.func @anchor(%ptr: !llvm.ptr, %lane_ptr: !llvm.ptr, %arg0: tensor<32x16xi32, #linear>, %arg1: tensor<8x32xi32, #lane_interleaved>) {
+  %0 = tt.call @reduce_inner_tree(%arg0) : (tensor<32x16xi32, #linear>) -> tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>>
+  %1 = builtin.unrealized_conversion_cast %0 : tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>> to !llvm.struct<(i32, i32)>
+  llvm.store volatile %1, %ptr : !llvm.struct<(i32, i32)>, !llvm.ptr
+  %2 = tt.call @reduce_lane_interleaved(%arg1) : (tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+  %3 = builtin.unrealized_conversion_cast %2 : tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>> to !llvm.struct<(i32, i32)>
+  llvm.store volatile %3, %lane_ptr : !llvm.struct<(i32, i32)>, !llvm.ptr
+  tt.return
+}
+
+// #lane_interleaved under INNER_TREE takes the ReduceOpHelper path. Shuffle
+// lane bits 0, 2 and 4 in count-up order.
+// CHECK-LABEL: @reduce_inner_tree_lane_interleaved
+// CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 1, i32 31)
+// CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 4, i32 31)
+// CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 16, i32 31)
+// CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 1, i32 31)
+// CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 4, i32 31)
+// CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 16, i32 31)
+// CHECK-NOT: call i32 @llvm.nvvm.shfl.sync.bfly.i32
+tt.func private @reduce_inner_tree_lane_interleaved(%arg0: tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>> {
+  %0 = "tt.reduce"(%arg0) ({
+  ^bb0(%arg1: i32, %arg2: i32):
+    %1 = arith.addi %arg1, %arg2 : i32
+    tt.reduce.return %1 : i32
+  }) {axis = 0 : i32, reduction_ordering = "inner_tree"} : (tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+  tt.return %0 : tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+}
+
+// Warps also split axis 0, so the default ordering takes the ReduceOpHelper
+// path too. Within a warp only lane bits 0 and 2 move axis 0, so lanes with
+// both bits clear write the partial result to shared memory.
+// CHECK-LABEL: @reduce_lane_interleaved_warps
+// CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 4, i32 31)
+// CHECK-NEXT: add i32
+// CHECK-NEXT: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 1, i32 31)
+// CHECK: %[[LANE_AXIS:.*]] = and i32 %{{.*}}, 5
+// CHECK-NEXT: %[[WRITE:.*]] = icmp eq i32 %[[LANE_AXIS]], 0
+// CHECK: st.shared.b32{{.*}}i1 %[[WRITE]])
+tt.func private @reduce_lane_interleaved_warps(%arg0: tensor<16x8xi32, #interleaved_warps>) -> tensor<8xi32, #ttg.slice<{dim = 0, parent = #interleaved_warps}>> {
+  %0 = "tt.reduce"(%arg0) ({
+  ^bb0(%arg1: i32, %arg2: i32):
+    %1 = arith.addi %arg1, %arg2 : i32
+    tt.reduce.return %1 : i32
+  }) {axis = 0 : i32} : (tensor<16x8xi32, #interleaved_warps>) -> tensor<8xi32, #ttg.slice<{dim = 0, parent = #interleaved_warps}>>
+  tt.return %0 : tensor<8xi32, #ttg.slice<{dim = 0, parent = #interleaved_warps}>>
+}
+
+// Control: contiguous lane bits 0 and 1 keep the contiguous shuffles.
+// CHECK-LABEL: @reduce_lane_contiguous_warps
+// CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 2, i32 31)
+// CHECK-NEXT: add i32
+// CHECK-NEXT: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 1, i32 31)
+tt.func private @reduce_lane_contiguous_warps(%arg0: tensor<16x8xi32, #contiguous_warps>) -> tensor<8xi32, #ttg.slice<{dim = 0, parent = #contiguous_warps}>> {
+  %0 = "tt.reduce"(%arg0) ({
+  ^bb0(%arg1: i32, %arg2: i32):
+    %1 = arith.addi %arg1, %arg2 : i32
+    tt.reduce.return %1 : i32
+  }) {axis = 0 : i32} : (tensor<16x8xi32, #contiguous_warps>) -> tensor<8xi32, #ttg.slice<{dim = 0, parent = #contiguous_warps}>>
+  tt.return %0 : tensor<8xi32, #ttg.slice<{dim = 0, parent = #contiguous_warps}>>
+}
+
+tt.func @anchor_helper_path(%ptr: !llvm.ptr, %arg0: tensor<8x32xi32, #lane_interleaved>, %arg1: tensor<16x8xi32, #interleaved_warps>, %arg2: tensor<16x8xi32, #contiguous_warps>) {
+  %0 = tt.call @reduce_inner_tree_lane_interleaved(%arg0) : (tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+  %1 = builtin.unrealized_conversion_cast %0 : tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>> to !llvm.struct<(i32, i32)>
+  llvm.store volatile %1, %ptr : !llvm.struct<(i32, i32)>, !llvm.ptr
+  %2 = tt.call @reduce_lane_interleaved_warps(%arg1) : (tensor<16x8xi32, #interleaved_warps>) -> tensor<8xi32, #ttg.slice<{dim = 0, parent = #interleaved_warps}>>
+  %3 = builtin.unrealized_conversion_cast %2 : tensor<8xi32, #ttg.slice<{dim = 0, parent = #interleaved_warps}>> to !llvm.struct<(i32)>
+  llvm.store volatile %3, %ptr : !llvm.struct<(i32)>, !llvm.ptr
+  %4 = tt.call @reduce_lane_contiguous_warps(%arg2) : (tensor<16x8xi32, #contiguous_warps>) -> tensor<8xi32, #ttg.slice<{dim = 0, parent = #contiguous_warps}>>
+  %5 = builtin.unrealized_conversion_cast %4 : tensor<8xi32, #ttg.slice<{dim = 0, parent = #contiguous_warps}>> to !llvm.struct<(i32)>
+  llvm.store volatile %5, %ptr : !llvm.struct<(i32)>, !llvm.ptr
+  tt.return
+}
+
+}

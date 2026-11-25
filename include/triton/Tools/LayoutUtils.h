@@ -4,6 +4,53 @@
 #include "triton/Tools/LinearLayout.h"
 
 namespace mlir::triton {
+
+// Whether the layout reaches every coordinate of the box [0, N_d) given by
+// `logicalShape` (out dims dim0, dim1, ... in order). The image is a subgroup,
+// so this is a closed-form span check; malformed inputs are not covered.
+bool coversAllLogicalOutputs(const LinearLayout &layout,
+                             ArrayRef<int64_t> logicalShape);
+
+enum class MixedRadixConversionScope {
+  Register,
+  Warp,
+  Block,
+};
+
+// `dstLayout` with its out dims in `srcLayout`'s order, or std::nullopt
+// unless the source out dims are dim0, dim1, ... of `logicalShape`'s rank and
+// the destination has the same out-dim names.
+std::optional<LinearLayout>
+alignMixedRadixConversionOutDims(const LinearLayout &srcLayout,
+                                 const LinearLayout &dstLayout,
+                                 ArrayRef<int64_t> logicalShape);
+
+// Whether every input dimension is register, lane, warp or a singleton block.
+bool hasMixedRadixConversionInputDims(const LinearLayout &layout);
+
+// The narrowest scope holding every source thread that holds unique data and
+// in-bounds destination replica; Block if a non-radix-2 digit lies outside
+// registers. Requires planMixedRadixLayoutConversion's preflight to pass.
+MixedRadixConversionScope
+classifyMixedRadixConversionScope(const LinearLayout &srcLayout,
+                                  const LinearLayout &dstLayout,
+                                  ArrayRef<int64_t> logicalShape);
+
+// Maps L with a(registerOrder(L(x))) == b(x). L's register output puts a's
+// radix-2 register digits first and its odd digit last, as a mixed-radix out
+// dim needs; registerOrder takes that order to a's flat register order.
+struct MixedRadixConversionInputMap {
+  LinearLayout registerMap;
+  LinearLayout laneMap;
+  ColumnAction registerOrder;
+};
+
+// Closed form; std::nullopt when a and b differ in outs or in dims, have
+// non-radix-2 digits outside registers or L would move another dim, and for
+// some register/lane bijections too (T294601128).
+std::optional<MixedRadixConversionInputMap>
+mapMixedRadixConversionInputs(const LinearLayout &a, const LinearLayout &b);
+
 // Is the sublayout defined from dimNames to dimNames the identity?
 // In particular, is the input and  output size in these dimensions
 // the same, and are the bases the identity?
@@ -15,12 +62,6 @@ bool squareSublayoutIsIdentity(const LinearLayout &ll,
 [[nodiscard]] LinearLayout
 invertAndComposeLocal(const LinearLayout &A, const LinearLayout &B,
                       ArrayRef<StringAttr> localDims);
-
-// Map registers to shared addresses for a store. Extra high register bits
-// repeat the source values across the remaining CTA replicas.
-[[nodiscard]] LinearLayout
-invertAndComposeStore(const LinearLayout &sharedLayout,
-                      const LinearLayout &regLayout);
 
 // For each output dimension d, ensure that the layout's output size (i.e., its
 // codomain) does not exceed shape[d]. Do this without changing the size of the
@@ -164,6 +205,13 @@ SmallVector<StringAttr> supremum(const SmallVector<StringAttr> &x,
 // Return a new layout reshaped to the given shape.
 LinearLayout reshapeLayout(MLIRContext *ctx, LinearLayout layout,
                            ArrayRef<int64_t> shape);
+
+// reshapeLayout returning nullopt, not asserting, when a mixed-radix layout
+// can't be regrouped: each new dim must take whole digits of the row-major
+// index, binary digits first and its odd digit last.
+std::optional<LinearLayout> tryReshapeLayout(MLIRContext *ctx,
+                                             const LinearLayout &layout,
+                                             ArrayRef<int64_t> shape);
 
 // Return a new layout with the dimensions transposed according to the given
 // order.

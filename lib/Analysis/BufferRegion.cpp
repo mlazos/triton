@@ -1,5 +1,8 @@
 #include "triton/Analysis/BufferRegion.h"
 
+#include <limits>
+#include <optional>
+
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Matchers.h"
@@ -48,11 +51,14 @@ getAllocationOffsets(ttg::LocalAllocOp op, Allocation *allocation) {
 
 SmallVector<uint32_t, 2> advancePartitionBases(ArrayRef<uint32_t> bases,
                                                uint32_t offset) {
-  return llvm::to_vector<2>(
-      llvm::map_range(bases, [=](uint32_t base) { return base + offset; }));
+  return llvm::to_vector<2>(llvm::map_range(bases, [=](uint32_t base) {
+    uint64_t advanced = static_cast<uint64_t>(base) + offset;
+    assert(advanced <= std::numeric_limits<uint32_t>::max());
+    return static_cast<uint32_t>(advanced);
+  }));
 }
 
-uint32_t getAllocationOffset(ttng::TMEMAllocOp op) {
+uint64_t getAllocationOffset(ttng::TMEMAllocOp op) {
   auto colOffsetAttr = op->getAttr("tensor_memory_col_offset");
   auto rowOffsetAttr = op->getAttr("tensor_memory_row_offset");
   if (!colOffsetAttr || !rowOffsetAttr) {
@@ -60,31 +66,52 @@ uint32_t getAllocationOffset(ttng::TMEMAllocOp op) {
         "ConcurrencySanitizer should run after AllocateSharedMemory and "
         "TensorMemoryAllocation pass.");
   }
-  uint32_t colOffset = cast<IntegerAttr>(colOffsetAttr).getInt();
-  uint32_t rowOffset = cast<IntegerAttr>(rowOffsetAttr).getInt();
+  int colOffset = cast<IntegerAttr>(colOffsetAttr).getInt();
+  int rowOffset = cast<IntegerAttr>(rowOffsetAttr).getInt();
   return colOffset | (rowOffset << 16);
 }
 
-unsigned getMemDescSize(ttg::MemDescType ty) {
-  if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace()))
-    return ttng::getTmemAllocSizes(ty).numCols;
-  assert(isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
-         "Unsupported memory space");
-  int64_t numElems = ttg::getAllocationElems(ty.getEncoding(), ty.getShape(),
-                                             ty.getAllocShape());
-  if (auto padded = ttg::getPaddedEncoding(ty.getEncoding()))
-    numElems = padded.getPaddedSize({numElems});
-  return numElems * getIntOrFloatOrPtrBitWidth(ty.getElementType()) / 8;
+// An NPOT view is the leading box of its pow2 alloc shape: each NPOT extent
+// takes ceil(log2) bits of the inverse. Flag off, the pow2 alloc shape is the
+// shape.
+bool hasNpotLayoutExtent(ArrayRef<int64_t> layoutShape) {
+  return !llvm::equal(ttg::getNpotPow2AllocShape(layoutShape), layoutShape);
+}
+
+// Flag on, the allocator places an NPOT tile on the pow2 alloc shape that its
+// layout is built on, so the tile's views have exact regions.
+bool isNpotPow2Allocation(ttg::MemDescType ty) {
+  auto tile = ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding());
+  SmallVector<int64_t> physical =
+      ttg::getAllocationShapePerCTA(ty.getEncoding(), tile);
+  return !llvm::all_of(tile, llvm::isPowerOf2_64) &&
+         llvm::all_of(physical, llvm::isPowerOf2_64) &&
+         llvm::equal(physical, ttg::getNpotPow2AllocShape(tile));
+}
+
+// Flag on, the allocator gives a dense NPOT tile exactly product(tile)
+// elements; a radix-2 dense layout keeps the bit-walk regions exact.
+bool isNpotDenseAllocation(ttg::MemDescType ty) {
+  auto tile = ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding());
+  if (!hasNpotLayoutExtent(tile))
+    return false;
+  FailureOr<triton::LinearLayout> dense =
+      ttg::getNpotDenseSharedLayout(ty.getEncoding(), tile);
+  return succeeded(dense) && dense->isRadix2();
 }
 
 uint32_t applySharedPadding(uint32_t byteOffset, ttg::MemDescType ty) {
   auto padded = ttg::getPaddedEncoding(ty.getEncoding());
   if (!padded)
     return byteOffset;
-  uint32_t elementSize = getIntOrFloatOrPtrBitWidth(ty.getElementType()) / 8;
-  uint32_t elementOffset = byteOffset / elementSize;
-  return (padded.getPaddedSize({elementOffset + 1}) - 1) * elementSize +
-         byteOffset % elementSize;
+  uint64_t elementSize = getIntOrFloatOrPtrBitWidth(ty.getElementType()) / 8;
+  uint64_t elementOffset = byteOffset / elementSize;
+  uint64_t paddedOffset =
+      (padded.getPaddedSize({static_cast<int64_t>(elementOffset + 1)}) - 1) *
+          elementSize +
+      byteOffset % elementSize;
+  assert(paddedOffset <= std::numeric_limits<uint32_t>::max());
+  return static_cast<uint32_t>(paddedOffset);
 }
 
 uint32_t getMemDescStorageOffset(ttg::MemDescType ty, unsigned index);
@@ -107,22 +134,24 @@ MemDescFootprint getMemDescAddresses(
     ArrayRef<uint32_t> partitionBases = {}, uint32_t affinePartitionOffset = 0,
     uint32_t affineCTAOffset = 0) {
   bool isTmem = isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace());
-  if (cast<ttg::LayoutEncodingTrait>(ty.getEncoding()).getRank() !=
-      ty.getRank()) {
+  auto collectPages = [&]() {
     ttg::MemDescType pageTy =
         ty.cloneWith(ty.getShape().drop_front(), ty.getElementType());
     MemDescFootprint footprint;
     for (int64_t page = 0; page < ty.getDimSize(0); ++page) {
       uint32_t pageOffset = getMemDescStorageOffset(pageTy, page);
-      for (const auto &[cta, addresses] : getMemDescAddresses(
-               storageBase + pageOffset, affineOffset, pageTy,
-               /*cache=*/nullptr,
-               advancePartitionBases(partitionBases, pageOffset),
-               affinePartitionOffset, affineCTAOffset))
+      MemDescFootprint pageFootprint = getMemDescAddresses(
+          storageBase + pageOffset, affineOffset, pageTy, /*cache=*/nullptr,
+          advancePartitionBases(partitionBases, pageOffset),
+          affinePartitionOffset, affineCTAOffset);
+      for (const auto &[cta, addresses] : pageFootprint)
         getAddressesForCTA(footprint, cta).insert(addresses);
     }
     return footprint;
-  }
+  };
+  if (cast<ttg::LayoutEncodingTrait>(ty.getEncoding()).getRank() !=
+      ty.getRank())
+    return collectPages();
   if (cache && partitionBases.empty()) {
     auto [found, inserted] =
         cache->try_emplace(std::make_pair(Type(ty), affineOffset));
@@ -137,11 +166,27 @@ MemDescFootprint getMemDescAddresses(
   triton::LinearLayout layout = ttg::toLinearLayoutIgnoringPadding(
       ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding()),
       ty.getEncoding());
+  if (llvm::size(layout.getOutDimNames()) != ty.getRank())
+    return collectPages();
   triton::LinearLayout inverse = layout.pseudoinvert();
   MLIRContext *ctx = ty.getContext();
   SmallVector<StringAttr> dims = triton::standardOutDimNames(ctx, ty.getRank());
   ArrayRef<int64_t> shape = ty.getShape();
   uint64_t numPoints = product(shape);
+  bool npotView = hasNpotLayoutExtent(shape);
+  // An NPOT view walks the Gray code of its pow2 alloc shape and keeps only the
+  // points whose coordinates lie inside the logical box.
+  auto isInsideBox = [&](uint64_t index) {
+    uint64_t gray = index ^ (index >> 1);
+    for (int64_t dimSize : shape) {
+      unsigned numBits = llvm::Log2_64_Ceil(dimSize);
+      if (static_cast<int64_t>(gray & ((uint64_t{1} << numBits) - 1)) >=
+          dimSize)
+        return false;
+      gray >>= numBits;
+    }
+    return true;
+  };
   uint32_t bitWidth = getIntOrFloatOrPtrBitWidth(ty.getElementType());
 
   StringAttr offsetName = StringAttr::get(ctx, "offset");
@@ -156,22 +201,29 @@ MemDescFootprint getMemDescAddresses(
     uint32_t cta = block ^ affineCTAOffset;
     auto &addresses = getAddressesForCTA(footprint, cta);
     if (isTmem) {
-      uint32_t bitBegin = col * bitWidth;
+      uint64_t bitBegin = static_cast<uint64_t>(col) * bitWidth;
       uint32_t firstWord = bitBegin / 32;
-      uint32_t lastWord = llvm::divideCeil(bitBegin + bitWidth, uint32_t{32});
+      uint32_t lastWord = llvm::divideCeil(bitBegin + bitWidth, uint64_t{32});
       uint32_t relative = (row << 16) | firstWord;
-      uint32_t begin = storageBase + affineOffset + relative;
-      for (uint32_t word = firstWord; word < lastWord; ++word)
-        addresses.set(begin + word - firstWord);
+      uint64_t begin =
+          static_cast<uint64_t>(storageBase) + affineOffset + relative;
+      for (uint32_t word = firstWord; word < lastWord; ++word) {
+        uint64_t address = begin + (word - firstWord);
+        assert(address <= std::numeric_limits<uint32_t>::max());
+        addresses.set(address);
+      }
     } else {
       uint32_t base = storageBase;
       if (!partitionBases.empty())
         base = partitionBases[partition ^ affinePartitionOffset];
       uint32_t relative = offset * (bitWidth / 8);
       uint32_t combined = affineOffset ^ relative;
-      uint32_t begin = base + applySharedPadding(combined, ty);
-      for (uint32_t byte = 0; byte < bitWidth / 8; ++byte)
+      uint64_t begin =
+          static_cast<uint64_t>(base) + applySharedPadding(combined, ty);
+      for (uint32_t byte = 0; byte < bitWidth / 8; ++byte) {
+        assert(begin + byte <= std::numeric_limits<uint32_t>::max());
         addresses.set(begin + byte);
+      }
     }
   };
 
@@ -184,7 +236,8 @@ MemDescFootprint getMemDescAddresses(
   };
   SmallVector<PhysicalBasis> bases;
   for (auto [dim, dimSize] : llvm::zip_equal(dims, shape)) {
-    unsigned numBits = llvm::Log2_64(dimSize);
+    unsigned numBits =
+        npotView ? llvm::Log2_64_Ceil(dimSize) : llvm::Log2_64(dimSize);
     for (unsigned bit = 0; bit < numBits; ++bit) {
       auto basis = [&, dim = dim](StringAttr name) {
         return inverse.hasOutDim(name)
@@ -213,6 +266,9 @@ MemDescFootprint getMemDescAddresses(
     }
   }
 
+  if (npotView)
+    numPoints = uint64_t{1} << bases.size();
+
   PhysicalBasis physical;
   for (uint64_t index = 0; index < numPoints; ++index) {
     if (index != 0) {
@@ -223,6 +279,8 @@ MemDescFootprint getMemDescAddresses(
       physical.partition ^= basis.partition;
       physical.block ^= basis.block;
     }
+    if (npotView && !isInsideBox(index))
+      continue;
     addPhysicalAddress(physical.offset, physical.row, physical.col,
                        physical.partition, physical.block);
   }
@@ -232,22 +290,55 @@ MemDescFootprint getMemDescAddresses(
 uint32_t getMemDescStorageOffset(ttg::MemDescType ty, unsigned index) {
   if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace()))
     return index * ttng::getTmemAllocSizes(ty).numCols;
-  uint32_t elems = ttg::getAllocationElems(ty.getEncoding(), ty.getShape(),
-                                           ty.getAllocShape());
-  if (auto partitioned =
-          dyn_cast<ttg::PartitionedSharedEncodingAttr>(ty.getEncoding()))
-    elems /= partitioned.getNumPartitions();
-  uint32_t elementSize = getIntOrFloatOrPtrBitWidth(ty.getElementType()) / 8;
-  return applySharedPadding(index * elems * elementSize, ty);
+  // A pow2 or dense allocation's pages are strided as memdesc_index lowers
+  // them.
+  uint64_t stageElems =
+      isNpotPow2Allocation(ty) || isNpotDenseAllocation(ty)
+          ? ttg::getAllocationElems(
+                ty.getEncoding(),
+                ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding()))
+          : ttg::getAllocationElems(ty.getEncoding(), ty.getShape(),
+                                    ty.getAllocShape());
+  uint64_t elementSize = getIntOrFloatOrPtrBitWidth(ty.getElementType()) / 8;
+  uint64_t byteOffset = static_cast<uint64_t>(index) * stageElems * elementSize;
+  uint64_t offset = applySharedPadding(byteOffset, ty);
+  assert(offset <= std::numeric_limits<uint32_t>::max() &&
+         "memdesc index offset exceeds 32-bit range");
+  return static_cast<uint32_t>(offset);
 }
 
-} // namespace
+// toLinearLayout asserts that every dim is a power of two
+// (LinearLayoutConversions.cpp). BufferRegion only ever passes it the
+// allocation shape with pipelining dims dropped
+// (dropPipeliningDim(allocShape, encoding)), so a leading NPOT stage or page
+// dim never reaches the assert: pipelined kernels legitimately use NPOT
+// logical shapes (e.g. memdesc<3x32x32> subviews or multibuffered
+// memdesc<5x1x2x1x2x256xi8> allocs) whose layout-relevant suffix is still all
+// powers of two. Degrade to Unknown only when the dims that actually reach
+// toLinearLayout are NPOT. Padded encodings take the paddedLinearLayout path
+// and distributed encodings bypass the assert, so neither needs the guard.
+bool reachesNPOTLinearLayoutAssert(Type type) {
+  auto ty = cast<ttg::MemDescType>(type);
+  auto encoding = ty.getEncoding();
+  if (isa<ttg::DistributedEncodingTrait>(encoding) ||
+      ttg::isPaddedEncoding(encoding))
+    return false;
+  return !llvm::all_of(ttg::dropPipeliningDim(ty.getAllocShape(), encoding),
+                       llvm::isPowerOf2_64) &&
+         !isNpotPow2Allocation(ty) && !isNpotDenseAllocation(ty);
+}
 
-namespace mlir::triton {
+struct MemDescSubsliceOffsets {
+  uint32_t storageOffset = 0;
+  uint32_t byteOffset = 0;
+  uint32_t partitionOffset = 0;
+  uint32_t ctaOffset = 0;
+};
 
 MemDescSubsliceOffsets
-getMemDescSubsliceUnpaddedOffsets(ttg::MemDescType srcTy,
-                                  ArrayRef<int64_t> offsets) {
+getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
+  auto srcTy = op.getSrc().getType();
+  auto offsets = op.getOffsets();
   if (offsets.empty())
     return MemDescSubsliceOffsets{};
 
@@ -256,7 +347,7 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescType srcTy,
   auto layoutRank = layoutOffsets.size();
   mlir::triton::LinearLayout layout = ttg::toLinearLayoutIgnoringPadding(srcTy);
 
-  MLIRContext *ctx = srcTy.getContext();
+  MLIRContext *ctx = op->getContext();
   SmallVector<StringAttr> dimNames =
       mlir::triton::standardOutDimNames(ctx, layoutRank);
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
@@ -269,7 +360,7 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescType srcTy,
   StringAttr partitionDim = StringAttr::get(ctx, "partition");
   mlir::triton::LinearLayout inverse = layout.pseudoinvert();
   auto mapped = inverse.apply(logicalOffsets);
-  uint32_t elementOffset = 0;
+  uint64_t elementOffset = 0;
   uint32_t blockOffset = 0;
   uint32_t partitionOffset = 0;
   for (auto [dim, offset] : mapped) {
@@ -280,31 +371,41 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescType srcTy,
     else if (dim == partitionDim)
       partitionOffset = static_cast<uint32_t>(offset);
   }
-  uint32_t storageElementOffset = 0;
+  uint64_t storageElementOffset = 0;
   if (offsets.size() != layoutRank) {
-    uint32_t stride = ttg::getAllocationElems(
+    uint64_t stride = ttg::getAllocationElems(
         encoding, ttg::dropPipeliningDim(srcTy.getAllocShape(), encoding));
-    if (auto partitioned =
-            dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
-      stride /= partitioned.getNumPartitions();
-    // The pipeline prefix advances every base pointer by addition. Only the
+    // The pipeline prefix advances every physical base by addition. Only the
     // layout-ranked suffix composes by XOR; nested prefix offsets may carry.
     // Padded pipeline subslices are rejected by the verifier.
-    storageElementOffset = offsets.front() * stride;
+    storageElementOffset = static_cast<uint64_t>(offsets.front()) * stride;
   }
 
-  uint32_t elementSizeBytes =
+  uint64_t elementSizeBytes =
       getIntOrFloatOrPtrBitWidth(srcTy.getElementType()) / 8;
   assert(elementSizeBytes > 0 && "element size must be non-zero");
-  return MemDescSubsliceOffsets{storageElementOffset * elementSizeBytes,
-                                elementOffset * elementSizeBytes,
+  uint64_t storageOffset = storageElementOffset * elementSizeBytes;
+  uint64_t byteOffset = elementOffset * elementSizeBytes;
+  assert(storageOffset <= std::numeric_limits<uint32_t>::max() &&
+         "memdesc_subslice storage offset exceeds 32-bit range");
+  assert(byteOffset <= std::numeric_limits<uint32_t>::max() &&
+         "memdesc_subslice byte offset exceeds 32-bit range");
+  return MemDescSubsliceOffsets{static_cast<uint32_t>(storageOffset),
+                                static_cast<uint32_t>(byteOffset),
                                 partitionOffset, blockOffset};
 }
 
+} // namespace
+
+namespace mlir::triton {
+
 AddressSet AddressSet::fromRange(uint32_t begin, uint32_t length) {
+  uint64_t end = static_cast<uint64_t>(begin) + length;
+  assert(end <= std::numeric_limits<uint32_t>::max() &&
+         "address range exceeds 32-bit address space");
   AddressSet result;
-  for (uint32_t offset = 0; offset < length; ++offset)
-    result.set(begin + offset);
+  for (uint64_t address = begin; address < end; ++address)
+    result.set(address);
   return result;
 }
 
@@ -334,8 +435,12 @@ bool AddressSet::contains(const AddressSet &other) const {
 
 AddressSet AddressSet::translated(uint32_t delta) const {
   AddressSet result;
-  for (uint32_t address : addresses)
-    result.set(address + delta);
+  for (uint32_t address : addresses) {
+    uint64_t translated = static_cast<uint64_t>(address) + delta;
+    assert(translated <= std::numeric_limits<uint32_t>::max() &&
+           "translated address set exceeds 32-bit address space");
+    result.set(translated);
+  }
   return result;
 }
 
@@ -481,6 +586,49 @@ BufferStatePlan createBufferStatePlan(ArrayRef<BufferRegion> regions,
   return plan;
 }
 
+unsigned getMemDescSize(ttg::MemDescType ty) {
+  auto encoding = ty.getEncoding();
+  auto shape = ttg::dropPipeliningDim(ty.getShape(), encoding);
+  auto allocShape = ttg::dropPipeliningDim(ty.getAllocShape(), encoding);
+  uint64_t stages = product(ty.getShape().drop_back(shape.size()));
+
+  if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
+    if (stages == 1)
+      return ttng::getTmemAllocSizes(ty).numCols;
+    uint32_t stageCols =
+        ttng::getTMemSubSliceOffset(ty, /*offset=*/1, /*dim=*/0);
+    return (stages - 1) * stageCols +
+           ttng::getTmemAllocSizes(ty).numCols / stages;
+  }
+  assert(isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
+         "Unsupported memory space");
+  unsigned elSize = getIntOrFloatOrPtrBitWidth(ty.getElementType()) / 8;
+  if (auto padded = ttg::getPaddedEncoding(encoding)) {
+    uint64_t logicalElements = product(ttg::getShapePerCTA(ty));
+    return padded.getPaddedSize({static_cast<int64_t>(logicalElements)}) *
+           elSize;
+  }
+
+  auto allocation = ttg::toLinearLayoutIgnoringPadding(allocShape, encoding);
+  auto view = allocation.pseudoinvert();
+  auto logicalDims = llvm::to_vector(view.getInDimNames());
+  bool npotView = hasNpotLayoutExtent(shape);
+  for (auto [dim, size] : llvm::zip_equal(logicalDims, shape))
+    view = view.resizeInDim(dim, npotView ? llvm::PowerOf2Ceil(size) : size);
+  auto offsetDim = StringAttr::get(ty.getContext(), "offset");
+  // Zero physical bases are still owned by the allocation and its subviews.
+  uint64_t zeroMask = (allocation.getInDimSize(offsetDim) - 1) &
+                      ~getInputBasisMask(allocation, offsetDim, logicalDims);
+  uint64_t viewSpan =
+      (getOutputBasisMask(view, logicalDims, offsetDim) | zeroMask) + 1;
+  // A densely mapped NPOT tile is allocated without the rest of its cover.
+  uint64_t stageElems = allocation.getInDimSize(offsetDim);
+  if (hasNpotLayoutExtent(allocShape) &&
+      succeeded(ttg::getNpotDenseSharedLayout(encoding, allocShape)))
+    stageElems = product(allocShape);
+  return ((stages - 1) * stageElems + std::min(viewSpan, stageElems)) * elSize;
+}
+
 BufferRegionView
 BufferRegionAnalysis::getAllocView(Value allocation, uint32_t storageBase,
                                    ArrayRef<uint32_t> partitionBases) {
@@ -502,17 +650,54 @@ BufferRegionAnalysis::getAllocView(Value allocation, uint32_t storageBase,
                                            op});
 }
 
+std::optional<BufferRegionView>
+BufferRegionAnalysis::getWholeAllocView(Value allocationValue,
+                                        ArrayRef<uint32_t> offsets) {
+  Operation *op = allocationValue.getDefiningOp();
+  Allocation *allocation = getAllocation(op);
+  if (!allocation || offsets.size() != 1)
+    return std::nullopt;
+  SmallVector<Allocation::BufferId> ids =
+      allocation->getBufferIds(allocationValue);
+  if (ids.size() != 1)
+    return std::nullopt;
+  size_t size = allocation->getAllocatedSize(ids.front());
+  assert(size <= std::numeric_limits<uint32_t>::max());
+  uint32_t length = static_cast<uint32_t>(size);
+  BufferRegion region;
+  region.baseOffset = offsets.front();
+  region.length = length;
+  AddressSet addresses = AddressSet::fromRange(offsets.front(), length);
+  unsigned numCTAs = ttg::lookupNumCTAs(op);
+  for (unsigned cta = 0; cta < numCTAs; ++cta)
+    region.ctaAddresses.emplace_back(cta, addresses);
+  return BufferRegionView(
+      std::move(region), offsets.front(), /*affineOffset=*/0,
+      /*partitionBases=*/{},
+      /*affinePartitionOffset=*/0, /*affineCTAOffset=*/0,
+      getOperationId(op->getParentOfType<FunctionOpInterface>()), op);
+}
+
 BufferRegionView
 BufferRegionAnalysis::getSubView(Type type, const BufferRegionView &view,
                                  uint32_t storageOffset, uint32_t byteOffset,
                                  uint32_t partitionOffset, uint32_t ctaOffset) {
   auto ty = cast<ttg::MemDescType>(type);
-  uint32_t storageBase = view.storageBase + storageOffset;
+  uint64_t wideStorageBase =
+      static_cast<uint64_t>(view.storageBase) + storageOffset;
+  assert(wideStorageBase <= std::numeric_limits<uint32_t>::max());
+  uint32_t storageBase = static_cast<uint32_t>(wideStorageBase);
   SmallVector<uint32_t, 2> partitionBases =
       advancePartitionBases(view.partitionBases, storageOffset);
-  uint32_t affineOffset = isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())
-                              ? view.affineOffset + byteOffset
-                              : view.affineOffset ^ byteOffset;
+  uint32_t affineOffset;
+  if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
+    uint64_t wideAffineOffset =
+        static_cast<uint64_t>(view.affineOffset) + byteOffset;
+    assert(wideAffineOffset <= std::numeric_limits<uint32_t>::max());
+    affineOffset = static_cast<uint32_t>(wideAffineOffset);
+  } else {
+    affineOffset = view.affineOffset ^ byteOffset;
+  }
   uint32_t affinePartitionOffset = view.affinePartitionOffset ^ partitionOffset;
   uint32_t affineCTAOffset = view.affineCTAOffset ^ ctaOffset;
   MemDescFootprint footprint = getMemDescAddresses(
@@ -521,10 +706,13 @@ BufferRegionAnalysis::getSubView(Type type, const BufferRegionView &view,
   uint32_t runtimeStorageBase = partitionBases.empty()
                                     ? storageBase
                                     : partitionBases[affinePartitionOffset];
-  uint32_t baseOffset = runtimeStorageBase +
-                        (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())
-                             ? affineOffset
-                             : applySharedPadding(affineOffset, ty));
+  uint64_t wideBaseOffset =
+      static_cast<uint64_t>(runtimeStorageBase) +
+      (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())
+           ? affineOffset
+           : applySharedPadding(affineOffset, ty));
+  assert(wideBaseOffset <= std::numeric_limits<uint32_t>::max());
+  uint32_t baseOffset = static_cast<uint32_t>(wideBaseOffset);
   return {{baseOffset, getMemDescSize(ty), std::move(footprint)},
           storageBase,
           affineOffset,
@@ -626,7 +814,7 @@ BufferRegionAnalysis::getScratchFootprint(Operation *op) {
       getOperationId(op->getParentOfType<FunctionOpInterface>());
   AddressSet addresses = AddressSet::fromRange(base, length);
   unsigned numCTAs = ttg::lookupNumCTAs(op);
-  uint32_t broadcastMask = getResultScratchBroadcastMask(op).value_or(0);
+  uint32_t broadcastMask = getAtomicScratchBroadcastMask(op).value_or(0);
   for (unsigned cta = 0; cta < numCTAs; ++cta)
     if (!(cta & broadcastMask))
       region.ctaAddresses.emplace_back(cta, addresses);
@@ -700,6 +888,18 @@ LogicalResult BufferRegionAnalysis::visitOperation(
         getAllocationOffsets(localAllocOp, getAllocation(op));
     if (failed(offsets))
       return failure();
+    if (reachesNPOTLinearLayoutAssert(localAllocOp.getResult().getType())) {
+      // No linear layout describes this shape, but the allocation's bytes are
+      // known: cover all of them rather than all of shared memory. Views
+      // derived from it with power-of-two shapes (e.g. one mbarrier of a
+      // three-slot ring) still get exact footprints.
+      std::optional<BufferRegionView> whole =
+          getWholeAllocView(localAllocOp.getResult(), *offsets);
+      if (!whole)
+        return propagateRegions(RegionInfo::getPessimisticValueState());
+      regionInfo.views.insert(std::move(*whole));
+      return propagateRegions(regionInfo);
+    }
     ArrayRef<uint32_t> partitionBases = offsets->size() > 1
                                             ? ArrayRef<uint32_t>(*offsets)
                                             : ArrayRef<uint32_t>();
@@ -708,14 +908,20 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     return propagateRegions(regionInfo);
   }
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(op)) {
+    uint64_t storageBase = getAllocationOffset(tmemAllocOp);
+    assert(storageBase <= std::numeric_limits<uint32_t>::max());
+    if (reachesNPOTLinearLayoutAssert(tmemAllocOp.getResult().getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     regionInfo.views.insert(getAllocView(tmemAllocOp.getResult(),
-                                         getAllocationOffset(tmemAllocOp)));
+                                         static_cast<uint32_t>(storageBase)));
     return propagateRegions(regionInfo);
   }
   if (auto memdescIndexOp = dyn_cast<ttg::MemDescIndexOp>(op)) {
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
+    if (reachesNPOTLinearLayoutAssert(memdescIndexOp.getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     int numSubBuffers =
         cast<ttg::MemDescType>(memdescIndexOp.getSrc().getType()).getShape()[0];
     int firstSubBuffer = 0;
@@ -742,9 +948,11 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
-    MemDescSubsliceOffsets relativeOffset = getMemDescSubsliceUnpaddedOffsets(
-        memdescSubsliceOp.getSrc().getType(),
-        llvm::to_vector_of<int64_t>(memdescSubsliceOp.getOffsets()));
+    if (reachesNPOTLinearLayoutAssert(memdescSubsliceOp.getSrc().getType()) ||
+        reachesNPOTLinearLayoutAssert(memdescSubsliceOp.getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
+    MemDescSubsliceOffsets relativeOffset =
+        getMemDescSubsliceUnpaddedOffsets(memdescSubsliceOp);
     for (const BufferRegionView &view : in.views)
       regionInfo.views.insert(
           getSubView(memdescSubsliceOp.getType(), view,
@@ -752,10 +960,19 @@ LogicalResult BufferRegionAnalysis::visitOperation(
                      relativeOffset.partitionOffset, relativeOffset.ctaOffset));
     return propagateRegions(regionInfo);
   }
+  if (isa<ttg::MemDescDynamicSubsliceOp>(op)) {
+    // The runtime offset prevents selecting one exact affine region.  Keep
+    // the source allocation's regions so alias and membar analyses remain
+    // conservative without degrading every shared-memory access to unknown.
+    return propagateRegions(operands[0]->getValue());
+  }
   if (auto tmemSubsliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
+    if (reachesNPOTLinearLayoutAssert(tmemSubsliceOp.getSrc().getType()) ||
+        reachesNPOTLinearLayoutAssert(tmemSubsliceOp.getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     uint32_t relativeOffset = ttng::getTMemSubSliceOffset(
         tmemSubsliceOp.getSrc().getType(), tmemSubsliceOp.getOffset(),
         tmemSubsliceOp.getDim());
@@ -775,6 +992,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
+    if (reachesNPOTLinearLayoutAssert(reinterpretOp.getType()))
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     for (const BufferRegionView &view : in.views)
       regionInfo.views.insert(getSubView(reinterpretOp.getType(), view));
     return propagateRegions(regionInfo);
@@ -806,8 +1025,11 @@ void BufferRegionAnalysis::calculateUsedBufferRegions(Operation *op) {
           usedBufferRegions[regionType].insert(view.region);
       };
 
-      bool isTensorMemory = isa<ttng::TensorMemorySpaceAttr>(
-          cast<ttg::MemDescType>(access.value.getType()).getMemorySpace());
+      auto type = dyn_cast<ttg::MemDescType>(access.value.getType());
+      if (!type)
+        continue;
+      bool isTensorMemory =
+          isa<ttng::TensorMemorySpaceAttr>(type.getMemorySpace());
       addRegions(isTensorMemory ? TENSOR_MEMORY : SHARED_MEMORY);
       if (auto barrierOp = dyn_cast<ttg::MBarrierOpInterface>(op))
         if (llvm::is_contained(barrierOp.getBarriers(), access.value))

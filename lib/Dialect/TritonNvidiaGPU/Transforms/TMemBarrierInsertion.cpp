@@ -4,13 +4,20 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/MBarrierUtilities.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 
+#include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 
 namespace mlir {
@@ -30,18 +37,25 @@ static bool needsTMemWait(Operation *op) {
   return alloc && alloc.getSrc();
 }
 
-class TMemWarpOwnership {
+// tcgen05.wait::{ld,st} only completes the executing thread's own
+// tcgen05.ld/st, so it orders a hazard only when every word accessed by both
+// operations is accessed by the same single thread at both endpoints. Any other
+// hazard also needs the threads to synchronize, even two threads of one warp.
+// TODO: A hazard that stays within one warp but crosses threads only needs that
+// warp to synchronize. Consider bar.warp.sync instead of a CTA barrier.
+class TMemThreadOwnership {
 public:
-  explicit TMemWarpOwnership(BufferRegionAnalysis &regions)
+  explicit TMemThreadOwnership(BufferRegionAnalysis &regions)
       : regions(regions) {}
 
-  bool isSameWarp(Operation *lhsOp, Operation *rhsOp, Allocation *allocation) {
+  bool isSameThread(Operation *lhsOp, Operation *rhsOp,
+                    Allocation *allocation) {
     // Function summaries and different WS regions may have different issuers.
-    if (lhsOp->getParentRegion() != rhsOp->getParentRegion() ||
+    if (getIssuerRegion(lhsOp) != getIssuerRegion(rhsOp) ||
         lhsOp->getParentOfType<FunctionOpInterface>() !=
             allocation->getOperation())
       return false;
-    auto [it, inserted] = sameWarps.try_emplace({lhsOp, rhsOp}, false);
+    auto [it, inserted] = sameThreads.try_emplace({lhsOp, rhsOp}, false);
     if (!inserted)
       return it->second;
     const Info *lhs = getInfo(lhsOp);
@@ -55,7 +69,7 @@ public:
         assert(!a.affineCTAOffset && !b.affineCTAOffset &&
                "TMEM views do not shift CTA coordinates");
         if (a.region.baseOffset == b.region.baseOffset &&
-            lhs->warps == rhs->warps)
+            lhs->threads == rhs->threads)
           continue;
         for (const auto &[cta, addresses] : a.region.ctaAddresses)
           for (const auto &[otherCTA, otherAddresses] : b.region.ctaAddresses) {
@@ -64,8 +78,8 @@ public:
             auto overlap = addresses.intersection(otherAddresses);
             // Descriptor offsets use integer addition, not layout XOR.
             for (uint32_t address : overlap) {
-              if (lhs->getWarp(address - a.region.baseOffset) !=
-                  rhs->getWarp(address - b.region.baseOffset))
+              if (lhs->getThread(address - a.region.baseOffset) !=
+                  rhs->getThread(address - b.region.baseOffset))
                 return false;
             }
           }
@@ -74,26 +88,34 @@ public:
   }
 
 private:
+  // The region whose threads issue `op`. A predicated region's body runs on
+  // threads of the region that contains it, which access the same words there.
+  static Region *getIssuerRegion(Operation *op) {
+    Region *region = op->getParentRegion();
+    while (isa<gpu::WarpPredicateOp>(region->getParentOp()))
+      region = region->getParentOp()->getParentRegion();
+    return region;
+  }
+
   struct Info {
-    // (row, word column) -> warp.
-    LinearLayout warps;
+    // (row, word column) -> (lane, warp).
+    LinearLayout threads;
     const BufferRegionFootprint *footprint;
 
-    uint32_t getWarp(uint32_t address) const {
-      auto dims = llvm::to_vector<2>(warps.getInDimNames());
-      return warps
-          .apply({{dims[0], int32_t(address >> 16)},
-                  {dims[1], int32_t(address & 0xffff)}})
-          .front()
-          .second;
+    SmallVector<std::pair<StringAttr, int32_t>>
+    getThread(uint32_t address) const {
+      auto dims = llvm::to_vector<2>(threads.getInDimNames());
+      return threads.apply({{dims[0], int32_t(address >> 16)},
+                            {dims[1], int32_t(address & 0xffff)}});
     }
   };
 
-  static LinearLayout getWarpLayout(RankedTensorType regTy,
-                                    gpu::MemDescType memTy) {
+  static LinearLayout getThreadLayout(RankedTensorType regTy,
+                                      gpu::MemDescType memTy) {
     auto layout = computeTMemLdStLayout(regTy, memTy);
     assert(succeeded(layout) && "TMEM layout must have been verified");
     auto *ctx = regTy.getContext();
+    auto lane = StringAttr::get(ctx, "lane");
     auto warp = StringAttr::get(ctx, "warp");
     auto row = StringAttr::get(ctx, "row");
     auto col = StringAttr::get(ctx, "col");
@@ -114,7 +136,7 @@ private:
                       LinearLayout::identity1D(cols, padding, col);
     return accesses.concatIns(completion)
         .pseudoinvert()
-        .sublayout({row, col}, {warp});
+        .sublayout({row, col}, {lane, warp});
   }
 
   const Info *getInfo(Operation *op) {
@@ -138,18 +160,18 @@ private:
     auto *footprint = regions.getFootprint(mem);
     if (!footprint)
       return nullptr;
-    auto warps = getWarpLayout(regTy, cast<gpu::MemDescType>(mem.getType()));
-    // A non-surjective inverse hides other warps accessing the same word.
-    // TMEM waits only order accesses within their issuing warp.
-    if (!warps.isSurjective())
+    auto threads =
+        getThreadLayout(regTy, cast<gpu::MemDescType>(mem.getType()));
+    // A non-surjective inverse hides other threads accessing the same word.
+    if (!threads.isSurjective())
       return nullptr;
-    it->second = std::make_unique<Info>(Info{std::move(warps), footprint});
+    it->second = std::make_unique<Info>(Info{std::move(threads), footprint});
     return it->second.get();
   }
 
   BufferRegionAnalysis &regions;
   DenseMap<Operation *, std::unique_ptr<Info>> info;
-  DenseMap<std::pair<Operation *, Operation *>, bool> sameWarps;
+  DenseMap<std::pair<Operation *, Operation *>, bool> sameThreads;
 };
 
 static bool isTensorMemory(Value value) {
@@ -179,12 +201,22 @@ static BlockInfo getTMemAccesses(Operation *op, BufferRegionAnalysis &regions) {
 // Publication: Wait + require a rendezvous between issuing warps if needed.
 enum class TMemBoundary { None, Wait, Publication };
 
-static TMemBoundary getTMemBoundary(Operation *op) {
+static TMemBoundary getTMemBoundary(Operation *op,
+                                    DivergentControlFlow &divergence) {
   // Assumptions do not publish pending TMEM accesses.
   if (isa<LLVM::AssumeOp>(op))
     return TMemBoundary::None;
   if (auto barrier = dyn_cast<gpu::MBarrierOpInterface>(op);
       barrier && barrier.isPerWarp())
+    return TMemBoundary::Wait;
+  // Every thread arrives for itself, and the barrier completes only after all
+  // of them do, so each thread only completes its own accesses. A named
+  // barrier that counts and is executed by every thread of the region is its
+  // own rendezvous.
+  if (arrivesFromEveryThread(op))
+    return TMemBoundary::Wait;
+  if (isa<NamedBarrierArriveOp, NamedBarrierWaitOp>(op) &&
+      countsEveryThread(op) && !divergence.isUnderDivergentBranch(op))
     return TMemBoundary::Wait;
   // An acquire does not publish earlier TMEM accesses. Keep them pending.
   if (isa<WaitBarrierOp>(op))
@@ -192,8 +224,10 @@ static TMemBoundary getTMemBoundary(Operation *op) {
   // Defer completion at CTA barriers until a hazard or boundary needs it.
   if (isa<gpu::BarrierOp>(op))
     return TMemBoundary::None;
-  // SCF has been lowered. Complete accesses before every CFG and WS edge.
-  if (isa<BranchOpInterface, gpu::WarpSpecializeOp,
+  // SCF has been lowered. Complete accesses before every CFG and WS edge,
+  // including entering or skipping a predicated region, which lowers to a
+  // conditional branch on NVIDIA. Its yield is ReturnLike.
+  if (isa<BranchOpInterface, gpu::WarpPredicateOp, gpu::WarpSpecializeOp,
           gpu::WarpSpecializePartitionsOp, gpu::WarpYieldOp, gpu::WarpReturnOp>(
           op) ||
       op->hasTrait<OpTrait::ReturnLike>())
@@ -242,6 +276,16 @@ static TMemBoundary getTMemBoundary(Operation *op) {
 class TMemSyncAnalysis : public MembarAnalysis {
 public:
   using MembarAnalysis::MembarAnalysis;
+
+  triton::BarrierStages getBarrierStages(Operation *op) override {
+    auto stages = MembarAnalysis::getBarrierStages(op);
+    // MMA completion is ordered by the TMEM publication/wait logic below;
+    // the generic trailing stage would wrongly claim the MMA's
+    // tensor-memory effects.
+    if (isa<MMAv5OpInterface>(op))
+      stages.afterMemoryEffects = false;
+    return stages;
+  }
 
   void run(FunctionOpInterface function, FuncMapT &funcMap) {
     MembarAnalysis::run(function, funcMap);
@@ -321,6 +365,22 @@ private:
             !pending.syncWriteSlices.empty());
   }
 
+  // A divergent branch can skip what it guards in only some threads of the
+  // region, and a rendezvous that only some of them reach deadlocks. Publish
+  // pending accesses before the branch if a guarded operation publishes.
+  bool publishesUnderBranch(Operation *branch) {
+    if (!divergence.isDivergentBranch(branch))
+      return false;
+    auto it = branchPublishes.find(branch);
+    if (it != branchPublishes.end())
+      return it->second;
+    bool publishes = false;
+    divergence.walkSkippable(branch, [&](Operation *op) {
+      publishes |= getTMemBoundary(op, divergence) == TMemBoundary::Publication;
+    });
+    return branchPublishes[branch] = publishes;
+  }
+
   void update(Operation *op, MembarInfo *info, FuncMapT *funcMap,
               OpBuilder *builder) override {
     waitsBefore.erase(op);
@@ -359,8 +419,8 @@ private:
       rememberBarrier(op, *info);
     }
 
-    auto boundary = getTMemBoundary(op);
-    if (boundary == TMemBoundary::Publication)
+    auto boundary = getTMemBoundary(op, divergence);
+    if (boundary == TMemBoundary::Publication || publishesUnderBranch(op))
       effects.threadDemands.hasDemand = true;
 
     syncBefore(effects);
@@ -371,7 +431,7 @@ private:
       for (TMEMWaitKind kind : {TMEMWaitKind::LOAD, TMEMWaitKind::STORE}) {
         if (hasHazard(beforeBarrier, effects, kind))
           waitBeforeBarrier(kind);
-        // Same-warp hazards still need completion before the next access.
+        // Thread-local hazards still need completion before the next access.
         if (hasHazard(beforeBarrier, effects, kind, /*needsBarrier=*/false) ||
             hasHazard(afterBarrier, effects, kind, /*needsBarrier=*/false))
           waitNow(op, kind, pending);
@@ -381,9 +441,9 @@ private:
     if (!info->allPathsFromEntrySynced)
       info->entryBlockInfo.join(effects);
 
-    // MMA and copies complete through mbarriers. Other TMEM effects need
-    // ordering, but only loads and stores need tmem_wait.
-    if (!isa<MMAv5OpInterface, TMEMCopyOp>(op))
+    // MMA, copies and shifts complete through mbarriers. Other TMEM effects
+    // need ordering, but only loads and stores need tmem_wait.
+    if (!isa<MMAv5OpInterface, TMEMCopyOp, TMEMShiftOp>(op))
       pending.join(effects);
     if (needsTMemWait(op))
       afterBarrier.join(effects);
@@ -391,12 +451,14 @@ private:
 
   // Planed tmem_wait insertions
   DenseMap<Operation *, SmallVector<TMEMWaitKind, 2>> waitsBefore;
+  // Whether an operation that a divergent branch guards publishes.
+  DenseMap<Operation *, bool> branchPublishes;
   Operation *lastBarrier = nullptr;
   // Incomplete TMEM accesses before `lastBarrier`
   BlockInfo beforeBarrier;
   // Incomplete TMEM accesses after `lastBarrier`
   BlockInfo afterBarrier;
-  // pending: Accesses that may still need cross-warp ordering
+  // pending: Accesses that may still need cross-thread ordering
   // Invariant: afterBarrier \subset pending at the end of update
 };
 
@@ -406,12 +468,12 @@ static LogicalResult runTMemAnalysis(ModuleOp mod) {
       BufferRegionAnalysis::Mode::TensorMemoryOnly);
   if (failed(solver->initializeAndRun(mod)))
     return failure();
-  TMemWarpOwnership ownership(*regions);
+  TMemThreadOwnership ownership(*regions);
   auto filter = [&](Operation *lhs, Operation *rhs, bool /*lhsIsRead*/,
                     bool /*rhsIsRead*/, Allocation *allocation,
                     const AllocationSlice &, const AllocationSlice &) {
-    // A completion wait orders same-warp RAW, WAR, and WAW dependencies.
-    return ownership.isSameWarp(lhs, rhs, allocation);
+    // A completion wait orders thread-local RAW, WAR, and WAW dependencies.
+    return ownership.isSameThread(lhs, rhs, allocation);
   };
   ModuleAllocation allocation(mod);
   ModuleMembarAnalysis analysis(allocation, std::move(filter));

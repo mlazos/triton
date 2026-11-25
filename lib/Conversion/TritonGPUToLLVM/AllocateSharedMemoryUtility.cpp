@@ -1,7 +1,94 @@
 #include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
+#include "triton/Analysis/Allocation.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.h"
+#include <cstdlib>
+#include <string>
 
 namespace mlir::triton::gpu {
+
+// Helper function to compute allocation size from MemDescType
+inline size_t computeAllocationSize(MemDescType memdescTy) {
+  auto elemTy = memdescTy.getElementType();
+  auto shape = memdescTy.getShape();
+  size_t elemSize = elemTy.getIntOrFloatBitWidth() / 8;
+  size_t totalElements = 1;
+  for (auto dim : shape) {
+    totalElements *= dim;
+  }
+  return totalElements * elemSize;
+}
+
+// Helper function to add allocation information as IR annotations
+void addAllocationAnnotations(Operation *op) {
+  MLIRContext *ctx = op->getContext();
+  IntegerAttr offsetAttr;
+  MemDescType memdescTy;
+
+  // Try to get allocation.offset from the operation itself
+  if (auto attr = op->getAttrOfType<IntegerAttr>("allocation.offset")) {
+    offsetAttr = attr;
+    // Find MemDescType from result or operands
+    for (auto result : op->getResults()) {
+      if (auto ty = dyn_cast<MemDescType>(result.getType())) {
+        memdescTy = ty;
+        break;
+      }
+    }
+    if (!memdescTy) {
+      for (auto operand : op->getOperands()) {
+        if (auto ty = dyn_cast<MemDescType>(operand.getType())) {
+          memdescTy = ty;
+          break;
+        }
+      }
+    }
+  } else {
+    // Try to find it through operands
+    for (auto operand : op->getOperands()) {
+      if (auto definingOp = operand.getDefiningOp()) {
+        if (auto allocOp = dyn_cast<triton::gpu::LocalAllocOp>(definingOp)) {
+          if (auto attr =
+                  allocOp->getAttrOfType<IntegerAttr>("allocation.offset")) {
+            offsetAttr = attr;
+            memdescTy = cast<MemDescType>(allocOp.getType());
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (!offsetAttr || !memdescTy) {
+    return;
+  }
+
+  auto offset = offsetAttr.getInt();
+  size_t totalSize = computeAllocationSize(memdescTy);
+  op->setAttr("shared_memory.offset",
+              IntegerAttr::get(IntegerType::get(ctx, 64), offset));
+  op->setAttr("shared_memory.size_bytes",
+              IntegerAttr::get(IntegerType::get(ctx, 64), totalSize));
+}
+
+// Function to add shared memory access annotations to all operations that use
+// shared memory
+void addSharedMemoryAnnotations(ModuleOp mod) {
+  if (!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP")) {
+    return;
+  }
+
+  mod.walk([&](Operation *op) {
+    if (isa<triton::gpu::LocalStoreOp, triton::gpu::LocalLoadOp,
+            triton::gpu::MemDescSubsliceOp,
+            triton::gpu::MemDescDynamicSubsliceOp, triton::gpu::MemDescIndexOp>(
+            op)) {
+      addAllocationAnnotations(op);
+    }
+  });
+}
 
 void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
                                        ModuleAllocation &allocation) {
@@ -52,6 +139,28 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
   mod->setAttr("ttg.shared",
                mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 32),
                                       allocation.getSharedMemorySize()));
+  triton::attachSharedMemoryBreakdown(mod, allocation);
+}
+
+static bool lacksNpotPow2AllocShape(Type type) {
+  auto memDesc = dyn_cast<MemDescType>(type);
+  return memDesc && isa<SharedEncodingTrait>(memDesc.getEncoding()) &&
+         !holdsNpotPow2AllocShape(memDesc.getEncoding(),
+                                  memDesc.getAllocShape());
+}
+
+LogicalResult verifyNpotTypesSupported(ModuleOp mod) {
+  if (!triton::tools::isNpotAllowed())
+    return success();
+  bool unsupported = false;
+  mod.walk([&](Operation *op) {
+    if (llvm::any_of(op->getOperandTypes(), lacksNpotPow2AllocShape) ||
+        llvm::any_of(op->getResultTypes(), lacksNpotPow2AllocShape)) {
+      op->emitError() << "NPOT shared memory descriptors are not yet supported";
+      unsupported = true;
+    }
+  });
+  return failure(unsupported);
 }
 
 } // namespace mlir::triton::gpu

@@ -1008,6 +1008,14 @@ static void fuseOneLevel(LoopNestNode *parent, mlir::DominanceInfo &domInfo) {
   if (disallowAccMultiBuffer)
     fused->setAttr(kDisallowAccMultiBufferAttrName, b.getUnitAttr());
 
+  // Propagate integer attributes from the outer loop that downstream passes
+  // (data partition, memory planning) read from the fused loop.
+  for (StringRef attrName :
+       {"tt.data_partition_factor", "tt.smem_alloc_algo"}) {
+    if (auto attr = outer->getAttrOfType<IntegerAttr>(attrName))
+      fused->setAttr(attrName, attr);
+  }
+
   // Update the parent's loop to the fused loop. Set the new stage count to the
   // max stage count of the inner loops.
   int numStages = 1;
@@ -1107,33 +1115,6 @@ static void optimizeEpilogueDependencies(scf::ForOp outerLoop,
           {outerLoop.getBody()->begin(), innerLoop->getIterator()}, inEpilogue);
 }
 
-// Crudely match llvm.assume(ub > lb) or llvm.assume(lb < ub).
-static LogicalResult matchPositiveTripCount(scf::ForOp loop,
-                                            mlir::DominanceInfo &domInfo) {
-  for (Operation *user : loop.getUpperBound().getUsers()) {
-    if (auto cmp = dyn_cast<arith::CmpIOp>(user)) {
-      if (llvm::none_of(cmp->getUsers(), [&](Operation *op) {
-            return isa<LLVM::AssumeOp>(op) &&
-                   domInfo.properlyDominates(op, loop);
-          }))
-        continue;
-      if (cmp.getPredicate() == (loop.getUnsignedCmp()
-                                     ? arith::CmpIPredicate::ugt
-                                     : arith::CmpIPredicate::sgt) &&
-          cmp.getLhs() == loop.getUpperBound() &&
-          cmp.getRhs() == loop.getLowerBound())
-        return success();
-      if (cmp.getPredicate() == (loop.getUnsignedCmp()
-                                     ? arith::CmpIPredicate::ult
-                                     : arith::CmpIPredicate::slt) &&
-          cmp.getLhs() == loop.getLowerBound() &&
-          cmp.getRhs() == loop.getUpperBound())
-        return success();
-    }
-  }
-  return failure();
-}
-
 // Speculate the length of the inner loop such that the loop is known to execute
 // at least once. This way, the inner loop body does not have to be placed
 // inside a conditional in the fused loop, which interacts better with the
@@ -1145,7 +1126,7 @@ static LogicalResult speculateInnerLoopLength(scf::ForOp outerLoop,
   ImplicitLocOpBuilder b(loc, outerLoop);
 
   // Check if the inner loop is known to execute at least once.
-  if (succeeded(matchPositiveTripCount(innerLoop, domInfo))) {
+  if (triton::isLoopTripCountKnownPositive(innerLoop, domInfo)) {
     innerLoop->setAttr(kMustExecuteAttrName, b.getUnitAttr());
     return success();
   }

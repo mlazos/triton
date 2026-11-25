@@ -76,6 +76,7 @@ def TT_AtomicRMWAttr : I32EnumAttr<
 def TT_DescriptorReduceKindAttr : I32EnumAttr<
     "DescriptorReduceKind", "",
     [
+        I32EnumAttrCase<"NONE", 0, "">,
         I32EnumAttrCase<"ADD", 1, "add">,
         I32EnumAttrCase<"MIN", 2, "min">,
         I32EnumAttrCase<"MAX", 3, "max">,
@@ -115,6 +116,7 @@ def TT_RoundingModeAttr : I32EnumAttr<
     [
         I32EnumAttrCase<"RTZ", 0, "rtz">,
         I32EnumAttrCase<"RTNE", 1, "rtne">,
+        I32EnumAttrCase<"RS", 2, "rs">,
     ]> {
     let cppNamespace = "::mlir::triton";
 }

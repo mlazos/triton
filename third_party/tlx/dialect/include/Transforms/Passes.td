@@ -1,0 +1,217 @@
+#ifndef TRITON_TLX_PASSES
+#define TRITON_TLX_PASSES
+
+include "mlir/Pass/PassBase.td"
+
+def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp"> {
+  let summary = "Fixup the IR for TritonTLX";
+  let description = [{
+    This pass applies fixups to the TritonDialect module to help TritonGPU
+    or TritonNvidiaGPU integrate with the frontend DSL and TritonDialect,
+    such as attaching metadata to the module.
+  }];
+
+  let options = [
+      Option<"target", "target",
+            "std::string", /*default*/"\"\"",
+            "the GPU target, e.g., cuda:80, hip:gfx942">,
+      Option<"numWarps", "num-warps",
+             "int32_t", /*default*/"4",
+             "number of warps">,
+      Option<"threadsPerWarp", "threads-per-warp",
+             "int32_t", /*default*/"32",
+             "number of threads per warp">,
+      Option<"numCTAs", "num-ctas",
+             "int32_t", /*default*/"1",
+             "number of ctas in a cga">,
+      ListOption<"clusterDims", "cluster-dims", "int32_t",
+             "cluster dimensions (X, Y, Z)">,
+   ];
+}
+
+def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
+  let summary = "Propagate layout information";
+
+  let description = [{
+    This pass propagates explicit layout constraints from tlx::RequireLayoutOp
+    and tlx::ReleaseLayoutOp using backward and forward dataflow analyses.
+
+    The pass owns the downstream consequences of those constraints:
+    - retagging memdesc producers and carriers when the memdesc lattice reaches
+      a concrete encoding
+    - retagging supported tensor producers (`ttg.local_load`) and region-carried
+      tensor values when the tensor lattice reaches a concrete encoding
+    - applying consensus-based updates for RegionBranchOpInterface carriers and
+      `ttg.warp_specialize` partition captures/arguments
+    - lowering residual unpinned tensor constraints to `ttg.convert_layout`
+    - lowering residual pinned tensor constraints to `ttg.require_layout`
+    - validating post-conditions such as the absence of unresolved
+      DummyTMEMLayoutAttr allocations
+
+    Tensor and memdesc constraints are either folded away when propagation
+    successfully retags the producer, or lowered to an explicit TTGIR boundary.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
+def TLXInsertRequireLayout : Pass<"tlx-insert-require-layout", "mlir::ModuleOp"> {
+  let summary = "Insert explicit TLX layout constraints for local_load-to-dot and TDM paths";
+
+  let description = [{
+    This pass discovers consumers with implicit shared-memory layout
+    requirements and synthesizes the missing tlx.require_layout
+    constraints so tlx-propagate-layout can rewrite the source allocs.
+
+    Today it covers two consumer flavors:
+    - Dot-fed `ttg.local_load` chains: insert memdesc-side and tensor-side
+      `tlx.require_layout` constraints for the AMD local_load-to-dot path.
+    - AMD TDM descriptor copies (`amdgpu.async_tdm_copy_global_to_local`,
+      `amdgpu.async_tdm_copy_local_to_global`): insert a memdesc-side
+      `tlx.require_layout` on the buffer operand with the descriptor-
+      compatible padded encoding.
+
+    The pass only synthesizes explicit TLX layout constraints. Tensor /
+    register propagation, region-branch retagging, and final convert
+    cleanup are handled by tlx-propagate-layout and downstream cleanup
+    passes.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::tlx::TLXDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect"];
+
+}
+
+def TLXRewriteLocalAlias : Pass<"tlx-rewrite-local-alias", "mlir::ModuleOp"> {
+  let summary = "Replace tlx::LocalAliasOp with the aliased local mem_desc";
+
+  let description = [{
+    This pass replaces each `tlx::LocalAliasOp` with the original aliased
+    mem_desc.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+}
+
+def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir::ModuleOp"> {
+  let summary = "Resolve placeholder layouts after function inlining";
+
+  let description = [{
+    This pass resolves placeholder layout encodings that were generated during
+    initial lowering. After function inlining, we have more context to determine
+    the correct layouts for TMEM loads/stores and other TLX operations.
+
+    The pass replaces:
+    - NoVerifyLayoutAttr -> wrapped concrete distributed layout
+    - DummyRegisterLayoutAttr -> BlockedEncodingAttr
+
+    Each resolved layout uses the same default values as the corresponding
+    Python make_default() methods.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::tlx::TLXDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TLXFinalizeUserLayouts : Pass<"tlx-finalize-user-layouts", "mlir::ModuleOp"> {
+  let summary = "Unwrap user-pinned register layouts after layout optimization";
+
+  let description = [{
+    Unwraps every remaining `#tlx.user_layout<L>` encoding on a RankedTensorType
+    back to its concrete wrapped layout `L`, defensively lowers any remaining
+    `ttg.require_layout` boundaries to ordinary `ttg.convert_layout`, and
+    verifies none remain.
+
+    User-pinned register layouts are kept wrapped through the layout-optimization
+    passes (remove-layout-conversions, accelerate-matmul, optimize-dot-operands)
+    as `ttg.require_layout` boundaries whose result wrapper carries
+    `PinnedEncodingTrait`. This pass runs after them to retire the boundary and
+    marker. (Shared user layouts on `local_alloc` are unwrapped much earlier, in
+    tlx-propagate-layout, since nothing rewrites a buffer's shared encoding.)
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::tlx::TLXDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
+def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
+  let summary = "Print TTGIR operations with their TLX equivalents";
+
+  let description = [{
+    This pass walks through the TTGIR module and prints annotations showing
+    the mapping from TTGIR operations back to their TLX API equivalents.
+    This is useful for understanding the correspondence between the high-level
+    TLX Python API and the low-level TTGIR operations.
+
+    Example mappings:
+    - ttng::InitBarrierOp -> tlx.alloc_barriers
+    - ttng::WaitBarrierOp -> tlx.barrier_wait
+    - ttng::WarpGroupDotOp -> tlx.async_dot (Hopper)
+    - ttng::TCGen5MMAOp -> tlx.async_dot (Blackwell)
+    - ttg::LocalAllocOp -> tlx.local_alloc (smem)
+    - ttng::TMEMAllocOp -> tlx.local_alloc (tmem)
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
+def TLXDumpLayout : Pass<"tlx-dump-layout", "mlir::ModuleOp"> {
+  let summary = "Print the resolved layout of tlx.dump_layout operands";
+
+  let description = [{
+    This pass walks all `tlx::DumpLayoutOp` operations and prints, to the
+    compiler log, the operand's value type and its layout in CuTe Shape:Stride
+    notation (a thread-value layout for register tensors, a strided layout for
+    shared/tensor-memory buffers, or `Swizzle<B,M,S> o base` for swizzled
+    buffers). Layouts not representable in CuTe fall back to the raw linear
+    layout string. It is meant to run at the end of the TTGIR pipeline so that
+    the reported layouts are final. Each `tlx::DumpLayoutOp` is erased after its
+    layout is printed.
+
+    It also emits a remark for every `ttg.convert_layout` that exchanges data
+    through shared memory, with both layouts in CuTe notation. When a
+    `ttg.local_load` produces the converted value, or feeds the same
+    elementwise op, a note on that load names the layout to load it in so the
+    conversion goes away (as a `tlx.layout(...)` when representable).
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::tlx::TLXDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
+def TLXStorageAliasLowering : Pass<"tlx-storage-alias-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower storage alias operations";
+
+  let description = [{
+    This pass lowers storage alias operations by:
+
+    1. Computing or validating storage alias sizes - For each storage_alias_spec,
+       computes the required buffer size as the maximum of all referencing
+       storage_alias_local_alloc operations. If an explicit size is provided,
+       validates it is sufficient.
+
+    2. Materializing storage alias allocations - Creates LocalAllocOp/TMEMAllocOp
+       for each storage_alias_spec and replaces storage_alias_local_alloc with
+       local_alias referencing the allocation.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+#endif // TRITON_TLX_PASSES

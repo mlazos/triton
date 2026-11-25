@@ -12,12 +12,10 @@ from ..cdna3 import _buffer_atomic_rmw_impl, _check_cd_regclass, _set_cd_regclas
 from ..cdna3 import *  # NOQA: F403
 from ..cdna3 import __all__ as __cdna3_all
 from . import async_copy
-from . import buffer
 
 __all__ = [
     *__cdna3_all,
     "async_copy",
-    "buffer",
     "mfma_scaled",
     "scaled_upcast",
     "scaled_downcast",
@@ -28,7 +26,7 @@ __all__ = [
 
 
 @builtin
-def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=None, _semantic=None):
+def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=None, packed=False, _semantic=None):
     """
     AMD Scaled MFMA operation.
 
@@ -45,15 +43,21 @@ def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=Non
         a (tensor): The operand A to be multiplied.
         a_scale (Optional[tensor]): Scale factor for operand A.
         a_format (str): Format of operand A. Available formats: ``e2m1``,
-            ``e4m3``, ``e5m2``.
+            ``e2m3``, ``e3m2``, ``e4m3``, ``e5m2``.
         b (tensor): The operand B to be multiplied.
         b_scale (Optional[tensor]): Scale factor for operand B.
         b_format (str): Format of operand B. Available formats: ``e2m1``,
-            ``e4m3``, ``e5m2``.
+            ``e2m3``, ``e3m2``, ``e4m3``, ``e5m2``.
         acc (tensor): Accumulator tensor.
         cd_regclass (str, optional): Experimental. Register class for the accumulator input (C)
             and result (D) of the scaled MFMA instructions, as for ``mfma``: ``"a"`` for AGPRs or
             ``"v"`` for VGPRs. ``None`` (default) leaves the choice to the compiler.
+        packed (bool): Operands already hold per-segment packed FP6
+            bytes (24 packed + 8 padding per 32-code fragment chunk);
+            the ScaledMFMA lowering consumes them directly instead of
+            dense-packing codes. Requires at least one ``e2m3``/``e3m2``
+            operand, and each FP6 operand's layout must have
+            ``k_width=32`` so that a lane's 32 codes are contiguous in K.
     """
     layout = acc.type.layout
     assert isinstance(layout, AMDMFMALayout), "Expected layout to be an instance of AMDMFMALayout"
@@ -66,11 +70,20 @@ def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=Non
     b_format = _unwrap_if_constexpr(b_format)
     a_scale = _unwrap_if_constexpr(a_scale)
     b_scale = _unwrap_if_constexpr(b_scale)
-    assert a_format in {"e2m1", "e4m3", "e5m2"}, f"Unsupported lhs_format: {a_format}"
-    assert b_format in {"e2m1", "e4m3", "e5m2"}, f"Unsupported rhs_format: {b_format}"
+    assert a_format in {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}, f"Unsupported lhs_format: {a_format}"
+    assert b_format in {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}, f"Unsupported rhs_format: {b_format}"
+
+    packed = _unwrap_if_constexpr(packed)
+    if packed:
+        fp6_formats = {"e2m3", "e3m2"}
+        assert a_format in fp6_formats or b_format in fp6_formats, \
+            f"packed=True requires an e2m3/e3m2 operand, got {a_format} and {b_format}"
+        for name, fmt, operand in (("lhs", a_format, a), ("rhs", b_format, b)):
+            assert fmt not in fp6_formats or operand.type.layout.k_width == 32, \
+                f"packed=True requires k_width=32 for the FP6 {name}, got {operand.type.layout.k_width}"
 
     cd_regclass = _check_cd_regclass(cd_regclass, acc)
-    ret = _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, get_mfma_scale_layout, _semantic)
+    ret = _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, get_mfma_scale_layout, _semantic, packed=packed)
     _set_cd_regclass(ret.handle, cd_regclass, _semantic)
     return ret
 

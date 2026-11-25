@@ -6,7 +6,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include <functional>
 #include <memory>
-#include <utility>
+#include <optional>
 
 namespace mlir::triton {
 enum class ProgramIDDim : uint32_t;
@@ -71,10 +71,20 @@ public:
   //
   // Assumes the address is aligned to the width of `val`.
   virtual void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                            Value ctaId, Value val, Value pred) const = 0;
+                            Value ctaId, Value val, Value pred,
+                            std::optional<Value> barrierPtr = {}) const = 0;
   virtual Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                             Value ctaId, Type elemTy, Value pred,
                             Operation *localLoadOp = nullptr) const = 0;
+
+  // Start a fresh machine live range for a distributed thread coordinate.
+  // Targets that support cheap coordinate rematerialization can override this
+  // hook; the default preserves the original SSA value.
+  virtual Value rematerializeDistributedCoordinate(RewriterBase &rewriter,
+                                                   Location loc,
+                                                   Value coordinate) const {
+    return coordinate;
+  }
 
   void storeShared(RewriterBase &rewriter, Location loc, Value ptr, Value val,
                    Value pred) const {
@@ -87,10 +97,8 @@ public:
 
   virtual Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                            int i) const = 0;
-  // Return the shuffled value and whether the source lane is in bounds.
-  virtual std::pair<Value, Value> shuffleUp(RewriterBase &rewriter,
-                                            Location loc, Value val,
-                                            int delta) const = 0;
+  virtual Value shuffleUp(RewriterBase &rewriter, Location loc, Value val,
+                          int i) const = 0;
   virtual Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
                            int i) const = 0;
   virtual Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
@@ -102,12 +110,15 @@ public:
   virtual Value programId(RewriterBase &rewriter, Location loc,
                           ModuleOp moduleOp, ProgramIDDim axis) const = 0;
 
-  // reduceLaneIdMask identifies lane-ID bits reduced by this step.
-  // broadcastLaneIdMask identifies zero lane bases in this step's layout.
-  virtual bool warpReduce(RewriterBase &rewriter, Location loc,
-                          SmallVector<Value> &acc, triton::ReduceOp op,
-                          unsigned reduceLaneIdMask,
-                          unsigned broadcastLaneIdMask) const = 0;
+  // Attempt a warp-wide reduction of `acc` with target-specific instructions.
+  // Returns false to fall back to a shuffle-based reduction. `numLaneToReduce`
+  // is the number of participating contiguous lanes, `interleave` the stride
+  // between them, and `broadcastLaneIdMask` optionally identifies zero lane
+  // bases in this step's layout (layout path only).
+  virtual bool warpReduce(
+      RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+      triton::ReduceOp op, unsigned numLaneToReduce, unsigned interleave,
+      std::optional<unsigned> broadcastLaneIdMask = std::nullopt) const = 0;
 
   // Emits LLVM code with |rewriter| to print a message following the given
   // format from the device. |formatStrStart| is the pointer to the start of
@@ -148,7 +159,6 @@ public:
   virtual int getAddressSpace(Attribute addressSpace) const = 0;
 
   virtual bool supportVectorizedAtomics() const = 0;
-  virtual bool supportNativeBF16AtomicAdd() const { return false; }
 
   virtual bool supportLdMatrix() const { return false; }
   virtual bool supportStMatrix() const { return false; }
@@ -178,6 +188,16 @@ public:
   }
 
   virtual ~TargetInfoBase() {}
+
+  // Bulk-copy a local SMEM buffer to remote SMEM in a cluster CTA and signal
+  // the remote CTA's mbarrier on completion.
+  virtual void copyBulkSharedToRemoteShared(RewriterBase &rewriter,
+                                            Location loc, Value srcPtr,
+                                            Value dstPtr, Value barrierPtr,
+                                            Value ctaId, Value size) const {
+    llvm_unreachable(
+        "copyBulkSharedToRemoteShared not supported on this target");
+  }
 };
 } // namespace mlir::triton
 #endif // TRITON_CONVERSION_TRITONGPU_TO_LLVM_TARGETINFOBASE_H

@@ -19,6 +19,14 @@ def mock_tensor_from_tensor(tensor):
     return MockTensor(tensor.dtype, tensor.shape)
 
 
+@pytest.mark.parametrize(
+    "shape", [None, (), (0, ), (7, ), (3, 5), (2, 3, 5), (2, 64, 8192, 128), (2, 0, 4), (0, 3, 0), (1, 3, 1, 7)])
+def test_mock_tensor_contiguous_strides(shape):
+    tensor = MockTensor(torch.float32, shape)
+    reference = torch.empty(tensor.shape, device="meta")
+    assert tensor.stride() == reference.stride()
+
+
 class MockJITCallable(JITCallable):
 
     def __init__(self):
@@ -40,7 +48,7 @@ class MockInt(int):
         return super().__new__(cls, value)
 
 
-def reference_specialize_impl(backend, arg, is_const, specialize_value, align, *, nested=False):
+def reference_specialize_impl(backend, arg, is_const, specialize_value, align):
     if arg is None:
         return ("constexpr", None)
     elif isinstance(arg, bool):
@@ -67,12 +75,7 @@ def reference_specialize_impl(backend, arg, is_const, specialize_value, align, *
     elif isinstance(arg, constexpr):
         return ("constexpr", arg)
     elif isinstance(arg, tuple):
-        fields = getattr(arg, "_fields", ())
-        skip = getattr(type(arg), "__triton_do_not_specialize__", ())
-        spec = []
-        for i, x in enumerate(arg):
-            specialize = (not nested or specialize_value) and not (fields and fields[i] in skip)
-            spec.append(reference_specialize_impl(backend, x, False, specialize, True, nested=True))
+        spec = [reference_specialize_impl(backend, x, False, True, True) for x in arg]
         make_tuple = lambda vals: type(arg)(*vals) if hasattr(arg, "_fields") else tuple(vals)
         tys = make_tuple([x[0] for x in spec])
         keys = make_tuple([x[1] for x in spec])
@@ -174,34 +177,6 @@ def test_specialize_gluon_fp4_descriptor_without_active_target(monkeypatch):
 
 def mock_tensors_to_specialize():
     return [mock_tensor_from_tensor(tensor) for tensor in tensors_to_specialize()]
-
-
-@pytest.mark.parametrize("handle", [1, 7, 16])
-def test_namedtuple_do_not_specialize(handle):
-
-    class Arguments(namedtuple("Arguments", "handle dynamic default")):
-        __triton_do_not_specialize__ = ("handle", "dynamic")
-
-    pointer = torch.empty(1, device="cpu", dtype=torch.float32)
-    constant = constexpr(3)
-    arg = Arguments(handle, (pointer, constant), (pointer, 1))
-    (types, ), (keys, ) = native_specialize_impl(CUDABackend, (arg, ), False, True, True)
-    assert types == Arguments("i32", ("*fp32", "constexpr"), ("*fp32", "constexpr"))
-    assert keys == Arguments(None, (None, constant), ("D", 1))
-    assert ((types, ), (keys, )) == reference_specialize_impl(CUDABackend, (arg, ), False, True, True)
-
-
-@pytest.mark.parametrize("names,exc,message", [
-    ("handle", TypeError, "must be a tuple of field names"),
-    (("unknown", ), ValueError, "unknown field 'unknown'"),
-])
-def test_namedtuple_do_not_specialize_invalid_fields(names, exc, message):
-
-    class Arguments(namedtuple("Arguments", "handle")):
-        __triton_do_not_specialize__ = names
-
-    with pytest.raises(exc, match=message):
-        native_specialize_impl(CUDABackend, Arguments(1), False, True, True)
 
 
 @pytest.mark.parametrize("input_generator", [

@@ -700,6 +700,7 @@ def test_export_import_fabric_handles(explicit_config, allocator_config, write_o
     assert result.exc is None
 
 
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 @pytest.mark.parametrize("write_once", [False, True])
 @pytest.mark.parametrize("shadow_granularity,size",
                          [(g, 513) for g in (1, 2, 4, 8, 16)] + [(4, _ODD_LARGE_ALLOCATION_SIZE)],
@@ -738,6 +739,7 @@ def _store_write_once_cell(ptr, WIDTH: gl.constexpr):
     gl.store(ptr + offsets, 1)
 
 
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 @pytest.mark.parametrize("shadow_granularity", [1, 2, 4, 8, 16], indirect=True)
 def test_write_once_export_import_preserves_shadow(fresh_knobs, shadow_granularity):
     triton.knobs.compilation.instrumentation_mode = "gsan"
@@ -785,6 +787,7 @@ def _run_write_once_live_allocation_check(shadow_granularity):
     reset()
 
 
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 def test_write_once_live_allocation_blocks_reset(shadow_granularity):
     result = run_in_process(_run_write_once_live_allocation_check, args=(shadow_granularity, ))
     assert result.exc is None, result.exc

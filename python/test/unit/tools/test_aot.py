@@ -10,7 +10,15 @@ import numpy as np
 
 import triton
 from triton.backends.compiler import GPUTarget
-from triton._internal_testing import is_cuda, is_hip
+from triton._internal_testing import is_cuda, is_hip, is_hip_cdna5
+
+# Buck expands $(location) in TRITON_AMD_CODEGEN_PATH to a runfiles-relative
+# path. The AOT helpers below spawn compile.py/link.py children with cwd set to
+# a temp dir, where the relative path no longer resolves (OSError: .so not
+# found). Absolutize eagerly while our own cwd is still the runfiles root so
+# all children inherit a valid path.
+if "TRITON_AMD_CODEGEN_PATH" in os.environ and not os.path.isabs(os.environ["TRITON_AMD_CODEGEN_PATH"]):
+    os.environ["TRITON_AMD_CODEGEN_PATH"] = os.path.abspath(os.environ["TRITON_AMD_CODEGEN_PATH"])
 
 if is_cuda():
     from triton.backends.nvidia.driver import include_dirs, library_dirs
@@ -27,6 +35,15 @@ elif is_hip():
 
     def library_names():
         return [_get_path_to_hip_runtime_dylib()]
+
+
+def runtime_env(tmp_dir):
+    env = os.environ.copy()
+    library_path = [tmp_dir, *library_dirs()]
+    if inherited_library_path := env.get("LD_LIBRARY_PATH"):
+        library_path.append(inherited_library_path)
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(library_path)
+    return env
 
 
 kernel_utils_src = """
@@ -114,6 +131,10 @@ elif is_hip():
 #define __HIP_PLATFORM_AMD__
 #include <hip/hip_runtime.h>
 """
+else:
+    # No GPU during reactor-ci --list-only collection (ASAN host, CUDA disabled),
+    # so neither is_cuda() nor is_hip() is true; keep the module importable.
+    test_utils_src = ""
 
 test_utils_src += """
 #include <stdio.h>
@@ -473,6 +494,7 @@ def test_compile_link_matmul_no_specialization():
         compile_aot_kernel_no_specialization(tmp_dir, kernel_path, dtype, BM, BN, BK)
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -485,8 +507,7 @@ def test_compile_link_matmul_no_specialization():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         subprocess.run(["./test", a_path, b_path, c_path], env=env, check=True, cwd=tmp_dir)
 
         # read data and compare against reference
@@ -507,6 +528,7 @@ def test_compile_link_matmul():
         compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":16", ":16")])
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
         link_aot_kernels(tmp_dir)
 
         # compile test case
@@ -518,8 +540,7 @@ def test_compile_link_matmul():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         subprocess.run(["./test", a_path, b_path, c_path], env=env, check=True, cwd=tmp_dir)
 
         # read data and compare against reference
@@ -540,6 +561,7 @@ def test_launcher_has_no_available_kernel():
         compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":1", ":1")])
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -552,8 +574,7 @@ def test_launcher_has_no_available_kernel():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         result = subprocess.run(
             ["./test", a_path, b_path, c_path],
             env=env,
@@ -585,6 +606,9 @@ def test_compile_link_autotune_matmul():
             compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":16", ":16"), (":16", ""),
                                                                                       ("", ":16")])
 
+        if is_hip():
+            return
+
         link_aot_kernels(tmp_dir)
 
         gen_kernel_library(tmp_dir, "libkernel.so")
@@ -600,8 +624,7 @@ def test_compile_link_autotune_matmul():
             test_name = f"test_{algo_id}"
             gen_test_bin(tmp_dir, M, N, K, exe=test_name, algo_id=algo_id)
 
-            env = os.environ.copy()
-            env["LD_LIBRARY_PATH"] = tmp_dir
+            env = runtime_env(tmp_dir)
             subprocess.run(
                 [f"./{test_name}", a_path, b_path, c_path],
                 check=True,
@@ -640,7 +663,12 @@ module attributes {{"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = {warp_si
             assert '.wavefront_size: 64' in amdgcn
 
 
-@pytest.mark.parametrize("target", [GPUTarget("hip", "gfx942", 64), GPUTarget("hip", "gfx1250", 32)])
+@pytest.mark.parametrize("target", [
+    pytest.param(GPUTarget("hip", "gfx942", 64),
+                 marks=pytest.mark.xfail(reason="gluon AOT compilation not yet supported on gfx942")),
+    pytest.param(GPUTarget("hip", "gfx1250", 32), marks=pytest.mark.skipif(not is_hip_cdna5(),
+                                                                           reason="CDNA5 not available")),
+])
 @pytest.mark.skipif(not is_hip(), reason="Requires HIP")
 def test_gluon_kernel(target):
     with tempfile.TemporaryDirectory() as tmp_dir:

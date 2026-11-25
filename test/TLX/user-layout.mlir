@@ -1,0 +1,197 @@
+// RUN: triton-opt -split-input-file --tlx-propagate-layout --tlx-finalize-user-layouts %s | FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-propagate-layout --tlx-finalize-user-layouts --canonicalize %s | FileCheck %s --check-prefix=CANON
+
+// A user-pinned layout (#tlx.user_layout<...>) is honored by layout propagation:
+// the value is never retagged, and the wrapper is unwrapped back to the concrete
+// layout the user asked for. The wrapper is general (wraps distributed or shared
+// layouts); here it wraps a shared layout on a local_alloc.
+
+#swizzled = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#user = #tlx.user_layout<#swizzled>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+// CHECK-DAG: #[[$SWIZZLED:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+// CHECK-NOT: #tlx.user_layout
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @user_pinned
+  tt.func @user_pinned(%arg0: tensor<128x64xf16, #blocked>) -> tensor<128x64xf16, #blocked> {
+    // The alloc keeps the user's swizzled layout (unwrapped from the marker),
+    // not some consumer-inferred encoding.
+    // CHECK: ttg.local_alloc {{.*}} -> !ttg.memdesc<128x64xf16, #[[$SWIZZLED]], #smem, mutable>
+    %0 = ttg.local_alloc %arg0 : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #user, #smem, mutable>
+    %1 = ttg.local_load %0 : !ttg.memdesc<128x64xf16, #user, #smem, mutable> -> tensor<128x64xf16, #blocked>
+    tt.return %1 : tensor<128x64xf16, #blocked>
+  }
+}
+
+// -----
+
+// A user-pinned buffer feeding a dot must NOT be folded away. Normally a
+// local_alloc(src) -> local_load(dot_operand) pair is an LDS round-trip that
+// tlx-propagate-layout eliminates (see the next case); the wrapper anchors it, so
+// the buffer and its swizzle survive.
+
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#swizzled = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#user = #tlx.user_layout<#swizzled>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#smem = #ttg.shared_memory
+
+// CHECK-DAG: #[[$SWZ:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @pinned_dot_not_folded
+  tt.func @pinned_dot_not_folded(%src: tensor<64x32xf16, #blocked>) -> tensor<64x32xf16, #dot0> {
+    // CHECK: ttg.local_alloc {{.*}} -> !ttg.memdesc<64x32xf16, #[[$SWZ]], #smem, mutable>
+    // CHECK: ttg.local_load
+    // CHECK-NOT: #tlx.user_layout
+    %buf = ttg.local_alloc %src : (tensor<64x32xf16, #blocked>) -> !ttg.memdesc<64x32xf16, #user, #smem, mutable>
+    %a = ttg.local_load %buf : !ttg.memdesc<64x32xf16, #user, #smem, mutable> -> tensor<64x32xf16, #dot0>
+    tt.return %a : tensor<64x32xf16, #dot0>
+  }
+}
+
+// -----
+
+// Unwrapping a user layout can turn a previously meaningful conversion into
+// an identity. Finalization must erase it from the emitted TTGIR.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#user = #tlx.user_layout<#tlx.no_verify_layout<#blocked>>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @erase_unwrapped_identity_conversion
+  tt.func @erase_unwrapped_identity_conversion(%arg0: tensor<128x64xf16, #user>) -> tensor<128x64xf16, #blocked> {
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: tt.return %{{.*}} : tensor<128x64xf16, #blocked>
+    %0 = ttg.convert_layout %arg0 : tensor<128x64xf16, #user> -> tensor<128x64xf16, #blocked>
+    tt.return %0 : tensor<128x64xf16, #blocked>
+  }
+}
+
+// -----
+
+// Baseline (no wrapper): the same local_alloc(src) -> local_load(dot_operand) is
+// folded to a convert_layout and the LDS buffer is eliminated. This is exactly
+// what the wrapper above prevents.
+
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#swizzled = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @unpinned_dot_folded
+  tt.func @unpinned_dot_folded(%src: tensor<64x32xf16, #blocked>) -> tensor<64x32xf16, #dot0> {
+    // CHECK: ttg.convert_layout
+    // CHECK-NOT: ttg.local_alloc
+    %buf = ttg.local_alloc %src : (tensor<64x32xf16, #blocked>) -> !ttg.memdesc<64x32xf16, #swizzled, #smem, mutable>
+    %a = ttg.local_load %buf : !ttg.memdesc<64x32xf16, #swizzled, #smem, mutable> -> tensor<64x32xf16, #dot0>
+    tt.return %a : tensor<64x32xf16, #dot0>
+  }
+}
+
+// -----
+
+// A TLX release remains a semantic TTG boundary during layout propagation, but
+// finalization retires it to the physical conversion selected for its result.
+
+#release_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#release_user = #tlx.user_layout<#release_src>
+#release_dst = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 4], order = [0, 1]}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @finalize_release_layout
+  tt.func @finalize_release_layout(
+      %src: tensor<128x64xf16, #release_user>)
+      -> tensor<128x64xf16, #release_dst> {
+    // CHECK-NOT: #tlx.user_layout
+    // CHECK-NOT: ttg.release_layout
+    // CHECK: %[[CONVERTED:.*]] = ttg.convert_layout %{{.*}} : tensor<128x64xf16, #{{.*}}> -> tensor<128x64xf16, #{{.*}}>
+    %released = tlx.release_layout %src : tensor<128x64xf16, #release_user> -> tensor<128x64xf16, #release_dst>
+    // CHECK: tt.return %[[CONVERTED]]
+    tt.return %released : tensor<128x64xf16, #release_dst>
+  }
+}
+
+// -----
+
+// Identity releases are kept until finalization, then removed without leaving
+// an identity convert_layout.
+
+#identity = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @finalize_identity_release_layout
+  tt.func @finalize_identity_release_layout(
+      %src: tensor<128x64xf16, #identity>) -> tensor<128x64xf16, #identity> {
+    // CHECK-NOT: ttg.release_layout
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: tt.return %arg0
+    %released = ttg.release_layout %src : tensor<128x64xf16, #identity> -> tensor<128x64xf16, #identity>
+    tt.return %released : tensor<128x64xf16, #identity>
+  }
+}
+
+// -----
+
+// Coordinate-rematerialization groups belong to concrete local loads. The
+// boolean request may cross a pinned boundary, but the group must not follow it
+// onto the finalized conversion, even if the source requirement also carries
+// stale group metadata.
+
+#group_physical = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#group_user = #tlx.user_layout<#group_physical>
+#group_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#group_smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @preserve_load_group_and_boundary_boolean
+  // CANON-LABEL: @preserve_load_group_and_boundary_boolean
+  tt.func @preserve_load_group_and_boundary_boolean(
+      %src: tensor<128x64xf16, #group_physical>)
+      -> tensor<128x64xf16, #group_user> {
+    // CHECK: %[[BUFFER:.*]] = ttg.local_alloc %arg0
+    // CHECK: %[[LOAD:.*]] = ttg.local_load %[[BUFFER]] {tlx.rematerialize_coordinates_group = 21 : i32}
+    // CHECK: %[[REMAT:.*]] = ttg.convert_layout %[[LOAD]] {tlx.rematerialize_coordinates} :
+    // CANON: %[[BUFFER:.*]] = ttg.local_alloc %arg0
+    // CANON: %[[LOAD:.*]] = ttg.local_load %[[BUFFER]] {tlx.rematerialize_coordinates_group = 21 : i32}
+    // CANON: %[[REMAT:.*]] = ttg.convert_layout %[[LOAD]] {tlx.rematerialize_coordinates} :
+    %buffer = ttg.local_alloc %src : (tensor<128x64xf16, #group_physical>) -> !ttg.memdesc<128x64xf16, #group_shared, #group_smem, mutable>
+    %loaded = ttg.local_load %buffer {tlx.rematerialize_coordinates_group = 21 : i32} : !ttg.memdesc<128x64xf16, #group_shared, #group_smem, mutable> -> tensor<128x64xf16, #group_physical>
+    %required = tlx.require_layout %loaded {tlx.rematerialize_coordinates, tlx.rematerialize_coordinates_group = 21 : i32} : tensor<128x64xf16, #group_physical> -> tensor<128x64xf16, #group_user>
+    // CHECK: tt.return %[[REMAT]]
+    // CANON: tt.return %[[REMAT]]
+    tt.return %required : tensor<128x64xf16, #group_user>
+  }
+}
+
+// -----
+
+// The fallback local_alloc/local_load elimination must not erase active load
+// metadata or move a load-owned group onto a replacement convert_layout.
+
+#fallback_src = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#fallback_dot = #ttg.dot_op<{opIdx = 0, parent = #fallback_src}>
+#fallback_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#fallback_smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @metadata_local_load_not_folded
+  // CANON-LABEL: @metadata_local_load_not_folded
+  tt.func @metadata_local_load_not_folded(
+      %src: tensor<64x32xf16, #fallback_src>)
+      -> tensor<64x32xf16, #fallback_dot> {
+    // CHECK: %[[BUFFER:.*]] = ttg.local_alloc %arg0
+    // CHECK: %[[LOAD:.*]] = ttg.local_load %[[BUFFER]] {tlx.rematerialize_coordinates_group = 9 : i32, ttg.amdg.syncedViaAsyncWait = true}
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: tt.return %[[LOAD]]
+    // CANON: %[[BUFFER:.*]] = ttg.local_alloc %arg0
+    // CANON: %[[LOAD:.*]] = ttg.local_load %[[BUFFER]] {tlx.rematerialize_coordinates_group = 9 : i32, ttg.amdg.syncedViaAsyncWait = true}
+    // CANON-NOT: ttg.convert_layout
+    // CANON: tt.return %[[LOAD]]
+    %buffer = ttg.local_alloc %src : (tensor<64x32xf16, #fallback_src>) -> !ttg.memdesc<64x32xf16, #fallback_shared, #fallback_smem, mutable>
+    %loaded = ttg.local_load %buffer {tlx.rematerialize_coordinates_group = 9 : i32, ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<64x32xf16, #fallback_shared, #fallback_smem, mutable> -> tensor<64x32xf16, #fallback_dot>
+    tt.return %loaded : tensor<64x32xf16, #fallback_dot>
+  }
+}

@@ -37,6 +37,9 @@ enum class MemoryOp { Load, Store };
 Value shuffleXor(Location loc, RewriterBase &rewriter, Value val, int i,
                  mlir::triton::amdgpu::ISAFamily isaFamily =
                      mlir::triton::amdgpu::ISAFamily::Unknown);
+Value shuffleUp(Location loc, RewriterBase &rewriter, Value val, int i,
+                mlir::triton::amdgpu::ISAFamily isaFamily =
+                    mlir::triton::amdgpu::ISAFamily::Unknown);
 Value shuffleIdx(Location loc, RewriterBase &rewriter, Value val, int i,
                  mlir::triton::amdgpu::ISAFamily isaFamily =
                      mlir::triton::amdgpu::ISAFamily::Unknown);
@@ -56,8 +59,9 @@ Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
 Value emitCtaMulticastMask(RewriterBase &rewriter, Location loc, Value blockId,
                            const LinearLayout &cvt, unsigned maxMaskPopcount);
 
-std::pair<bool, bool>
-getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm, MemoryOp op);
+std::pair<bool, bool> getCacheModifierFlagsForLoadStore(
+    const triton::CacheModifier &cm, MemoryOp op,
+    triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL);
 
 // Loads from shared or global memory with predication.
 // `otherElems` is used to mask out the elements that are not loaded
@@ -67,6 +71,7 @@ getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm, MemoryOp op);
 Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
              Value pred, Value falseVal, Value multicastMask,
              triton::CacheModifier cm = triton::CacheModifier::NONE,
+             triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL,
              bool isVolatile = false, bool forceNoAliasAsyncLoads = false);
 
 // Stores to shared or global memory with predication.
@@ -75,6 +80,7 @@ Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
 // avoid conservative waits. See `addLocalLoadNoAliasScope` for more details
 void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
              Value pred, triton::CacheModifier cm = triton::CacheModifier::NONE,
+             triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL,
              bool forceNoAliasAsyncLoads = false);
 
 // Get cache modifier information for creating load or store instruction
@@ -82,17 +88,9 @@ void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
 std::pair<bool, bool> getCacheModifierFlagsForLoadStore(LLVM::CallOp);
 // Get the cachepolicy value for a cache modifier
 int32_t
-getCtrlBitsForCacheModifierOnTarget(triton::CacheModifier, bool,
+getCtrlBitsForCacheModifierOnTarget(triton::CacheModifier,
+                                    triton::EvictionPolicy, bool,
                                     const mlir::triton::AMD::TargetInfo &);
-
-// Get the cachepolicy (aux) value of a buffer load or store from its
-// `cachePolicy` attribute and its optional coherence `scope`.
-// Fails, with a diagnostic on `op`, for a combination the target can't encode.
-FailureOr<int32_t>
-getBufferLoadStoreCtrlBits(Operation *op, Attribute cachePolicy,
-                           std::optional<triton::MemSyncScope> scope,
-                           bool isLoad,
-                           const mlir::triton::AMD::TargetInfo &targetInfo);
 
 // Return a tensor of pointers with the same type of `basePtr` and the same
 // shape of `offset`
@@ -108,11 +106,31 @@ unsigned getContiguity(Value ptr, Value offset,
 // Determine the vector size of a tensor of pointers
 unsigned getVectorSize(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass);
 
+// Determine the vector size from per-thread and analyzed contiguity without
+// requiring the pointer base to have the vector's natural alignment.
+unsigned
+getVectorSizeIgnoringAlignment(Value ptr,
+                               ModuleAxisInfoAnalysis &axisAnalysisPass);
+
 // Given a scalar pointer and a tensor of offsets, determine the vector size
 unsigned getVectorSize(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass);
 
 Type scaleDotElemTypeToMLIRType(MLIRContext *ctx, triton::ScaleDotElemType t);
+
+// Splits a direct-to-LDS copy of |srcLayout| into |sharedLayout| into one
+// radix-2 copy per odd register value o, written from element
+// |slabOffsets|[o]; returns that copy's register-to-offset layout.
+FailureOr<LinearLayout> splitDirectToLdsCopy(
+    const LinearLayout &srcLayout, const LinearLayout &sharedLayout,
+    SmallVectorImpl<int32_t> &slabOffsets, std::string &reason);
+
+// Returns why a mixed-radix |srcLayout| cannot be loaded directly into
+// |dstEnc|, else sets |vectorSize| as canLoadDirectToLDS does.
+std::optional<std::string> getNpotDirectToLdsUnsupportedReason(
+    const triton::AMD::TargetInfo &targetInfo, const LinearLayout &srcLayout,
+    unsigned elemBitWidth, Attribute dstEnc, ArrayRef<int64_t> dstAllocShape,
+    unsigned &vectorSize);
 
 // The vector sizes the pointers/offsets and the mask each allow. Zero means
 // unknown, in which case no attribution is made.

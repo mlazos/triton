@@ -23,6 +23,8 @@ using namespace mlir;
 using namespace mlir::triton::gpu;
 using TranspositionInfo = DecomposedWarpConversion::TranspositionInfo;
 
+constexpr int kPtrBitWidth = 64;
+
 struct ConvertLayoutOpConversion
     : public ConvertOpToLLVMPattern<ConvertLayoutOp> {
   const TargetInfoBase &targetInfo;
@@ -38,11 +40,14 @@ struct ConvertLayoutOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     MLIRContext *ctx = op.getContext();
 
+    const auto &shape = op.getType().getShape();
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getType();
 
     auto kRegister = str_attr("register");
 
+    if (auto plan = getMixedRadixConversionPlan(srcTy, dstTy))
+      return lowerMixedRadixConversion(op, *plan, adaptor, rewriter);
     auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
     auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
     LinearLayout conversion = minimalCvtLayout(srcLayout, dstLayout);
@@ -91,10 +96,221 @@ struct ConvertLayoutOpConversion
     return success();
   }
 
-  void transferSwizzlingLocalMem(ConvertLayoutOp op, Value src,
-                                 const LinearLayout &srcLayout,
-                                 const LinearLayout &dstLayout,
-                                 ConversionPatternRewriter &rewriter) const {
+  LogicalResult lowerMixedRadixConversion(
+      ConvertLayoutOp op, const MixedRadixConversionPlan &plan,
+      OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const {
+    assert(plan.supported() && "the verifier rejects unsupported plans");
+    auto loc = op.getLoc();
+    auto kRegister = StringAttr::get(op.getContext(), "register");
+    auto dstTy = op.getType();
+    auto srcLayout = toLinearLayout(op.getSrc().getType())
+                         .removeZeroBasesAlongDim(kRegister);
+    auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
+    if (plan.transfer == MixedRadixConversionTransfer::Shared) {
+      transferSwizzlingLocalMem(op, adaptor.getSrc(), srcLayout, dstLayout,
+                                rewriter, &plan);
+      return success();
+    }
+    if (plan.transfer == MixedRadixConversionTransfer::Warp)
+      return transferWithinWarp(op, srcLayout, dstLayout, adaptor, rewriter,
+                                &plan);
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    SmallVector<Value> outVals(inVals.size());
+    for (auto [i, value] : llvm::enumerate(inVals))
+      outVals[plan.warpFactors->pReg.apply({{kRegister, int32_t(i)}})
+                  .front()
+                  .second] = value;
+    rewriter.replaceOp(op, packUniqueTensorElements(
+                               loc, getTypeConverter(),
+                               plan.destinationRegisterOrder->apply(outVals),
+                               rewriter, dstTy));
+    return success();
+  }
+
+  SmallVector<Value> transferSwizzlingLocalMemImpl(
+      Location loc, ConversionPatternRewriter &rewriter,
+      const LinearLayout &srcLayout, const LinearLayout &dstLayout,
+      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
+      Operation *sourceOp,
+      std::optional<std::pair<Value, Value>> distributedCoordinates,
+      const MixedRadixConversionPlan *plan) const {
+    auto *ctx = rewriter.getContext();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    // We handle transformations recursively as they all need a preprocessing
+    // and a postprocessing step.
+
+    // Handle pointer types as 64-bit integers
+    if (isa<LLVM::LLVMPointerType>(llvmElemTy)) {
+      auto llvmElemTyPtr = i64_ty;
+      auto newInVals = llvm::to_vector(llvm::map_range(inVals, [&](Value v) {
+        return b.ptrtoint(llvmElemTyPtr, v).getResult();
+      }));
+      auto outVals = transferSwizzlingLocalMemImpl(
+          loc, rewriter, srcLayout, dstLayout, newInVals, llvmElemTyPtr,
+          smemBase, sourceOp, distributedCoordinates, plan);
+      for (auto &v : outVals) {
+        v = b.inttoptr(llvmElemTy, v);
+      }
+      return outVals;
+    }
+
+    // Handle sub-byte elements like i1
+    if (llvmElemTy.getIntOrFloatBitWidth() < 8) {
+      // Upcast to i8
+      auto i8ElemTy = i8_ty;
+      auto newInVals = llvm::to_vector(llvm::map_range(
+          inVals, [&](Value v) { return b.zext(i8ElemTy, v).getResult(); }));
+      auto outVals = transferSwizzlingLocalMemImpl(
+          loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase,
+          sourceOp, distributedCoordinates, plan);
+      for (auto &v : outVals) {
+        v = b.trunc(llvmElemTy, v, LLVM::IntegerOverflowFlags::nuw);
+      }
+      return outVals;
+    }
+
+    // The owner predicate handles broadcast source registers. A transpose
+    // moves its odd tiles on the swizzled pow2 path, which keeps a vector on
+    // both sides.
+    if (plan) {
+      bool blockScope = plan->scope == triton::MixedRadixConversionScope::Block;
+      if (auto tiles = getMixedRadixTransposeTiles(
+              srcLayout, dstLayout, llvmElemTy.getIntOrFloatBitWidth()))
+        return transferMixedRadixThroughSharedMemory(
+            loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
+            smemBase, plan->sourceFreeVariableMasks, blockScope,
+            distributedCoordinates, &*tiles,
+            [&](const LinearLayout &src, const LinearLayout &dst,
+                ArrayRef<Value> vals) {
+              return transferSwizzlingLocalMemImpl(
+                  loc, rewriter, src, dst, vals, llvmElemTy, smemBase, sourceOp,
+                  distributedCoordinates, /*plan=*/nullptr);
+            });
+      return transferMixedRadixThroughSharedMemory(
+          loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
+          smemBase, plan->sourceFreeVariableMasks, blockScope,
+          distributedCoordinates,
+          plan->sharedTiling ? &*plan->sharedTiling : nullptr);
+    }
+
+    // Remove broadcasting in src
+    auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLayout);
+    if (!removeBroadcastSrc.isIdentity()) {
+      auto prmtSrc = removeBroadcastSrc.apply(srcLayout);
+      auto newInVals = removeBroadcastSrc.apply(inVals);
+      return transferSwizzlingLocalMemImpl(
+          loc, rewriter, prmtSrc, dstLayout, newInVals, llvmElemTy, smemBase,
+          sourceOp, distributedCoordinates, /*plan=*/nullptr);
+    }
+
+    // Remove broadcasting in dst
+    auto removeBroadcastDst = actionRemoveBroadcastedRegs(dstLayout);
+    if (!removeBroadcastDst.isIdentity()) {
+      auto prmtDst = removeBroadcastDst.apply(dstLayout);
+      auto outVals = transferSwizzlingLocalMemImpl(
+          loc, rewriter, srcLayout, prmtDst, inVals, llvmElemTy, smemBase,
+          sourceOp, distributedCoordinates, /*plan=*/nullptr);
+      return broadcastAs(outVals, dstLayout);
+    }
+
+    // At this point we have a type that's at least 8-bit
+    // and we don't have broadcasting in the registers
+    auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
+    int numBanks = targetInfo.getSharedMemoryBanks();
+    int32_t vecBitwidth =
+        triton::gpu::getVecBitwidthLdSt(srcLayout, dstLayout, bitwidth);
+    auto [dstTile, srcTile] = targetInfo.getSharedLdStTiles(vecBitwidth);
+    auto smem = optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth, numBanks,
+                                     srcTile, dstTile);
+
+    // Extract reps from smem
+    auto kReg = str_attr("register");
+    auto kWarp = str_attr("warp");
+    auto kBlock = str_attr("block");
+    auto kReps = str_attr("reps");
+    auto nReps = smem.getInDimSize(kReps);
+    auto reps = LinearLayout::identity1D(nReps, kReg, kReps);
+
+    auto totalStoreCvt = srcLayout.invertAndCompose(smem);
+    auto totalLoadCvt = invertAndComposeLocal(smem, dstLayout, {kBlock});
+
+    // The permutation exists by construction of the reps dimension in
+    // optimalSwizzling
+    auto permStore =
+        regPermForDivide(totalStoreCvt, reps, /*left=*/false).value();
+    totalStoreCvt = permStore.apply(totalStoreCvt);
+    auto permutedInVals = permStore.apply(inVals);
+    auto permLoad =
+        regPermForDivide(totalLoadCvt, reps, /*left=*/false).value();
+    totalLoadCvt = permLoad.apply(totalLoadCvt);
+
+    // Remove the reps and flatten into offset
+    auto storeCvt = *divideRight(totalStoreCvt, reps);
+    auto loadCvt = *divideRight(totalLoadCvt, reps);
+    auto kOffset = str_attr("offset");
+    auto nBlock = storeCvt.getInDimSize(kBlock);
+    storeCvt = storeCvt.reshapeOuts(
+        {{kOffset, storeCvt.getTotalOutDimSize() / nBlock}, {kBlock, nBlock}});
+    loadCvt = loadCvt.reshapeOuts(
+        {{kOffset, loadCvt.getTotalOutDimSize() / nBlock}, {kBlock, nBlock}});
+
+    auto tileSize = storeCvt.getInDimSize(kReg);
+
+    assert(permutedInVals.size() == tileSize * nReps);
+    SmallVector<Value> outVals;
+    auto affineOffset = b.i32_val(0);
+    auto maskSpanAffineOffset = 0;
+
+    bool isWarpSync = mlir::isCvtDimSync(srcLayout, dstLayout, kWarp);
+    bool isBlockSync = mlir::isCvtDimSync(srcLayout, dstLayout, kBlock);
+    auto emitBarrier = [&]() {
+      if (isWarpSync) {
+        targetInfo.warpSync(loc, rewriter);
+      } else if (isBlockSync) {
+        targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+      } else {
+        targetInfo.clusterBarrier(loc, rewriter, sourceOp);
+      }
+    };
+
+    for (int i = 0; i < nReps; ++i) {
+      // Membar orders inter-operation scratch reuse after allocation. Repeated
+      // tiles within this operation still need to release the preceding reads.
+      if (i > 0)
+        emitBarrier();
+      auto tileInVals =
+          ArrayRef<Value>(permutedInVals).slice(i * tileSize, tileSize);
+      // Store
+      lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
+                      /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
+                      /*affineBlockOffset=*/Value(),
+                      /*maskSpanAffineBlock=*/0, rewriter, targetInfo,
+                      /*maybeMaxVecElems=*/{},
+                      /*localLoadOp=*/nullptr,
+                      /*ctaRank=*/{},
+                      /*barrierPtr=*/{}, distributedCoordinates);
+      emitBarrier();
+      // Load
+      auto tileOutVals = lowerLdStShared(
+          loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
+          affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+          /*maskSpanAffineBlock=*/0, rewriter, targetInfo,
+          /*maybeMaxVecElems=*/{},
+          /*localLoadOp=*/nullptr,
+          /*ctaRank=*/{},
+          /*barrierPtr=*/{}, distributedCoordinates);
+      llvm::append_range(outVals, tileOutVals);
+    }
+
+    // Undo the permLoad used to divideRight
+    outVals = permLoad.inverse().apply(outVals);
+    return outVals;
+  }
+
+  void transferSwizzlingLocalMem(
+      ConvertLayoutOp op, Value src, const LinearLayout &srcLayout,
+      const LinearLayout &dstLayout, ConversionPatternRewriter &rewriter,
+      const MixedRadixConversionPlan *plan = nullptr) const {
     auto loc = op.getLoc();
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getType();
@@ -103,9 +319,18 @@ struct ConvertLayoutOpConversion
     auto smemBase =
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
     auto inVals = unpackUniqueTensorElements(loc, src, rewriter);
-    auto outVals = mlir::convertLayoutViaSharedMemory(
+
+    std::optional<std::pair<Value, Value>> distributedCoordinates;
+    if (op->hasAttr("tlx.rematerialize_coordinates")) {
+      auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+      distributedCoordinates = {
+          targetInfo.rematerializeDistributedCoordinate(rewriter, loc, laneId),
+          targetInfo.rematerializeDistributedCoordinate(rewriter, loc, warpId),
+      };
+    }
+    auto outVals = transferSwizzlingLocalMemImpl(
         loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase, op,
-        targetInfo);
+        distributedCoordinates, plan);
 
     Value result = packUniqueTensorElements(loc, getTypeConverter(), outVals,
                                             rewriter, dstTy);
@@ -114,11 +339,11 @@ struct ConvertLayoutOpConversion
 
   // Use warp shuffles to implement a layout conversion where data only needs to
   // be moved within warps.
-  LogicalResult transferWithinWarp(ConvertLayoutOp op,
-                                   const LinearLayout &srcLayout,
-                                   const LinearLayout &dstLayout,
-                                   OpAdaptor adaptor,
-                                   ConversionPatternRewriter &rewriter) const {
+  LogicalResult
+  transferWithinWarp(ConvertLayoutOp op, const LinearLayout &srcLayout,
+                     const LinearLayout &dstLayout, OpAdaptor adaptor,
+                     ConversionPatternRewriter &rewriter,
+                     const MixedRadixConversionPlan *plan = nullptr) const {
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -130,7 +355,9 @@ struct ConvertLayoutOpConversion
     int bitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
 
     auto [pReg, shuffleMap, mixedTranspositions, nPack] =
-        getWarpLayoutConvertDecomposition(srcLayout, dstLayout, bitwidth);
+        plan
+            ? *plan->warpFactors
+            : getWarpLayoutConvertDecomposition(srcLayout, dstLayout, bitwidth);
     int m = mixedTranspositions.size();
     bool isXorShuffle = squareSublayoutIsIdentity(shuffleMap, kLane);
 
@@ -242,6 +469,10 @@ struct ConvertLayoutOpConversion
       outVals = std::move(unpackedVals);
     }
 
+    // A mixed-radix plan's pReg output is in destinationRegisterOrder's input
+    // order.
+    if (plan)
+      outVals = plan->destinationRegisterOrder->apply(outVals);
     // If `dstLayout` has a smaller `kReg` dimension than `srcLayout` after
     // broadcasting is removed, then drop the extra registers from `outVals`.
     outVals.resize(dstLayout.getInDimSize(kReg));
@@ -264,6 +495,7 @@ struct ConvertLayoutOpConversion
     auto kBlock = str_attr("block");
 
     SmallVector<Value> vals(inVals.begin(), inVals.end());
+    int m = mixedTranspositions.size();
     int numRegs = inVals.size();
     // A single mixed transposition (r_i l_j) which swaps the i-th register
     // index bit and the j-th lane index bit of an element applies a tiled 2x2
@@ -437,140 +669,6 @@ struct ConvertLayoutOpConversion
 };
 
 } // namespace
-
-namespace mlir {
-
-using namespace mlir::triton::gpu;
-
-SmallVector<Value> convertLayoutViaSharedMemory(
-    Location loc, ConversionPatternRewriter &rewriter,
-    const LinearLayout &srcLayout, const LinearLayout &dstLayout,
-    ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
-    Operation *sourceOp, const TargetInfoBase &targetInfo, Value storePred) {
-  auto *ctx = rewriter.getContext();
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-  if (!storePred)
-    storePred = b.true_val();
-  // We handle transformations recursively as they all need a preprocessing
-  // and a postprocessing step.
-
-  // Handle pointer types as 64-bit integers
-  if (isa<LLVM::LLVMPointerType>(llvmElemTy)) {
-    auto llvmElemTyPtr = i64_ty;
-    auto newInVals = llvm::to_vector(llvm::map_range(inVals, [&](Value v) {
-      return b.ptrtoint(llvmElemTyPtr, v).getResult();
-    }));
-    auto outVals = convertLayoutViaSharedMemory(
-        loc, rewriter, srcLayout, dstLayout, newInVals, llvmElemTyPtr, smemBase,
-        sourceOp, targetInfo, storePred);
-    for (auto &v : outVals) {
-      v = b.inttoptr(llvmElemTy, v);
-    }
-    return outVals;
-  }
-
-  // Handle sub-byte elements like i1
-  if (llvmElemTy.getIntOrFloatBitWidth() < 8) {
-    // Upcast to i8
-    auto i8ElemTy = i8_ty;
-    auto newInVals = llvm::to_vector(llvm::map_range(
-        inVals, [&](Value v) { return b.zext(i8ElemTy, v).getResult(); }));
-    auto outVals = convertLayoutViaSharedMemory(
-        loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase,
-        sourceOp, targetInfo, storePred);
-    for (auto &v : outVals) {
-      v = b.trunc(llvmElemTy, v, LLVM::IntegerOverflowFlags::nuw);
-    }
-    return outVals;
-  }
-
-  // At this point we have a type that's at least 8-bit
-  // and we don't have broadcasting in the registers
-  auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
-  int numBanks = targetInfo.getSharedMemoryBanks();
-  int32_t vecBitwidth =
-      triton::gpu::getVecBitwidthLdSt(srcLayout, dstLayout, bitwidth);
-  auto [dstTile, srcTile] = targetInfo.getSharedLdStTiles(vecBitwidth);
-  auto smem = optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth, numBanks,
-                                   srcTile, dstTile);
-
-  // Extract reps from smem
-  auto kReg = str_attr("register");
-  auto kWarp = str_attr("warp");
-  auto kBlock = str_attr("block");
-  auto kReps = str_attr("reps");
-  auto nReps = smem.getInDimSize(kReps);
-  auto reps = LinearLayout::identity1D(nReps, kReg, kReps);
-
-  auto totalStoreCvt = srcLayout.invertAndCompose(smem);
-  auto totalLoadCvt = invertAndComposeLocal(smem, dstLayout, {kBlock});
-
-  // The permutation exists by construction of the reps dimension in
-  // optimalSwizzling
-  auto permStore =
-      regPermForDivide(totalStoreCvt, reps, /*left=*/false).value();
-  totalStoreCvt = permStore.apply(totalStoreCvt);
-  auto permutedInVals = permStore.apply(inVals);
-  auto permLoad = regPermForDivide(totalLoadCvt, reps, /*left=*/false).value();
-  totalLoadCvt = permLoad.apply(totalLoadCvt);
-
-  // Remove the reps and flatten into offset
-  auto storeCvt = *divideRight(totalStoreCvt, reps);
-  auto loadCvt = *divideRight(totalLoadCvt, reps);
-  auto kOffset = str_attr("offset");
-  auto nBlock = storeCvt.getInDimSize(kBlock);
-  storeCvt = storeCvt.reshapeOuts(
-      {{kOffset, storeCvt.getTotalOutDimSize() / nBlock}, {kBlock, nBlock}});
-  loadCvt = loadCvt.reshapeOuts(
-      {{kOffset, loadCvt.getTotalOutDimSize() / nBlock}, {kBlock, nBlock}});
-
-  auto tileSize = storeCvt.getInDimSize(kReg);
-
-  assert(permutedInVals.size() == tileSize * nReps);
-  SmallVector<Value> outVals;
-  auto affineOffset = b.i32_val(0);
-  auto maskSpanAffineOffset = 0;
-
-  bool isWarpSync = mlir::isCvtDimSync(srcLayout, dstLayout, kWarp);
-  bool isBlockSync = mlir::isCvtDimSync(srcLayout, dstLayout, kBlock);
-  auto emitBarrier = [&]() {
-    if (isWarpSync) {
-      targetInfo.warpSync(loc, rewriter);
-    } else if (isBlockSync) {
-      targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
-    } else {
-      targetInfo.clusterBarrier(loc, rewriter, sourceOp);
-    }
-  };
-
-  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-  for (int i = 0; i < nReps; ++i) {
-    if (i > 0)
-      emitBarrier();
-    auto tileInVals =
-        ArrayRef<Value>(permutedInVals).slice(i * tileSize, tileSize);
-    // Store
-    lowerLdSt(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
-              /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
-              /*affineBlockOffset=*/Value(), /*maskSpanAffineBlock=*/0, laneId,
-              warpId, rewriter, targetInfo, /*maybeMaxVecElems=*/{},
-              makeSharedStoreEmitter(targetInfo, storePred));
-    emitBarrier();
-    // Load
-    auto tileOutVals = lowerLdSt(
-        loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-        affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
-        /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
-        /*maybeMaxVecElems=*/{}, makeSharedLoadEmitter(targetInfo));
-    llvm::append_range(outVals, tileOutVals);
-  }
-
-  // Undo the permLoad used to divideRight
-  outVals = permLoad.inverse().apply(outVals);
-  return outVals;
-}
-
-} // namespace mlir
 
 void mlir::triton::populateConvertLayoutOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,

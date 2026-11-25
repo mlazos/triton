@@ -1,12 +1,17 @@
 import os
+import re
 import pytest
 import shutil
+import sys
 import triton
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from triton._C.libtriton import get_cache_invalidating_env_vars  # type: ignore[attr-defined]
 from triton._internal_testing import is_hip
 
 from pathlib import Path
+
+from triton.backends.compiler import GPUTarget
 
 
 def test_knobs_utils(fresh_knobs) -> None:
@@ -70,180 +75,17 @@ def test_knobs_utils(fresh_knobs) -> None:
     }
 
 
-def _register_pressure_scheduler_kernel():
-    from triton.backends.compiler import GPUTarget
-    from triton.backends.nvidia import compiler
-
-    compiler.llvm.init_targets()
-    backend = compiler.CUDABackend(GPUTarget("cuda", 90, 32))
-    arithmetic = []
-    stores = []
-    for lane in range(32):
-        arithmetic.extend([
-            f"  %seed{lane} = add i32 %seed, {lane + 1}",
-            f"  %high{lane} = call i32 @llvm.umulh.i32(i32 %seed{lane}, i32 -766435501)",
-            f"  %low{lane} = mul i32 %seed{lane}, -845247145",
-            f"  %value{lane} = xor i32 %high{lane}, %low{lane}",
-        ])
-        stores.extend([
-            f"  %out{lane} = getelementptr i32, ptr addrspace(1) %out, i64 {lane}",
-            f"  store i32 %value{lane}, ptr addrspace(1) %out{lane}, align 4",
-        ])
-
-    source = ('target triple = "nvptx64-nvidia-cuda"\n'
-              'declare i32 @llvm.umulh.i32(i32, i32)\n'
-              'define ptx_kernel void @scheduler_kernel(ptr addrspace(1) %out, i32 %seed) {\n' +
-              "\n".join(arithmetic + stores) + "\n  ret void\n}\n")
-    return backend, source
-
-
-@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
-@pytest.mark.parametrize("link_hip_first", [False, True])
-def test_nvidia_register_pressure_scheduler_hook(link_hip_first, fresh_triton_cache):
-    backend, source = _register_pressure_scheduler_kernel()
-    if link_hip_first:
-        # HIP linking resets LLVM command-line options.
-        _compile_empty_hip_kernel("gfx942", 64)
-
-    default_options = backend.parse_options({"ptx_version": 80, "sched4reg": False})
-    pressure_options = backend.parse_options({"ptx_version": 80, "sched4reg": True})
-
-    assert default_options.hash() != pressure_options.hash()
-    assert backend.make_ptx(source, {}, default_options, 90) != backend.make_ptx(source, {}, pressure_options, 90)
-
-
-@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
-def test_nvidia_register_pressure_scheduler_concurrent():
-    backend, source = _register_pressure_scheduler_kernel()
-
-    def emit(pressure_sensitive):
-        options = backend.parse_options({"ptx_version": 80, "sched4reg": pressure_sensitive})
-        return backend.make_ptx(source, {}, options, 90)
-
-    expected = {False: emit(False), True: emit(True)}
-    assert expected[False] != expected[True]
-
-    scheduling_policies = [bool(index % 2) for index in range(24)]
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(executor.map(emit, scheduling_policies))
-
-    assert results == [expected[policy] for policy in scheduling_policies]
-
-
-def _nvidia_short_pointer_kernel():
-    from triton.backends.compiler import GPUTarget
-    from triton.backends.nvidia import compiler
-
-    compiler.llvm.init_targets()
-    backend = compiler.CUDABackend(GPUTarget("cuda", 90, 32))
-    source = '''
-target triple = "nvptx64-nvidia-cuda"
-@shared = external addrspace(3) global [0 x i8]
-define ptx_kernel void @short_pointer_kernel(ptr addrspace(1) %out, i64 %offset) {
-  %ptr = getelementptr i8, ptr addrspace(3) @shared, i64 %offset
-  %value = ptrtoint ptr addrspace(3) %ptr to i64
-  store i64 %value, ptr addrspace(1) %out
-  ret void
-}
-'''
-    return backend, source
-
-
-@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
-@pytest.mark.parametrize("link_hip_first", [False, True])
-def test_nvidia_short_pointer_abi(link_hip_first, fresh_triton_cache):
-    from triton.backends.compiler import GPUTarget
-
-    if link_hip_first:
-        # HIP linking resets every LLVM command-line option.
-        _compile_empty_hip_kernel("gfx942", 64)
-
-    @triton.jit
-    def empty_kernel():
-        return
-
-    compiled = triton.compile(triton.compiler.ASTSource(empty_kernel, {}), target=GPUTarget("cuda", 90, 32))
-    data_layout = next(line for line in compiled.asm["llir"].splitlines() if line.startswith("target datalayout"))
-    assert "p3:32:32" in data_layout
-    assert "p5:32:32" in data_layout
-
-    backend, source = _nvidia_short_pointer_kernel()
-    options = backend.parse_options({"ptx_version": 80})
-    ptx = backend.make_ptx(source, {}, options, 90)
-    assert "\tadd.s32 " in ptx
-    assert "\tadd.s64 " not in ptx
-
-
-def _compile_empty_hip_kernel(arch, warp_size):
-    from triton.backends.compiler import GPUTarget
-
-    @triton.jit
-    def empty_kernel():
-        return
-
-    return triton.compile(triton.compiler.ASTSource(empty_kernel, {}), target=GPUTarget("hip", arch, warp_size))
-
-
-def _amd_scheduler_kernel():
-    arithmetic = []
-    stores = []
-    for lane in range(32):
-        arithmetic.extend([
-            f"  %seed{lane} = add i32 %seed, {lane + 1}",
-            f"  %high{lane} = mul i32 %seed{lane}, -766435501",
-            f"  %low{lane} = mul i32 %seed{lane}, -845247145",
-            f"  %value{lane} = xor i32 %high{lane}, %low{lane}",
-        ])
-        stores.extend([
-            f"  %out{lane} = getelementptr i32, ptr addrspace(1) %out, i64 {lane}",
-            f"  store i32 %value{lane}, ptr addrspace(1) %out{lane}, align 4",
-        ])
-
-    return ('target triple = "amdgcn-amd-amdhsa"\n'
-            'define amdgpu_kernel void @scheduler_kernel(ptr addrspace(1) %out, i32 %seed) {\n' +
-            "\n".join(arithmetic + stores) + "\n  ret void\n}\n")
-
-
-def test_amd_llvm_options_concurrent():
-    from triton.backends.compiler import GPUTarget
-    from triton.backends.amd import compiler
-
-    compiler.llvm.init_targets()
-    source = _amd_scheduler_kernel()
-    # gfx950 codegen needs a process-wide LLVM option that CDNA5 codegen must
-    # not see, and every HSACO link resets all LLVM options.
-    backends = {
-        arch: compiler.HIPBackend(GPUTarget("hip", arch, warp_size))
-        for arch, warp_size in [("gfx950", 64), ("gfx1250", 32)]
-    }
-
-    def emit(arch):
-        backend = backends[arch]
-        options = backend.parse_options({})
-        metadata = {}
-        amdgcn = backend.make_amdgcn(source, metadata, options)
-        backend.make_hsaco(amdgcn, metadata, options)
-        return amdgcn
-
-    expected = {arch: emit(arch) for arch in backends}
-    assert expected["gfx950"] != expected["gfx1250"]
-
-    archs = [("gfx950", "gfx1250")[index % 2] for index in range(24)]
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(executor.map(emit, archs))
-
-    assert results == [expected[arch] for arch in archs]
-
-
-@pytest.mark.parametrize(("arch", "enable_fp_fusion", "disable_opt", "expected_flags", "disable_optimization"), [
-    ("gfx90a", True, None, ["instcombine-simplify-vector-elts-depth=32"], False),
-    ("gfx942", False, "1", ["instcombine-simplify-vector-elts-depth=32"], True),
-    ("gfx950", True, "disable-lsr", ["instcombine-simplify-vector-elts-depth=32"], False),
-    ("gfx1250", True, "0", ["instcombine-simplify-vector-elts-depth=32", "amdgpu-anti-hints-for-va-vdst"], False),
-])
-def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags, disable_optimization, fresh_knobs,
-                             monkeypatch):
-    from triton.backends.compiler import GPUTarget
+# Beta enables expert scheduling on CDNA5 by default; upstream does not.
+@pytest.mark.parametrize(
+    ("arch", "enable_fp_fusion", "disable_opt", "expected_flags", "disable_optimization", "extra_options"), [
+        ("gfx90a", True, None, [], False, {}),
+        ("gfx942", False, "1", ["amdgpu-use-amdgpu-trackers"], True, {}),
+        ("gfx950", True, "disable-lsr", ["amdgpu-use-amdgpu-trackers"], False, {}),
+        ("gfx1250", True, "0", ["amdgpu-anti-hints-for-va-vdst", "amdgpu-expert-scheduling-mode"], False, {}),
+        ("gfx1250", True, "0", ["amdgpu-expert-scheduling-mode"], False, {"va_vdst_anti_hints": False}),
+    ])
+def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags, disable_optimization, extra_options,
+                             fresh_knobs, monkeypatch):
     from triton.backends.amd import compiler
 
     calls = []
@@ -260,7 +102,7 @@ def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags
 
     warp_size = 32 if arch == "gfx1250" else 64
     backend = compiler.HIPBackend(GPUTarget("hip", arch, warp_size))
-    options = compiler.HIPOptions(arch=arch, enable_fp_fusion=enable_fp_fusion)
+    options = compiler.HIPOptions(arch=arch, enable_fp_fusion=enable_fp_fusion, **extra_options)
     source = "define amdgpu_kernel void @test_kernel() { ret void }"
     metadata = {}
     assembly = backend.make_amdgcn(source, metadata, options)
@@ -279,23 +121,6 @@ def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags
     assert "s_endpgm" in assembly
 
 
-def test_amd_bitcode_path_override(fresh_knobs, monkeypatch, tmp_path):
-    from triton.backends.amd import compiler
-
-    monkeypatch.delenv("TRITON_AMD_BITCODE_PATH", raising=False)
-    options = compiler.HIPOptions(arch="gfx942")
-    default_dir = Path(compiler.__file__).parent / "lib"
-    libs = dict(options.extern_libs)
-    assert Path(libs["ockl"]) == default_dir / "ockl.bc"
-    assert Path(libs["ocml"]) == default_dir / "ocml.bc"
-
-    monkeypatch.setenv("TRITON_AMD_BITCODE_PATH", str(tmp_path))
-    options = compiler.HIPOptions(arch="gfx942")
-    libs = dict(options.extern_libs)
-    assert Path(libs["ockl"]) == tmp_path / "ockl.bc"
-    assert Path(libs["ocml"]) == tmp_path / "ocml.bc"
-
-
 def test_amd_codegen_path_override(fresh_knobs, monkeypatch):
     from triton.backends.amd import compiler
 
@@ -309,7 +134,6 @@ def test_amd_codegen_path_override(fresh_knobs, monkeypatch):
 
 
 def test_amd_codegen_revision_invalidates_backend_hash(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     monkeypatch.setattr(compiler, "get_amd_codegen_revision", lambda: "first-revision-1")
@@ -324,7 +148,6 @@ def test_amd_codegen_revision_invalidates_backend_hash(fresh_knobs, monkeypatch)
 
 
 def test_amd_codegen_inlines_functions_from_bitcode(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = '''
@@ -378,8 +201,56 @@ def test_amd_codegen_options_restored(option, capfd, fresh_knobs):
     assert not capfd.readouterr().err
 
 
+def test_amd_codegen_explicit_flag_values_restored(fresh_knobs):
+    compiler = pytest.importorskip("triton.backends.amd.compiler")
+    try:
+        compiler._load_amd_codegen(compiler.get_amd_codegen_path())
+    except OSError:
+        pytest.skip("AMD code-generation library is unavailable")
+
+    source = '''
+declare i32 @llvm.amdgcn.workitem.id.x()
+declare <16 x float> @llvm.amdgcn.mfma.scale.f32.32x32x64.f8f6f4.v8i32.v8i32(
+    <8 x i32>, <8 x i32>, <16 x float>, i32 immarg, i32 immarg, i32 immarg, i32, i32 immarg, i32)
+
+define amdgpu_kernel void @mfma_kernel(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out) {
+  %lane = call i32 @llvm.amdgcn.workitem.id.x()
+  %a_ptr = getelementptr <8 x i32>, ptr addrspace(1) %a, i32 %lane
+  %b_ptr = getelementptr <8 x i32>, ptr addrspace(1) %b, i32 %lane
+  %a_value = load <8 x i32>, ptr addrspace(1) %a_ptr, align 8
+  %b_value = load <8 x i32>, ptr addrspace(1) %b_ptr, align 8
+  %seed = call <16 x float> asm sideeffect "", "=a,0"(<16 x float> zeroinitializer)
+  %result = call <16 x float> @llvm.amdgcn.mfma.scale.f32.32x32x64.f8f6f4.v8i32.v8i32(
+      <8 x i32> %a_value, <8 x i32> %b_value, <16 x float> %seed,
+      i32 0, i32 0, i32 0, i32 127, i32 0, i32 127)
+  %committed = call <16 x float> asm sideeffect "", "=a,0"(<16 x float> %result)
+  %out_ptr = getelementptr <16 x float>, ptr addrspace(1) %out, i32 %lane
+  store <16 x float> %committed, ptr addrspace(1) %out_ptr, align 16
+  ret void
+}
+'''
+
+    def emit(flags):
+        return compiler.compile_amdgpu(source, compiler.amd.get_target_triple("gfx950"), "gfx950", "", flags=flags,
+                                       enable_fp_fusion=True, disable_optimization=False, canonicalize_gep=False,
+                                       disabled_passes="", dump_ir=False, enable_timing=False)
+
+    baseline = emit([])
+    flag = "amdgpu-mfma-vgpr-form"
+    opcode = "v_mfma_scale_f32_32x32x64_f8f6f4"
+    assert opcode in baseline
+    for value in (flag, f"{flag}=true"):
+        assert emit([value]) == baseline
+    agpr = emit([f"{flag}=false"])
+    assert opcode in agpr
+    baseline_vgprs = re.search(r"\.amdhsa_next_free_vgpr\s+(\d+)", baseline)
+    agpr_vgprs = re.search(r"\.amdhsa_next_free_vgpr\s+(\d+)", agpr)
+    assert baseline_vgprs is not None and agpr_vgprs is not None
+    assert int(agpr_vgprs.group(1)) < int(baseline_vgprs.group(1))
+    assert emit([]) == baseline
+
+
 def test_amd_codegen_reports_invalid_llvm_ir(fresh_knobs):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = "define amdgpu_kernel void @invalid_kernel() { invalid }"
@@ -389,7 +260,6 @@ def test_amd_codegen_reports_invalid_llvm_ir(fresh_knobs):
 
 
 def test_amd_codegen_assembles_object_with_private_llvm(fresh_knobs):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = '''
@@ -408,7 +278,6 @@ define amdgpu_kernel void @object_kernel() {
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_amd_codegen_respects_mir_dump_knob(enabled, fresh_knobs, monkeypatch, tmp_path):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     events = []
@@ -431,7 +300,6 @@ def test_amd_codegen_respects_mir_dump_knob(enabled, fresh_knobs, monkeypatch, t
 
 
 def test_amd_codegen_preserves_mir_replacement(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     replacement_calls = []
@@ -453,6 +321,24 @@ def test_amd_codegen_preserves_mir_replacement(fresh_knobs, monkeypatch):
     assert replacement_calls[0][0].startswith("/custom/mir/test_kernel_")
     assert replacement_calls[0][0].endswith(".txt")
     assert "s_endpgm" in assembly
+
+
+@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
+def test_nvidia_register_pressure_scheduler_concurrent():
+    backend, source = _register_pressure_scheduler_kernel()
+
+    def emit(pressure_sensitive):
+        options = backend.parse_options({"ptx_version": 80, "sched4reg": pressure_sensitive})
+        return backend.make_ptx(source, {}, options, 90)
+
+    expected = {False: emit(False), True: emit(True)}
+    assert expected[False] != expected[True]
+
+    scheduling_policies = [bool(index % 2) for index in range(24)]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(emit, scheduling_policies))
+
+    assert results == [expected[policy] for policy in scheduling_policies]
 
 
 def _loop_strength_reduction_kernel():
@@ -531,13 +417,11 @@ def test_knobs_scope(fresh_knobs, monkeypatch):
 
     assert fresh_knobs.amd.use_buffer_atomics
 
-    # Just to prove that buffer_ops_analyze_small_tensor_range is coming from env
-    monkeypatch.setenv("AMDGCN_ANALYZE_SMALL_TENSOR_RANGE", "1")
-    assert fresh_knobs.amd.buffer_ops_analyze_small_tensor_range
-    monkeypatch.delenv("AMDGCN_ANALYZE_SMALL_TENSOR_RANGE")
-    assert not fresh_knobs.amd.buffer_ops_analyze_small_tensor_range
-
-    fresh_knobs.amd.use_buffer_ops = True
+    # Just to prove that use_buffer_ops is coming from env
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", "0")
+    assert not fresh_knobs.amd.use_buffer_ops
+    monkeypatch.delenv("AMDGCN_USE_BUFFER_OPS")
+    assert fresh_knobs.amd.use_buffer_ops
 
     with fresh_knobs.amd.scope():
         # Use the environment
@@ -550,42 +434,43 @@ def test_knobs_scope(fresh_knobs, monkeypatch):
     assert fresh_knobs.amd.use_buffer_atomics
     assert fresh_knobs.amd.use_buffer_ops
 
-    # Just to prove that buffer_ops_analyze_small_tensor_range is coming from env
-    monkeypatch.setenv("AMDGCN_ANALYZE_SMALL_TENSOR_RANGE", "1")
-    assert fresh_knobs.amd.buffer_ops_analyze_small_tensor_range
-    monkeypatch.delenv("AMDGCN_ANALYZE_SMALL_TENSOR_RANGE")
-    assert not fresh_knobs.amd.buffer_ops_analyze_small_tensor_range
-
-
-def test_use_buffer_ops_is_read_once(fresh_knobs, monkeypatch):
-    # use_buffer_ops is read at import time, only refresh_knobs() re-reads it
-    monkeypatch.delenv("AMDGCN_USE_BUFFER_OPS", raising=False)
-    triton.knobs.refresh_knobs()
-    assert fresh_knobs.amd.use_buffer_ops
-
+    # Just to prove that use_buffer_ops is coming from env
     monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", "0")
-    assert fresh_knobs.amd.use_buffer_ops
-    triton.knobs.refresh_knobs()
     assert not fresh_knobs.amd.use_buffer_ops
-
     monkeypatch.delenv("AMDGCN_USE_BUFFER_OPS")
-    triton.knobs.refresh_knobs()
     assert fresh_knobs.amd.use_buffer_ops
 
-    # Explicit assignment still wins
-    fresh_knobs.amd.use_buffer_ops = False
-    assert not fresh_knobs.amd.use_buffer_ops
+
+def test_shared_runtime_knob_aliases():
+    from triton import knobs
+
+    with knobs.runtime.scope():
+        knobs.runtime.use_triton_dispatcher = True
+        assert knobs.nvidia.use_triton_dispatcher
+        knobs.nvidia.use_triton_dispatcher = False
+        assert not knobs.runtime.use_triton_dispatcher
 
 
 def test_env_updated(fresh_knobs, monkeypatch):
-    fresh_knobs.amd.use_buffer_atomics = False
-    assert os.getenv("AMDGCN_USE_BUFFER_ATOMICS") == "0"
+    fresh_knobs.amd.use_buffer_ops = False
+    assert os.getenv("AMDGCN_USE_BUFFER_OPS") == "0"
     # Just triple checking both APIs give us what we expect
-    assert os.environ["AMDGCN_USE_BUFFER_ATOMICS"] == "0"
+    assert os.environ["AMDGCN_USE_BUFFER_OPS"] == "0"
 
     fresh_knobs.cache.home_dir = "/foo/bar"
     assert os.getenv("TRITON_HOME") == "/foo/bar"
     assert os.environ["TRITON_HOME"] == "/foo/bar"
+
+
+def test_scalarize_packed_fops_invalidates_cache(monkeypatch):
+    monkeypatch.setenv("AMDGCN_SCALARIZE_PACKED_FOPS", "0")
+    disabled = get_cache_invalidating_env_vars()
+
+    monkeypatch.setenv("AMDGCN_SCALARIZE_PACKED_FOPS", "1")
+    enabled = get_cache_invalidating_env_vars()
+
+    assert disabled["AMDGCN_SCALARIZE_PACKED_FOPS"] == "false"
+    assert enabled["AMDGCN_SCALARIZE_PACKED_FOPS"] == "true"
 
 
 @pytest.mark.parametrize("truthy, falsey", [("1", "0"), ("true", "false"), ("True", "False"), ("TRUE", "FALSE"),
@@ -594,8 +479,9 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     fresh_knobs = fresh_knobs_including_libraries
     # bool defaulting to False
     assert not fresh_knobs.runtime.debug
-    assert not fresh_knobs.language.default_fp_fusion
-    assert not fresh_knobs.language.allow_fp_fusion
+    # bool defaulting to True
+    assert fresh_knobs.language.default_fp_fusion
+    assert not fresh_knobs.language.force_disable_fp_fusion
     # str defaulting to None
     assert fresh_knobs.compilation.use_ir_loc is None
     # str defaulting to not None
@@ -606,7 +492,7 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     assert len(fresh_knobs.build.backend_dirs) == 0
 
     monkeypatch.setenv("TRITON_DEFAULT_FP_FUSION", falsey)
-    monkeypatch.setenv("TRITON_ALLOW_FP_FUSION", truthy)
+    monkeypatch.setenv("TRITON_FORCE_DISABLE_FP_FUSION", truthy)
     monkeypatch.setenv("TRITON_DEBUG", truthy)
     monkeypatch.setenv("USE_IR_LOC", "ttir")
     monkeypatch.setenv("TRITON_CACHE_DIR", "/tmp/triton_cache")
@@ -618,7 +504,7 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     triton.knobs.refresh_knobs()
     assert fresh_knobs.runtime.debug
     assert not fresh_knobs.language.default_fp_fusion
-    assert fresh_knobs.language.allow_fp_fusion
+    assert fresh_knobs.language.force_disable_fp_fusion
     assert fresh_knobs.compilation.use_ir_loc == "ttir"
     assert fresh_knobs.cache.home_dir == "/tmp/triton_home"
     assert fresh_knobs.cache.dir == "/tmp/triton_cache"
@@ -630,6 +516,148 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     assert fresh_knobs.cache.manager_class == FileCacheManager
 
     assert fresh_knobs.build.backend_dirs == {"/tmp/cuda/crt", "/tmp/cuda/rt"}
+
+
+def _register_pressure_scheduler_kernel():
+    from triton.backends.nvidia import compiler
+
+    compiler.llvm.init_targets()
+    backend = compiler.CUDABackend(GPUTarget("cuda", 90, 32))
+    arithmetic = []
+    stores = []
+    for lane in range(32):
+        arithmetic.extend([
+            f"  %seed{lane} = add i32 %seed, {lane + 1}",
+            f"  %high{lane} = call i32 @llvm.umulh.i32(i32 %seed{lane}, i32 -766435501)",
+            f"  %low{lane} = mul i32 %seed{lane}, -845247145",
+            f"  %value{lane} = xor i32 %high{lane}, %low{lane}",
+        ])
+        stores.extend([
+            f"  %out{lane} = getelementptr i32, ptr addrspace(1) %out, i64 {lane}",
+            f"  store i32 %value{lane}, ptr addrspace(1) %out{lane}, align 4",
+        ])
+
+    source = ('target triple = "nvptx64-nvidia-cuda"\n'
+              'declare i32 @llvm.umulh.i32(i32, i32)\n'
+              'define ptx_kernel void @scheduler_kernel(ptr addrspace(1) %out, i32 %seed) {\n' +
+              "\n".join(arithmetic + stores) + "\n  ret void\n}\n")
+    return backend, source
+
+
+@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
+@pytest.mark.parametrize("link_hip_first", [False, True])
+def test_nvidia_register_pressure_scheduler_hook(link_hip_first, fresh_triton_cache):
+    backend, source = _register_pressure_scheduler_kernel()
+    if link_hip_first:
+        # HIP linking resets LLVM command-line options.
+        _compile_empty_hip_kernel("gfx942", 64)
+
+    default_options = backend.parse_options({"ptx_version": 80, "sched4reg": False})
+    pressure_options = backend.parse_options({"ptx_version": 80, "sched4reg": True})
+    default_ptx = backend.make_ptx(source, {}, default_options, 90)
+    pressure_ptx = backend.make_ptx(source, {}, pressure_options, 90)
+    assert default_ptx != pressure_ptx
+
+
+def _nvidia_short_pointer_kernel():
+    from triton.backends.nvidia import compiler
+
+    compiler.llvm.init_targets()
+    backend = compiler.CUDABackend(GPUTarget("cuda", 90, 32))
+    source = '''
+target triple = "nvptx64-nvidia-cuda"
+@shared = external addrspace(3) global [0 x i8]
+define ptx_kernel void @short_pointer_kernel(ptr addrspace(1) %out, i64 %offset) {
+  %ptr = getelementptr i8, ptr addrspace(3) @shared, i64 %offset
+  %value = ptrtoint ptr addrspace(3) %ptr to i64
+  store i64 %value, ptr addrspace(1) %out
+  ret void
+}
+'''
+    return backend, source
+
+
+@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
+@pytest.mark.parametrize("link_hip_first", [False, True])
+def test_nvidia_short_pointer_abi(link_hip_first, fresh_triton_cache):
+
+    if link_hip_first:
+        # HIP linking resets every LLVM command-line option.
+        _compile_empty_hip_kernel("gfx942", 64)
+
+    @triton.jit
+    def empty_kernel():
+        return
+
+    compiled = triton.compile(triton.compiler.ASTSource(empty_kernel, {}), target=GPUTarget("cuda", 90, 32))
+    data_layout = next(line for line in compiled.asm["llir"].splitlines() if line.startswith("target datalayout"))
+    assert "p3:32:32" in data_layout
+    assert "p5:32:32" in data_layout
+
+    backend, source = _nvidia_short_pointer_kernel()
+    options = backend.parse_options({"ptx_version": 80})
+    ptx = backend.make_ptx(source, {}, options, 90)
+    assert "\tadd.s32 " in ptx
+    assert "\tadd.s64 " not in ptx
+
+
+def _compile_empty_hip_kernel(arch, warp_size):
+
+    @triton.jit
+    def empty_kernel():
+        return
+
+    return triton.compile(triton.compiler.ASTSource(empty_kernel, {}), target=GPUTarget("hip", arch, warp_size))
+
+
+def _amd_scheduler_kernel():
+    arithmetic = []
+    stores = []
+    for lane in range(32):
+        arithmetic.extend([
+            f"  %seed{lane} = add i32 %seed, {lane + 1}",
+            f"  %high{lane} = mul i32 %seed{lane}, -766435501",
+            f"  %low{lane} = mul i32 %seed{lane}, -845247145",
+            f"  %value{lane} = xor i32 %high{lane}, %low{lane}",
+        ])
+        stores.extend([
+            f"  %out{lane} = getelementptr i32, ptr addrspace(1) %out, i64 {lane}",
+            f"  store i32 %value{lane}, ptr addrspace(1) %out{lane}, align 4",
+        ])
+
+    return ('target triple = "amdgcn-amd-amdhsa"\n'
+            'define amdgpu_kernel void @scheduler_kernel(ptr addrspace(1) %out, i32 %seed) {\n' +
+            "\n".join(arithmetic + stores) + "\n  ret void\n}\n")
+
+
+def test_amd_llvm_options_concurrent():
+    from triton.backends.amd import compiler
+
+    compiler.llvm.init_targets()
+    source = _amd_scheduler_kernel()
+    # gfx950 codegen needs a process-wide LLVM option that CDNA5 codegen must
+    # not see, and every HSACO link resets all LLVM options.
+    backends = {
+        arch: compiler.HIPBackend(GPUTarget("hip", arch, warp_size))
+        for arch, warp_size in [("gfx950", 64), ("gfx1250", 32)]
+    }
+
+    def emit(arch):
+        backend = backends[arch]
+        options = backend.parse_options({})
+        metadata = {}
+        amdgcn = backend.make_amdgcn(source, metadata, options)
+        backend.make_hsaco(amdgcn, metadata, options)
+        return amdgcn
+
+    expected = {arch: emit(arch) for arch in backends}
+    assert expected["gfx950"] != expected["gfx1250"]
+
+    archs = [("gfx950", "gfx1250")[index % 2] for index in range(24)]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(emit, archs))
+
+    assert results == [expected[arch] for arch in archs]
 
 
 def test_triton_home(fresh_knobs, monkeypatch):
@@ -760,6 +788,118 @@ def test_nvidia_tool(fresh_knobs, tmp_path, monkeypatch):
     assert fresh_knobs.nvidia.ptxas_options is None
 
 
+def _fake_tool(path, body):
+    """A stand-in for ptxas: a script running `body` under this interpreter."""
+    path.write_text(f"#!{sys.executable}\nimport sys\n{body}\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_nvidia_tool_probe_reports_reason(tmp_path):
+    probe = triton.knobs.NvidiaTool.probe
+
+    tool, reason = probe(str(tmp_path / "absent"))
+    assert tool is None
+    assert reason == "no such file"
+
+    # The case that motivated this: present and executable, but killed at exec.
+    broken = _fake_tool(tmp_path / "broken", 'sys.stderr.write("undefined symbol: unw_backtrace\\n"); sys.exit(127)')
+    tool, reason = probe(str(broken))
+    assert tool is None
+    assert "exited with status 127" in reason
+    assert "undefined symbol: unw_backtrace" in reason
+
+    # Executable, but not a runnable image: exec fails with ENOEXEC, an OSError
+    # that is not FileNotFoundError, and it has to come back as a reason rather
+    # than propagate out of the candidate loop. ENOEXEC rather than a cleared
+    # execute bit so the case does not depend on who runs the test.
+    not_a_binary = tmp_path / "not-a-binary"
+    not_a_binary.write_bytes(b"\x7fnot an ELF header\n")
+    not_a_binary.chmod(0o755)
+    tool, reason = probe(str(not_a_binary))
+    assert tool is None
+    assert reason.startswith("cannot execute: ")
+
+    unparseable = _fake_tool(tmp_path / "unparseable", 'print("not a version string")')
+    tool, reason = probe(str(unparseable))
+    assert tool is None
+    assert "release X.Y" in reason
+
+    good = _fake_tool(tmp_path / "good", 'print("Cuda compilation tools, release 12.8, V12.8.93")')
+    tool, reason = probe(str(good))
+    assert reason is None
+    assert tool.version == "12.8"
+
+
+def test_nvidia_tool_probe_truncates_output(tmp_path):
+    noisy = _fake_tool(tmp_path / "noisy", 'sys.stderr.write("E" * 100000); sys.exit(1)')
+    _, reason = triton.knobs.NvidiaTool.probe(str(noisy))
+    assert len(reason) < 4096
+    assert reason.startswith("`--version` exited with status 1: ...")
+
+
+def test_nvidia_tool_error_lists_all_candidates(fresh_knobs, tmp_path, monkeypatch):
+    broken = _fake_tool(tmp_path / "broken-ptxas", 'sys.stderr.write("boom\\n"); sys.exit(127)')
+    absent = tmp_path / "absent-ptxas"
+
+    # Both candidates must fail for transform() to raise.
+    monkeypatch.setattr(type(fresh_knobs.nvidia).__dict__["ptxas"], "default_path", str(absent))
+    monkeypatch.setenv("TRITON_PTXAS_PATH", str(broken))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        fresh_knobs.nvidia.ptxas
+
+    msg = str(excinfo.value)
+    assert "Cannot find ptxas" in msg
+    # The interpreter running the fake tool is free to add its own noise to the
+    # captured stream, so `boom` is not necessarily flush against the status --
+    # only assert it lands in the broken candidate's reason.
+    broken_prefix = f"{broken}: `--version` exited with status 127:"
+    absent_reason = f"{absent}: no such file"
+    assert broken_prefix in msg
+    assert absent_reason in msg
+    broken_reason = msg.split(broken_prefix, 1)[1].split(absent_reason, 1)[0]
+    assert "boom" in broken_reason
+
+
+def test_nvidia_tool_env_hook(fresh_knobs, tmp_path, monkeypatch):
+    # A tool that dies unless a specific variable is scrubbed from its
+    # environment -- the shape of an inherited LD_PRELOAD that only resolves
+    # inside the host interpreter.
+    poison = "TRITON_TEST_POISONED_ENV"
+    tool = _fake_tool(
+        tmp_path / "ptxas", 'import os\n'
+        f'if os.environ.get("{poison}"):\n'
+        '    sys.stderr.write("undefined symbol: unw_backtrace\\n"); sys.exit(127)\n'
+        'print("Cuda compilation tools, release 12.8, V12.8.93")')
+    monkeypatch.setenv(poison, "1")
+
+    # Drive both directions explicitly rather than relying on the ambient value:
+    # `fresh_knobs` deliberately does not reset `nvidia`, and a packager may have
+    # installed a hook at import (fbcode's `set_configs()` does). `scope()`
+    # snapshots `nvidia.__dict__` and restores it on exit, so whatever was
+    # installed survives this test.
+    with fresh_knobs.nvidia.scope():
+        # No hook: the environment is inherited as-is, so the tool dies.
+        fresh_knobs.nvidia.tool_env = None
+        assert fresh_knobs.nvidia.get_tool_env() is None
+        triton.knobs.NvidiaTool.probe.cache_clear()
+        tool_obj, reason = triton.knobs.NvidiaTool.probe(str(tool))
+        assert tool_obj is None
+        assert "unw_backtrace" in reason
+
+        # With a hook that scrubs the marker, the same tool resolves.
+        fresh_knobs.nvidia.tool_env = lambda: {k: v for k, v in os.environ.items() if k != poison}
+        triton.knobs.NvidiaTool.probe.cache_clear()
+        tool_obj, reason = triton.knobs.NvidiaTool.probe(str(tool))
+        assert reason is None
+        assert tool_obj.version == "12.8"
+
+    # `probe` is lru_cached per path and the cache is process-wide; don't leave
+    # entries behind that were resolved under this test's hook.
+    triton.knobs.NvidiaTool.probe.cache_clear()
+
+
 def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
     fresh_knobs = fresh_knobs_including_libraries
     assert fresh_knobs.amd.use_block_pingpong is None
@@ -769,3 +909,46 @@ def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
     assert fresh_knobs.amd.use_block_pingpong
     monkeypatch.delenv("TRITON_HIP_USE_BLOCK_PINGPONG")
     assert fresh_knobs.amd.use_block_pingpong is None
+
+
+def test_autotune_warmup_rep_defaults(fresh_knobs):
+    assert fresh_knobs.autotuning.warmup == 25
+    assert fresh_knobs.autotuning.rep == 100
+
+
+def test_autotune_warmup_rep_env(fresh_knobs, monkeypatch):
+    monkeypatch.setenv("TRITON_AUTOTUNE_WARMUP_MS", "50")
+    monkeypatch.setenv("TRITON_AUTOTUNE_REP_MS", "200")
+    assert fresh_knobs.autotuning.warmup == 50
+    assert fresh_knobs.autotuning.rep == 200
+
+
+def test_autotune_warmup_rep_set_directly(fresh_knobs):
+    fresh_knobs.autotuning.warmup = 10
+    fresh_knobs.autotuning.rep = 40
+    assert fresh_knobs.autotuning.warmup == 10
+    assert fresh_knobs.autotuning.rep == 40
+
+
+def test_autotune_warmup_rep_reset(fresh_knobs, monkeypatch):
+    triton.knobs.propagate_env = False
+    fresh_knobs.autotuning.warmup = 10
+    fresh_knobs.autotuning.rep = 40
+    fresh_knobs.autotuning.reset()
+    assert fresh_knobs.autotuning.warmup == 25
+    assert fresh_knobs.autotuning.rep == 100
+    triton.knobs.propagate_env = True
+
+
+def test_autotune_warmup_rep_scope(fresh_knobs, monkeypatch):
+    fresh_knobs.autotuning.warmup = 10
+    fresh_knobs.autotuning.rep = 40
+
+    with fresh_knobs.autotuning.scope():
+        fresh_knobs.autotuning.warmup = 77
+        fresh_knobs.autotuning.rep = 88
+        assert fresh_knobs.autotuning.warmup == 77
+        assert fresh_knobs.autotuning.rep == 88
+
+    assert fresh_knobs.autotuning.warmup == 10
+    assert fresh_knobs.autotuning.rep == 40

@@ -4,17 +4,21 @@
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir {
+class LoopLikeOpInterface;
 class Operation;
 class OpOperand;
 class OpResult;
-class LoopLikeOpInterface;
+class Region;
 namespace scf {
 class ForOp;
 class WhileOp;
 } // namespace scf
 } // namespace mlir
+
+static constexpr char kPartitionTypesAttrName[] = "ttg.partition.types";
 
 //===----------------------------------------------------------------------===//
 // PartitionSet
@@ -35,6 +39,8 @@ public:
   ArrayRef<Operation *> getOps() const { return ops; }
   void addOp(Operation *op) { ops.push_back(op); }
   bool hasOp(Operation *op) const;
+  StringRef getType() const { return type; }
+  void setType(StringRef t) { type = t.str(); }
   bool empty() const { return ops.empty(); }
 
   // Iterate the inputs of the partition. Input values are those that originate
@@ -52,7 +58,7 @@ public:
                  function_ref<void(Operation *, OpOperand &)> callback) const;
   // Iterate the defining ops of the inputs to the partition in the current and
   // previous iterations, including the distance in the past.
-  void iterateDefs(scf::ForOp loop,
+  void iterateDefs(LoopLikeOpInterface loop,
                    function_ref<void(OpResult, unsigned)> callback) const;
   void iterateDefs(scf::WhileOp loop,
                    function_ref<void(OpResult, unsigned)> callback) const;
@@ -63,6 +69,7 @@ public:
       function_ref<void(OpResult, OpOperand &, unsigned)> callback) const;
 
 private:
+  friend class PartitionSet;
   void setIndex(int idx) { this->idx = idx; }
 
   // The partition number.
@@ -71,6 +78,8 @@ private:
   int stage;
   // The ops in the partition.
   SmallVector<Operation *> ops;
+  // The type of the partition (e.g., "gemm", "load", "reduction", "default").
+  std::string type;
 };
 
 // A partition set divides a loop into multiple partitions. Ops in a loop are
@@ -99,11 +108,17 @@ public:
   // attributes tagged on operations in its regions.
   static FailureOr<PartitionSet> fromLoop(LoopLikeOpInterface loop);
 
+  // Serialize the partition set to the loop attributes.
+  void serialize(LoopLikeOpInterface loop) const;
+
   // Debug dump the partition set.
   LLVM_DUMP_METHOD void dump() const;
 
   // Utility to be used when the op is known to belong to one partition
   Partition *getPartition(Operation *op);
+
+  // Swap two partitions' indices and update all op annotations in the loop.
+  void swapPartitions(unsigned idxA, unsigned idxB, LoopLikeOpInterface loop);
 
 private:
   // WarpSpecialization tag
@@ -119,6 +134,7 @@ void setPartition(Operation *op, const SetVector<Partition *> &partitions);
 // Annotate the op with the partition indices. It should only be used in a pass
 // which does not work with Partition instances and iterate* functions, since
 // it does not keep the op attributes and the op list of a partition in sync.
+void setPartition(Operation *op, ArrayRef<int> partitionIds);
 void setPartition(Operation *op, const SetVector<int> &partitionIds);
 void setPartitionOutputs(Operation *op,
                          ArrayRef<SetVector<int>> partitionOutputsIds);

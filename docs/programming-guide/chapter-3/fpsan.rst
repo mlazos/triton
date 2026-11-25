@@ -311,7 +311,7 @@ Exact preserved properties:
 - ``exp2(-x) = 1.0 / exp2(x)``
 
 ``exp``
-=======
+-------
 
 Supported operation:
 

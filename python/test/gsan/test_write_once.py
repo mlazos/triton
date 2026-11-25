@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 import torch
 import triton
@@ -11,6 +14,10 @@ from triton._internal_testing import is_blackwell, is_cuda, is_hopper_or_newer, 
 from triton.experimental.gsan import create_mem_pool
 from triton.experimental.gsan._testing_utils import shadow_cell_from_address, shadow_tensor_for
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+# The fast runner collects with --import-mode=importlib, which does not put
+# this directory on sys.path. Keep the sibling import working there.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_gsan import (
     _device_tma_masked_load_kernel,
     _device_tma_masked_store_kernel,

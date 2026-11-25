@@ -119,9 +119,6 @@ TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(
   ModuleOp mod = op->getParentOfType<ModuleOp>();
   auto targetAttr = mod->getAttrOfType<StringAttr>(gpu::AttrTargetName);
   bool isRubin = targetAttr && targetAttr.getValue() == "cuda:107";
-  // Rubin NVFP4 uses different orders for A and B:
-  // A scales must advance along K before the next M tile, while B scales keep
-  // the default order that advances along N before the next K tile.
   bool isRubinNVFP4xNVFP4 = isRubin && aType == ScaleDotElemType::E2M1 &&
                             bType == ScaleDotElemType::E2M1 &&
                             isa<Float8E4M3FNType>(aScaleElemType) &&
@@ -185,7 +182,7 @@ uint32_t getTMemSubSliceOffset(MemDescType memDescType, int32_t offset,
 }
 
 LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
-                           bool withWarp) {
+                           bool withWarp, int numWarpBases) {
   auto str_attr = [&](StringRef str) { return StringAttr::get(ctx, str); };
   auto kReg = str_attr("register");
   auto kLane = str_attr("lane");
@@ -222,8 +219,9 @@ LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
   if (withWarp) {
     auto nCol = tile.getOutDimSize(kCol);
     auto bases = tile.getBases();
-    bases[kWarp].push_back({32, 0});
-    bases[kWarp].push_back({64, 0});
+    auto &warpBases = bases[kWarp];
+    for (int i = 0; i < numWarpBases; ++i)
+      warpBases.push_back({32 << i, 0});
     tile = LinearLayout(std::move(bases), {{kRow, 128}, {kCol, nCol}}, false);
   }
   return tile;
@@ -388,6 +386,27 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
          "numWarps must be a power of 2 and >= 4");
   assert(atom != TMemAccessAtom::I16x32bx2 &&
          "This layout is inferred sometimes for the 32x32b atom");
+  // NPOT N (or scale MN): the pow2 chunk's layout times the odd part as the
+  // outermost register digit, the form computeTMemLdStEncodingInfo lowers.
+  auto shape = memType.getShape().take_back(2);
+  FailureOr<gpu::MemDescType> chunkTy = failure();
+  if (!llvm::all_of(shape, llvm::isPowerOf2_64))
+    chunkTy = getNpotTMemChunkType(memType);
+  if (succeeded(chunkTy)) {
+    auto chunk = getDistributedLayoutForTmemLdSt(*chunkTy, atom, numWarps);
+    if (!chunk)
+      return std::nullopt;
+    auto kReg = StringAttr::get(memType.getContext(), "register");
+    int d = chunkTy->getShape()[0] == shape[0] ? 1 : 0;
+    int32_t odd = shape[d] / chunkTy->getShape()[d];
+    LinearLayout::BasesT bases;
+    bases[kReg] = {{1}};
+    LinearLayout::RadicesT radices;
+    radices[kReg] = {odd};
+    auto dims = to_vector(chunk->getOutDimNames());
+    return *chunk * LinearLayout(std::move(bases), std::move(radices),
+                                 {{dims[d], odd}}, /*requireSurjective=*/true);
+  }
   auto ll = toLinearLayout(memType);
   auto bitwidth = memType.getElementTypeBitWidth();
   return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, bitwidth);
@@ -439,7 +458,8 @@ getTmemLoadLayoutSplitLongM(RankedTensorType tensorType, MemDescType memType,
       std::swap(bases[kWarp][2], bases[kLane][4]);
       return LinearEncodingAttr::get(
           tensorType.getContext(),
-          LinearLayout(std::move(bases), ret.getOutDims(), ret.isSurjective()));
+          LinearLayout(std::move(bases), ret.getInputRadices(),
+                       ret.getOutDims(), ret.isSurjective()));
     }
   }
   return std::nullopt;
@@ -478,18 +498,22 @@ bool isDistributedLayoutTMemCompatible(Operation *op,
 LogicalResult TensorMemoryEncodingAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, unsigned blockM,
     unsigned blockN, unsigned colStride, gpu::CGAEncodingAttr cgaLayout,
-    bool twoCTAs, bool fp4Padded) {
+    bool twoCTAs, TensorMemoryCTAMode, bool fp4Padded) {
   if (cgaLayout.getRank() != 2) {
     return emitError() << "CGALayout must have rank 2";
   }
   if (twoCTAs) {
+    // twoCTAs does not imply a sharded accumulator: num_ctas>1 shards it across
+    // the cluster (block axis = [1,0]), while ctas_per_cga with num_ctas==1
+    // keeps it single-CTA (empty block axis). Only check the shard direction
+    // when a shard exists -- never getBasis() an empty axis.
     auto kBlock = StringAttr::get(cgaLayout.getContext(), "block");
     auto cgaLL = cgaLayout.getLinearLayout();
-    if (cgaLL.getInDimSizeLog2(kBlock) == 0 ||
+    if (cgaLL.hasInDim(kBlock) && cgaLL.getInDimSizeLog2(kBlock) >= 1 &&
         cgaLL.getBasis(kBlock, 0) != ArrayRef{1, 0}) {
       return emitError()
-             << "twoCTAs layout requires the first CGALayout block basis to "
-                "be [1, 0]";
+             << "twoCTAs layout with a CTA shard requires the first CGALayout "
+                "block basis to be [1, 0]";
     }
   }
   if (blockM != 64 && blockM != 128) {
@@ -516,9 +540,15 @@ LogicalResult TensorMemoryEncodingAttr::verify(
 
 LogicalResult TensorMemoryScalesEncodingAttr::verify(
     function_ref<InFlightDiagnostic()> emitError,
-    gpu::CGAEncodingAttr cgaLayout, TensorMemoryScalesBlockRepOrder) {
+    gpu::CGAEncodingAttr cgaLayout, TensorMemoryScalesBlockRepOrder,
+    TensorMemoryCTAMode ctaMode) {
   if (cgaLayout.getRank() != 2) {
     return emitError() << "CGALayout must have rank 2";
+  }
+  if (ctaMode != TensorMemoryCTAMode::DEFAULT &&
+      ctaMode != TensorMemoryCTAMode::TwoCTA_RHS) {
+    return emitError()
+           << "scale layout only supports default or twocta_rhs CTA mode";
   }
   return success();
 }
@@ -553,13 +583,32 @@ LogicalResult impl::verifyMMAv5Op(Operation *op) {
   if (encoding.getFp4Padded())
     return op->emitOpError("accumulator layout must not be fp4_padded");
 
+  // NOTE(TLX): the layout-compatibility checks below assume upstream's
+  // twoCTAs encoding convention (CTA pairs in B, matching D twoCTAs, ...).
+  // TLX two-CTA mode sets the op flag without propagating twoCTAs into the
+  // encodings, so it violates them by design; skip them on mismatch. This
+  // subsumes the accumulator-CTA-group match check. Re-enable once TLX
+  // adopts upstream's CGAEncodingAttr convention.
+  if (encoding.getTwoCTAs() != itf.getTwoCtas())
+    return success();
+
   if (aType.getElementType().isF32()) {
     auto aAttrs = isa<NVMMASharedEncodingAttr, SharedLinearEncodingAttr>(
                       aType.getEncoding())
                       ? getNvmmaSmemAttrs(aType)
                       : std::nullopt;
     auto bAttrs = getNvmmaSmemAttrs(bType);
-    if ((aAttrs && aAttrs->transposed) || (bAttrs && !bAttrs->transposed))
+    // The 32-byte swizzle atomicity requirement binds unswizzled 32-bit
+    // swizzle units; fork layouts bank f32 data through 16-bit units or
+    // swizzled 32-bit descriptors, which lower fine and are exempt here.
+    auto needsAtomicity = [](MemDescType t) {
+      if (auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(t.getEncoding()))
+        return nvmma.getElementBitWidth() == 32 &&
+               nvmma.getSwizzlingByteWidth() == 0;
+      return true;
+    };
+    if ((aAttrs && aAttrs->transposed && needsAtomicity(aType)) ||
+        (bAttrs && !bAttrs->transposed && needsAtomicity(bType)))
       return op->emitOpError(
           "transposed float32 shared-memory operands require "
           "unsupported 32-byte swizzle atomicity");
@@ -567,16 +616,21 @@ LogicalResult impl::verifyMMAv5Op(Operation *op) {
 
   auto isInterleaved = [](MemDescType memdesc) {
     auto enc = dyn_cast<TensorMemoryEncodingAttr>(memdesc.getEncoding());
-    return enc && enc.getBlockM() == 64 &&
-           getTmemAllocSizes(memdesc).numRows != 64;
+    if (!enc)
+      return false;
+    if (enc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_LHS ||
+        enc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS) {
+      return false;
+    }
+    return enc && getTmemAllocSizes(memdesc).numRows != 64 &&
+           enc.getBlockM() == 64;
   };
 
   if (isInterleaved(aType) && isInterleaved(dType)) {
     return op->emitOpError(
         "does not support blockM=64 with interleaved blocks in TMEM layout");
   }
-  if (encoding.getTwoCTAs() != itf.getTwoCtas())
-    return op->emitOpError("accumulator layout must match the MMA CTA group");
+  // (Accumulator-CTA-group match is subsumed by the mismatch exemption above.)
 
   auto *ctx = op->getContext();
   auto dims = standardOutDimNames(ctx, 2);
@@ -625,24 +679,32 @@ LogicalResult impl::verifyMMAv5Op(Operation *op) {
           "two-CTA MMA requires a single instruction along N");
     auto bLayout = toLinearLayout(bType);
     auto block = StringAttr::get(ctx, "block");
-    if (bLayout.getInDimSize(block) < 2)
-      return op->emitOpError("B layout must contain a CTA pair");
-    unsigned bCtaOffset = bLayout.getBasis(block, 0, dims[1]);
-    if (bIsFp4) {
-      auto attrs = getNvmmaSmemAttrs(bType);
-      if (!attrs)
+    // NOTE(TLX): upstream twoCTAs requires a CTA pair in B, but TLX keeps B
+    // unsplit ([1,1] CGA) by design. Skip the pair checks when unsplit.
+    if (bLayout.getInDimSize(block) >= 2) {
+      unsigned bCtaOffset = bLayout.getBasis(block, 0, dims[1]);
+      if (bIsFp4) {
+        auto attrs = getNvmmaSmemAttrs(bType);
+        if (!attrs)
+          return op->emitOpError(
+              "B shared-memory layout is not compatible with MMA");
+        if (!attrs->transposed)
+          bCtaOffset *= 2;
+      }
+      unsigned expectedN = n / 2 < nPerCTA ? n / 2 : 0;
+      // NOTE(TLX): the CTA-offset model assumes B covers D's N; TLX paired
+      // MMA uses partial B tiles (B.N != D.N), which its lowering handles.
+      if (bCtaOffset != expectedN && bType.getDimSize(1) == dType.getDimSize(1))
         return op->emitOpError(
-            "B shared-memory layout is not compatible with MMA");
-      if (!attrs->transposed)
-        bCtaOffset *= 2;
+                   "B CTA layout does not match MMA instruction N = ")
+               << n;
     }
-    unsigned expectedN = n / 2 < nPerCTA ? n / 2 : 0;
-    if (bCtaOffset != expectedN)
-      return op->emitOpError("B CTA layout does not match MMA instruction N = ")
-             << n;
   }
 
-  if (nPerCTA < n) {
+  // NOTE(fork-NPOT): the subview checks below assume the padded-layout model
+  // and can crash (mixed-radix resize) or misfire on NPOT shapes, which use
+  // the fork's pow2-rounded model owned by the op verifier. Skip them there.
+  if (nPerCTA < n && llvm::all_of(bType.getShape(), llvm::isPowerOf2_64)) {
     auto bLayout = toLinearLayout(bType).pseudoinvert();
     for (auto [dim, size] : llvm::zip_equal(dims, bType.getShape()))
       bLayout = bLayout.resizeInDim(dim, size);
@@ -677,10 +739,17 @@ LogicalResult impl::verifyMMAv5Op(Operation *op) {
   auto allocShape = dropPipeliningDim(dType.getAllocShape(), encoding);
   if (dType.getShape() == allocShape)
     return success();
+  // NOTE(fork-NPOT): the instruction-N layout comparison below assumes the
+  // padded-layout model; NPOT D shapes use the fork's pow2-rounded model
+  // (owned by the op verifier) and can crash (mixed-radix resize) or misfire
+  // here. Skip them.
+  if (!llvm::all_of(dType.getShape(), llvm::isPowerOf2_64))
+    return success();
 
   auto instrEncoding = TensorMemoryEncodingAttr::get(
       ctx, encoding.getBlockM(), n, encoding.getColStride(),
-      encoding.getCGALayout(), encoding.getTwoCTAs());
+      encoding.getCGALayout(), encoding.getTwoCTAs(), encoding.getCtaMode(),
+      encoding.getFp4Padded());
   SmallVector<int64_t> instrShape = {encoding.getBlockM(), n};
   auto expected = ensureLayoutNotLargerThan(
       toLinearLayout(dType.getShape(), instrEncoding), dims, instrShape);

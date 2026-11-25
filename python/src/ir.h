@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+using namespace mlir;
+using namespace triton;
 inline mlir::Attribute
 buildCachePolicy(mlir::OpBuilder &builder,
                  mlir::triton::CacheModifier cacheModifier,

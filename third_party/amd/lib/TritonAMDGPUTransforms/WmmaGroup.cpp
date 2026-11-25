@@ -320,12 +320,15 @@ WmmaScaleDatabase::WmmaScaleDatabase(MLIRContext *context) {
 
   // Reference: llvm/include/llvm/IR/IntrinsicsAMDGPU.td
   wmmaScaleMap = {
-      TRITON_WMMA_SCALE_v(3, 16, 16, f32T, 0u /*isScale16*/,
-                          WmmaScaleIntrinsic::IntrinsicFamily::F8F6F4,
-                          "llvm.amdgcn.wmma.scale.f32.16x16x128.f8f6f4", 128),
-      TRITON_WMMA_SCALE_v(3, 16, 16, f32T, 1u /*isScale16*/,
-                          WmmaScaleIntrinsic::IntrinsicFamily::F8F6F4,
-                          "llvm.amdgcn.wmma.scale16.f32.16x16x128.f8f6f4", 128),
+      TRITON_WMMA_SCALE_v_feature(3, 16, 16, f32T, 0u /*isScale16*/,
+                                  WmmaScaleIntrinsic::IntrinsicFamily::F8F6F4,
+                                  "llvm.amdgcn.wmma.scale.f32.16x16x128.f8f6f4",
+                                  128, kWmmaRestrictedInstsFeature),
+      TRITON_WMMA_SCALE_v_feature(
+          3, 16, 16, f32T, 1u /*isScale16*/,
+          WmmaScaleIntrinsic::IntrinsicFamily::F8F6F4,
+          "llvm.amdgcn.wmma.scale16.f32.16x16x128.f8f6f4", 128,
+          kWmmaRestrictedInstsFeature),
       TRITON_WMMA_SCALE_v_feature(3, 32, 16, f32T, 0u /*isScale16*/,
                                   WmmaScaleIntrinsic::IntrinsicFamily::F4,
                                   "llvm.amdgcn.wmma.scale.f32.32x16x128.f4",
@@ -337,15 +340,30 @@ WmmaScaleDatabase::WmmaScaleDatabase(MLIRContext *context) {
   };
 }
 
-static std::pair<unsigned, unsigned>
+static FailureOr<std::pair<unsigned, unsigned>>
 kBaseForWmmaScale(Type aElemType, Type bElemType, unsigned mDim, unsigned nDim,
                   unsigned kDim) {
   constexpr unsigned warpSize = 32;
-  unsigned packedKA = llvm::isa<Float4E2M1FNType>(aElemType) ? kDim / 2 : kDim;
-  unsigned packedKB = llvm::isa<Float4E2M1FNType>(bElemType) ? kDim / 2 : kDim;
+  auto packedK = [](Type elemType, unsigned kDim) -> FailureOr<unsigned> {
+    if (llvm::isa<Float4E2M1FNType>(elemType))
+      return kDim / 2;
+    if (llvm::isa<Float6E2M3FNType, Float6E3M2FNType>(elemType)) {
+      // fp6 packs groups of 16 values per 12 bytes; the x3/4 byte
+      // conversion steps within a group by 4 values.
+      if (kDim % 4 != 0)
+        return failure();
+      return kDim * 3 / 4;
+    }
+    return kDim;
+  };
+  auto packedKAOr = packedK(aElemType, kDim);
+  auto packedKBOr = packedK(bElemType, kDim);
+  if (failed(packedKAOr) || failed(packedKBOr))
+    return failure();
   unsigned depthA = warpSize / mDim;
   unsigned depthB = warpSize / nDim;
-  return {packedKA / depthA, packedKB / depthB};
+  return std::pair<unsigned, unsigned>{*packedKAOr / depthA,
+                                       *packedKBOr / depthB};
 }
 
 // 32×16 F4 scale WMMA only when both operands are FP4.
@@ -379,8 +397,10 @@ WmmaScaleIntrinsic::get(int version, unsigned mDim, unsigned nDim,
   auto &values = it->second;
   assert(values.size() == 1);
   auto [symbol, kDim, feature] = values.back();
-  auto [kBaseA, kBaseB] =
-      kBaseForWmmaScale(aElemType, bElemType, mDim, nDim, kDim);
+  auto kBaseOr = kBaseForWmmaScale(aElemType, bElemType, mDim, nDim, kDim);
+  if (failed(kBaseOr))
+    return failure();
+  auto [kBaseA, kBaseB] = *kBaseOr;
   // On asymmetric and transposed we swap the operands, layouts and kBase.
   if (isTransposed && mDim != nDim)
     std::swap(kBaseA, kBaseB);

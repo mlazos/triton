@@ -1,8 +1,20 @@
 #include "Utility.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/ADT/SetVector.h"
+#include <algorithm>
 
+namespace tt = mlir::triton;
 namespace mlir {
+
+static void normalizeAsyncTaskIds(SmallVectorImpl<AsyncTaskId> &asyncTaskIds) {
+  llvm::sort(asyncTaskIds);
+  asyncTaskIds.erase(std::unique(asyncTaskIds.begin(), asyncTaskIds.end()),
+                     asyncTaskIds.end());
+}
 
 //===----------------------------------------------------------------------===//
 // Helper functions for async task
@@ -10,15 +22,17 @@ namespace mlir {
 
 SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
   SmallVector<AsyncTaskId> asyncTaskIds;
-  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id")) {
+  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName)) {
     for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
-      // TODO(Arda): Remove this check once we figure out why we have duplicate
-      // async task ids
-      if (asyncTaskIds.empty() ||
-          asyncTaskIds[asyncTaskIds.size() - 1] != asyncTaskId)
-        asyncTaskIds.push_back(asyncTaskId);
+      asyncTaskIds.push_back(asyncTaskId);
+    }
+  } else if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(
+                 tt::gpu::kPartitionAttrName)) {
+    for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
+      asyncTaskIds.push_back(asyncTaskId);
     }
   }
+  normalizeAsyncTaskIds(asyncTaskIds);
   return asyncTaskIds;
 }
 
@@ -27,10 +41,12 @@ bool hasAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
 }
 
 void setAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTaskIds) {
+  if (asyncTaskIds.empty())
+    return;
   SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(),
                                               asyncTaskIds.end());
-  sort(sortedAsyncTaskIds);
-  op->setAttr("async_task_id",
+  normalizeAsyncTaskIds(sortedAsyncTaskIds);
+  op->setAttr(kAsyncTaskIdAttrName,
               DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
 }
 
@@ -71,11 +87,21 @@ void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
   auto origAsyncTaskIds = getAsyncTaskIds(op);
   llvm::erase(origAsyncTaskIds, asyncTaskId);
   if (origAsyncTaskIds.empty())
-    op->removeAttr("async_task_id");
+    op->removeAttr(kAsyncTaskIdAttrName);
   else
     setAsyncTaskIds(op, origAsyncTaskIds);
 }
 
-void removeAsyncTaskIds(Operation *op) { op->removeAttr("async_task_id"); }
+void removeAsyncTaskIds(Operation *op) { op->removeAttr(kAsyncTaskIdAttrName); }
 
+void copyLoopScheduleInfo(Operation *newOp, Operation *oldOp) {
+  // This assignment is optional because we may call this code
+  // from sections outside the innermost loop.
+  if (oldOp->hasAttr(tt::kLoopStageAttrName))
+    newOp->setAttr(tt::kLoopStageAttrName,
+                   oldOp->getAttr(tt::kLoopStageAttrName));
+  if (oldOp->hasAttr(tt::kLoopClusterAttrName))
+    newOp->setAttr(tt::kLoopClusterAttrName,
+                   oldOp->getAttr(tt::kLoopClusterAttrName));
+}
 } // namespace mlir

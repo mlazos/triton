@@ -27,7 +27,7 @@
 // CHECK-SAME: contiguity = 4 : i32
 // CHECK-DAG: %[[LOOP_COND_0_SPLAT_B:.*]] = tt.splat %[[LOOP_COND_0]]
 // CHECK-DAG: %[[BSUB:.*]] = ttg.memdesc_index %[[BBUFFER]]{{\[}}%[[CONSTANT_0]]{{\]}}
-// CHECK: %[[T_B0:.*]] = ttg.async_copy_global_to_local %{{.*}}, %[[BSUB]] mask %[[LOOP_COND_0_SPLAT_B]] {contiguity = 4 : i32} : tensor<32x128x!tt.ptr<f16>, #blocked> -> <32x128xf16, #shared1, #smem, mutable>
+// CHECK: %[[T_B0:.*]] = ttg.async_copy_global_to_local %{{.*}}, %[[BSUB]] mask %[[LOOP_COND_0_SPLAT_B]] other %{{.*}} {contiguity = 4 : i32} : tensor<32x128x!tt.ptr<f16>, #blocked> -> <32x128xf16, #shared1, #smem, mutable>
 // CHECK-DAG: %[[IV_1:.*]] = arith.addi %[[LB]], %[[STEP:.*]]
 // CHECK-DAG: %[[LOOP_COND_1:.*]] = arith.cmpi slt, %[[IV_1]], %[[UB]]
 // CHECK-DAG: %[[LOOP_COND_1_SPLAT_A:.*]] = tt.splat %[[LOOP_COND_1]]
@@ -509,7 +509,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: scf.for
     scf.for %arg4 = %c0_i32 to %arg3 step %arg2  : i32 {
       %1 = arith.divsi %arg4, %arg2 : i32
-      %desc = tt.make_tensor_descriptor %arg1, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : <f32>, <128x128xf32, #shared>
+      %desc = tt.make_tensor_descriptor %arg1, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<128x128xf32, #shared>
       // CHECK: ttng.tensormap_create
       // CHECK: ttng.tensormap_fenceproxy_acquire
       // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32, read_only}
@@ -1151,7 +1151,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // CHECK: %[[BEFORE_DESC:.*]] = tt.make_tensor_descriptor %{{.*}}
       // CHECK: tt.descriptor_store %[[BEFORE_DESC]]
       %before_c0 = arith.constant 0 : i32
-      %before_desc = tt.make_tensor_descriptor %base, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : <f32>, <128x128xf32, #shared_while_store>
+      %before_desc = tt.make_tensor_descriptor %base, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<128x128xf32, #shared_while_store>
       tt.descriptor_store %before_desc[%before_c0, %before_c0], %src : !tt.tensordesc<128x128xf32, #shared_while_store>, tensor<128x128xf32, #blocked_while_store>
       %continue = arith.cmpi sgt, %unused, %before_c0 : i32
       // CHECK: scf.condition({{.*}}) {{%.*}}, [[BEFORE_COUNTER]] : i1, i32
@@ -1168,7 +1168,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // CHECK-NEXT: [[COUNTER_INC:%.*]] = arith.addi [[AFTER_COUNTER]], {{.*}} : i32
       // CHECK-NEXT: [[COUNTER_WRAP:%.*]] = arith.cmpi sge, [[COUNTER_INC]], {{.*}} : i32
       // CHECK-NEXT: [[NEXT_COUNTER:%.*]] = arith.select [[COUNTER_WRAP]], [[ZERO]], [[COUNTER_INC]] : i32
-      %desc = tt.make_tensor_descriptor %base, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : <f32>, <128x128xf32, #shared_while_store>
+      %desc = tt.make_tensor_descriptor %base, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<128x128xf32, #shared_while_store>
       // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32, read_only}
       // CHECK-NEXT: ttg.local_store {{.*}}, %[[ALLOC]]
       // CHECK-NEXT: ttng.fence_async_shared

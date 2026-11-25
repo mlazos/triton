@@ -1,5 +1,8 @@
 # Working on Triton
 
+## Vendored code
+- `third_party/cpu` is vendored from [triton-lang/triton-cpu](https://github.com/triton-lang/triton-cpu), not developed in-tree. See `third_party/cpu/README.md` for the sync/port procedure.
+
 ## Block Programming Model
 - Triton and Gluon programs operate on logical blocks, not independent hardware threads. Scalar values, scalar control flow, and memory descriptor origins are uniform within a logical block or warp-specialized execution region. Per-element variation must be represented by tensors with valid layouts. Membar inserts the required intra-CTA barriers so shared-memory operations obey this block-level model from the user's perspective.
 - Do not introduce hidden lane- or warp-varying scalars through inline assembly, hardware IDs, or other backdoors. Such programs violate the programming model and must not be used as reproducers or as justification for compiler guards. Hardware IDs used by compiler lowerings to implement layouts are different from source-level scalar values.

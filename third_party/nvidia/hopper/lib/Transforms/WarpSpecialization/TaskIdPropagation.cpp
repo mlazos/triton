@@ -1,7 +1,10 @@
 #include "TaskIdPropagation.h"
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -97,13 +100,19 @@ void TaskIdBackwardPropagation::propagateToParent(Operation *op,
         ChangeResult changed = controlLattice->meet(taskId);
         propagateIfChanged(controlLattice, changed);
       }
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp)) {
+      auto condOp = whileOp.getConditionOp();
+      auto condLattice = getLatticeElement(condOp.getCondition());
+      ChangeResult changed = condLattice->meet(taskId);
+      propagateIfChanged(condLattice, changed);
     } else if (auto ifOp = dyn_cast<scf::IfOp>(parentOp)) {
       auto cond = ifOp.getCondition();
       auto condLattice = getLatticeElement(cond);
       ChangeResult changed = condLattice->meet(taskId);
       propagateIfChanged(condLattice, changed);
     } else {
-      if (!isa<triton::FuncOp, triton::ReduceOp>(parentOp))
+      if (!isa<triton::FuncOp, triton::ReduceOp, triton::MapElementwiseOp>(
+              parentOp))
         llvm_unreachable("Other parent ops are not supported.");
     }
     parentOp = parentOp->getParentOp();
@@ -113,30 +122,57 @@ void TaskIdBackwardPropagation::propagateToParent(Operation *op,
 LogicalResult TaskIdBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<TaskIdLattice *> operands,
     ArrayRef<const TaskIdLattice *> results) {
-  // Already annotated
   // TODO(Arda): Replace the following with getAsyncTaskIds when we no longer
   // need to dump the task ids into the IR.
-  auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
-  if (taskIdAttr) {
-    const auto annotated = TaskId(taskIdAttr);
+  auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName);
+
+  // An op is a non-anchor (allows backward propagation to flow through) when
+  // it is a replicable scalar computation. These ops compute shared addresses,
+  // indices, or control predicates used across tasks and need the union of
+  // consumer task IDs. Scalar loads are safe to repeat and avoid introducing
+  // an unsupported scalar communication channel for a collective predicate.
+  // All other annotated ops (Triton ops, tensor ops, control flow) are anchors
+  // whose task IDs define the computation partition and must not be overridden.
+  bool isScalarReplicable =
+      (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
+       isa<triton::AddPtrOp, triton::LoadOp>(op)) &&
+      llvm::none_of(op->getResultTypes(),
+                    [](Type t) { return isa<RankedTensorType>(t); });
+  bool isAnchor = taskIdAttr && !isScalarReplicable;
+
+  auto propagateTaskToOperandsAndParent = [&](const TaskId &taskId) {
     for (auto operandLattice : operands) {
-      ChangeResult changed = operandLattice->meet(annotated);
+      ChangeResult changed = operandLattice->meet(taskId);
       propagateIfChanged(operandLattice, changed);
     }
-    // Propagate to the parent ops such as control flows
-    propagateToParent(op, annotated);
+    propagateToParent(op, taskId);
+  };
+
+  if (isAnchor) {
+    const auto annotated = TaskId(taskIdAttr);
+    auto propagateAnchorTaskToTerminator = [&](Operation *terminator) {
+      for (auto terminatorOperand : terminator->getOperands()) {
+        auto terminatorLattice = getLatticeElement(terminatorOperand);
+        ChangeResult changed = terminatorLattice->meet(annotated);
+        propagateIfChanged(terminatorLattice, changed);
+      }
+    };
+    propagateTaskToOperandsAndParent(annotated);
 
     if (op->getNumRegions() == 1) {
       if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
-        propagateToTerminator(reduceOp.getCombineOp().front().getTerminator(),
-                              results);
+        propagateAnchorTaskToTerminator(
+            reduceOp.getCombineOp().front().getTerminator());
+      } else if (auto mapOp = dyn_cast<triton::MapElementwiseOp>(op)) {
+        propagateAnchorTaskToTerminator(
+            mapOp.getScalarOp().front().getTerminator());
       }
     }
 
     return success();
   }
-  // If it is not annotated by the user, propagate from results to the
-  // operands
+
+  // Non-anchor: propagate from results to operands (standard backward flow).
   for (const auto resultLattice : results) {
     for (auto operandLattice : operands) {
       ChangeResult changed = operandLattice->meet(resultLattice->getValue());
@@ -147,10 +183,27 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
   for (const auto resultLattice : results)
     propagateToParent(op, resultLattice->getValue());
 
+  // For non-anchor ops with existing annotations, also propagate the
+  // annotation backward so it contributes to operand lattices.
+  if (taskIdAttr) {
+    const auto annotated = TaskId(taskIdAttr);
+    propagateTaskToOperandsAndParent(annotated);
+  }
+
   if (op->getNumRegions() == 1) {
     if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
       propagateToTerminator(reduceOp.getCombineOp().front().getTerminator(),
                             results);
+    } else if (auto mapOp = dyn_cast<triton::MapElementwiseOp>(op)) {
+      auto *terminator = mapOp.getScalarOp().front().getTerminator();
+      for (auto terminatorOperand : terminator->getOperands()) {
+        auto terminatorLattice = getLatticeElement(terminatorOperand);
+        for (auto resultLattice : results) {
+          ChangeResult changed =
+              terminatorLattice->meet(resultLattice->getValue());
+          propagateIfChanged(terminatorLattice, changed);
+        }
+      }
     }
   }
 
@@ -159,33 +212,114 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
 
 void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   auto defOp = operand.getOwner();
-  assert(isa<scf::IfOp>(defOp) || isa<scf::ForOp>(defOp));
-
-  SmallVector<TaskId> lattices(defOp->getNumResults(),
-                               TaskId::getUninitialized());
-  for (auto [i, result] : llvm::enumerate(defOp->getResults())) {
-    auto resultLattice = getLatticeElement(result);
-    // Wait for all the results to be initialized.
-    if (resultLattice->getValue().isUninitialized())
+  if (auto condOp = dyn_cast<scf::ConditionOp>(defOp)) {
+    auto whileOp = cast<scf::WhileOp>(condOp->getParentOp());
+    auto whileTaskIds = TaskId::getUninitialized();
+    if (auto attr =
+            whileOp->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName))
+      whileTaskIds = TaskId(attr);
+    for (auto [idx, forwarded] : llvm::enumerate(condOp.getArgs())) {
+      if (forwarded != operand.get())
+        continue;
+      auto resultLattice = getLatticeElement(whileOp.getResult(idx));
+      auto forwardedLattice = getLatticeElement(forwarded);
+      auto taskIds = TaskId::meet(resultLattice->getValue(), whileTaskIds);
+      if (taskIds.isUninitialized())
+        return;
+      ChangeResult changed = forwardedLattice->meet(taskIds);
+      propagateIfChanged(forwardedLattice, changed);
       return;
-    lattices[i] =
-        resultLattice->getValue().meet(lattices[i], resultLattice->getValue());
+    }
+    auto conditionLattice = getLatticeElement(operand.get());
+    ChangeResult changed = conditionLattice->meet(whileTaskIds);
+    propagateIfChanged(conditionLattice, changed);
+    return;
   }
 
-  // Propagate to the yield ops
-  if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    propagateToYield(yieldOp, lattices);
-  } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
-    propagateToYield(ifOp.thenYield(), lattices);
-    if (!ifOp.getElseRegion().empty())
-      propagateToYield(ifOp.elseYield(), lattices);
-  } else {
-    llvm_unreachable("Unknown branch operation");
-  }
-  return;
+  // The framework routes here every operand of a branch-like op that is NOT
+  // forwarded into a successor region/block (forwarded operands are meet with
+  // their region/block-argument lattices by the framework directly). For the
+  // structured scf ops this is the trip-count / condition control operand; we
+  // propagate the union of the op's result task ids into the loop/if body via
+  // its yield(s) so the body computes for every consumer task.
+  if (isa<scf::IfOp>(defOp) || isa<scf::ForOp>(defOp) ||
+      isa<scf::WhileOp>(defOp)) {
+    SmallVector<TaskId> lattices(defOp->getNumResults(),
+                                 TaskId::getUninitialized());
+    for (auto [i, result] : llvm::enumerate(defOp->getResults())) {
+      auto resultLattice = getLatticeElement(result);
+      // Wait for all the results to be initialized.
+      if (resultLattice->getValue().isUninitialized())
+        return;
+      lattices[i] = resultLattice->getValue().meet(lattices[i],
+                                                   resultLattice->getValue());
+    }
 
-  // TODO(Arda): Address what happens when loop is annotated
+    // Propagate to the yield ops
+    if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
+      auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      propagateToYield(yieldOp, lattices);
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
+      propagateToYield(ifOp.thenYield(), lattices);
+      if (!ifOp.getElseRegion().empty())
+        propagateToYield(ifOp.elseYield(), lattices);
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(defOp)) {
+      auto condOp = whileOp.getConditionOp();
+      for (auto [lattice, forwarded] :
+           llvm::zip_equal(lattices, condOp.getArgs())) {
+        auto forwardedLattice = getLatticeElement(forwarded);
+        ChangeResult changed = forwardedLattice->meet(lattice);
+        propagateIfChanged(forwardedLattice, changed);
+      }
+    }
+    return;
+    // TODO(Arda): Address what happens when loop is annotated
+  }
+
+  // Unstructured control flow (`cf.cond_br` / `cf.br`), e.g. from an early-exit
+  // `return` / bounds guard at the top of a kernel (the common case for these
+  // autoWS kernels), or from a loop transform such as
+  // tritongpu-fuse-nested-loops. The non-forwarded operand is the branch
+  // condition / selector. It must be available on every warp group that
+  // executes either successor, so give it the union of the task ids flowing
+  // into the successor blocks (the forwarded destination operands, whose
+  // lattices the framework has already populated from the block arguments). A
+  // pure control op like `cf.cond_br` has no results, so there is nothing to
+  // back-propagate from results; the successor-operand union is the correct
+  // backward signal. It is empty for a bare early-return guard (successors take
+  // no forwarded operands), which is benign: a task-id-less scalar control op
+  // replicates across partitions. This mirrors how scf.if's condition acquires
+  // the union of its body task ids.
+  if (auto branch = dyn_cast<BranchOpInterface>(defOp)) {
+    auto condLattice = getLatticeElement(operand.get());
+    for (unsigned i = 0, e = defOp->getNumSuccessors(); i < e; ++i) {
+      SuccessorOperands succOperands = branch.getSuccessorOperands(i);
+      for (Value forwarded : succOperands.getForwardedOperands()) {
+        auto fwdLattice = getLatticeElement(forwarded);
+        if (fwdLattice->getValue().isUninitialized())
+          continue;
+        ChangeResult changed = condLattice->meet(fwdLattice->getValue());
+        propagateIfChanged(condLattice, changed);
+      }
+    }
+    return;
+  }
+
+  // RegionBranchOpInterface ops other than the scf ops handled above (e.g. a
+  // future ttg.warp_specialize) only reach here for operands not forwarded to
+  // any region; such ops carry no extra control operand needing a task id
+  // today, so ignore rather than abort.
+  if (isa<RegionBranchOpInterface>(defOp))
+    return;
+
+  // visitBranchOperand is only invoked for RegionBranchOpInterface /
+  // BranchOpInterface ops, all handled above. Anything else is unanticipated at
+  // this stage: fail loudly here (at task-id propagation) so it is easy to
+  // triage, rather than silently dropping propagation -- a missing/wrong
+  // async_task_id would otherwise surface much later as a hard-to-triage
+  // warp-specialization miscompile (wrong partition / missing barrier). Extend
+  // the handling above when a new branch shape is introduced.
+  llvm_unreachable("Unhandled branch op in task-id propagation");
 }
 
 void TaskIdBackwardPropagation::visitCallOperand(OpOperand &operand) {

@@ -1,0 +1,566 @@
+# TMA Store Wait Pipeline
+
+**File**: `WSTMAStoreLowering.cpp`, `WSMemoryPlanner.cpp`
+
+After `doTMAStoreLowering` converts `tt::DescriptorStoreOp` into
+`LocalAllocOp` + `AsyncTMACopyLocalToGlobalOp` + `TMAStoreTokenWaitOp`
+(see [Memory Lowering](MemoryLowering.md#tma-store-lowering)), the
+memory planner and a sequence of sub-passes handle these staging buffers.
+
+Before this lowering, `doBufferAllocation` uses each `DescriptorStoreOp` as
+the ordering anchor for channels feeding TMA stores. The producer-side
+`local_store` order must match the descriptor-store order for the same TMA
+descriptor; later wait annotation and rotation reason about the sequence of
+stores to a shared staging buffer.
+
+## Memory Planner: `buffer.tmaStaging` Handling
+
+**File**: `WSMemoryPlanner.cpp` (within `allocateSmemBuffers`)
+
+When `early_tma_store_lowering` is enabled, the `local_alloc` ops created
+for TMA store staging are visible to the memory planner. Each WSBuffer is
+classified by which TMA op it feeds (Phase 1):
+
+```cpp
+for (auto user : alloc->getUsers()) {
+    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+        buf.tmaStaging = 1;   // regular TMA store staging (dk, dv, c, o, ...)
+        break;
+    }
+    if (isa<ttng::AsyncTMAReduceOp>(user)) {
+        buf.tmaStaging = 2;   // TMA atomic-add reduce staging (dq, ...)
+        break;
+    }
+}
+```
+
+`buf.tmaStaging` is a classification tag (0 = not TMA staging, 1 = store,
+2 = reduce), not a count. It is propagated to the resulting `local_alloc`
+op as the `buffer.tmaStaging` attribute and consumed by later passes that
+need to distinguish reduce staging from regular store staging.
+
+The flag drives a special path through three phases:
+
+### Phase 3.5: TMA Staging Fusion
+
+TMA staging WSBuffers are merged by descriptor, originating load, and producer
+basic block (via `fuseEpilogueWSBuffers`). If the originating load cannot be traced, as with
+Hopper register accumulators, the producer task is used instead. For example,
+the 4 same-task subtile stagings of `desc_dq` (under `EPILOGUE_SUBTILE=4`) all
+share one `bufferId`, as do the dk and dv subtile stagings (each per their own
+descriptor). Different data-partition tasks targeting the same descriptor stay
+in distinct buffers. Sibling loops also stay distinct because each
+multi-buffered staging ring must rotate from one loop-local accumulation counter.
+
+The shared `bufferId` is honored by `doCodePartition` downstream: the
+subtile allocs are physically merged into one `local_alloc` of shape
+`numCopies x original_shape` (e.g., `1x128x32xf32` for `numCopies=1`).
+All subtile stores then index into the same physical SMEM region via
+`memdesc_index`. As a result `computeTotalSmem`'s cost model
+(`max(size) × copies` per `bufferId`) matches the actual post-merge
+physical footprint — there is no per-entry multiplier to add.
+
+### Phase 3.6: Inter-Buffer SMEM Reuse via `allocation.reuseTarget`
+
+When the post-Phase-3.5 SMEM total still exceeds `smemBudget`,
+the planner runs an inter-buffer reuse pass (`Phase 3.6: Reuse
+allocated buffers when base total exceeds budget` in
+`WSMemoryPlanner.cpp::allocateSmemBuffers`). It looks for a host
+buffer whose physical SMEM region can be overlapped with a staging
+buffer's region without a liveness conflict (the host's last consumer
+finishes before the staging's first store), and annotates the staging
+alloc with `allocation.reuseTarget = <host bufferId>`. The annotated
+WSBuffer's footprint is then counted against the host's region in the
+planner's `computeTotalSmem` accounting (i.e. it costs 0 extra bytes
+as long as `max(host, staging × copies)` fits inside the host's
+existing allocation).
+
+Concrete example for FA-bwd: with `_BWD_DOT_ATTRS_TMEM` and
+`BLOCK_M1=128`, the planner annotates
+
+```mlir
+%desc_dv_staging = ttg.local_alloc {
+  allocation.reuseTarget = 3 : i32,   // v's buffer.id
+  buffer.copy = 2, buffer.id = 22, buffer.tmaStaging = 1
+} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+%desc_dk_staging = ttg.local_alloc {
+  allocation.reuseTarget = 4 : i32,   // do's buffer.id
+  buffer.copy = 2, buffer.id = 24, buffer.tmaStaging = 1
+} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+```
+
+so that the planner can keep both staging groups at `numCopies=2`
+inside the 220 KB budget by treating them as "free" (they share v's
+and do's 32 KB regions respectively).
+
+**Important:** the planner sets the attribute and accounts for the
+reuse, but the SMEM layout pass (`AllocateSharedMemoryNv`) does *not*
+read `allocation.reuseTarget` directly — it sees the staging alloc as
+a request for its own region. Realizing the reuse therefore requires
+an extra step in `doCodePartition` that rewrites the staging alloc
+into a reinterpret view of the host alloc (see
+[CodePartition: Realizing `allocation.reuseTarget`](#code-partition-realizing-allocationreusetarget)
+below).
+
+### Phase 3.7: Epilogue Group Copy Increase
+
+Each fused group in the `P2_InnerTMAStaging`, `P3_OuterTMAStaging`, or
+`P4_Other` tier is treated as an epilogue group, in that tier order. `increaseFusedEpilogueCopies` iteratively bumps
+`numCopies` from the current value up to `numBuffers`, accepting each
+bump as long as `computeTotalSmem ≤ smemBudget`.
+
+This reservation runs before the general Phase 4 P0/P1 copy increase. TMA
+store/reduce staging is on the output critical path and must get first claim on
+the discretionary budget; otherwise small operand buffers can consume the last
+few KiB before a high-value staging ring (for example FA-bwd dQ) is considered.
+
+TMA-fed operands of a compiler data-partitioned MMA loop with
+`tt.disallow_acc_multi_buffer` are not discretionary: before Phase 3.7, the
+planner pins them to the configured pipeline depth. Their acquire/release
+schedule assumes that depth, and shortening the ring can overwrite an operand
+while a partitioned, pipelined MMA still consumes it.
+Phase 3.7 therefore reserves output staging only from the budget remaining
+after these operand correctness floors. Ordinary single-group MMA operands and
+TMA-fed metadata used only by elementwise computation remain discretionary, so
+FA-backward dQ/dK/dV staging stays prioritized over their extra copies.
+
+`TRITON_WS_TMA_REDUCE_STAGING_COPIES=K` independently sets the copy target for
+TMA-reduce staging. It may exceed `num_stages`, because the output
+reduction ring is drained by TMA store waits and can overlap stores without
+increasing the operand/GEMM pipeline depth. The normal SMEM-budget and `K | S`
+safety checks still apply. Other output staging remains bounded by
+`num_stages`.
+
+Groups whose members all reuse another allocation (`isAllocated=false`) are
+bumped only when every Phase 3.6 host has enough physical capacity for the
+enlarged ring (`stagingSize × copies ≤ hostSize × hostCopies`). Their apparent
+cost in `computeTotalSmem` is zero, so omitting this capacity check makes an
+increase look free even when reuse realization must reject the alias and
+materialize a separate allocation, which can make the final physical layout
+exceed the planner budget.
+
+#### Opt-in: operand ring before outer staging
+
+The warp-specialized loop (or an enclosing loop) can set `tt.smem_operand_ring_first` (`tl.range(...,
+smem_operand_ring_first=True)`). The planner then also builds a plan in which
+outer-loop staging (P4/P5 tiers) only grows from the budget left once the
+TMA-fed MMA operands reach `min(num_stages, K-loop trip count)` copies, and
+keeps it if it deepens the shallowest MMA operand ring. This helps when large
+staging slots (for example a fused fp32 cast) would leave the operand ring at
+1-2 copies; small bf16 slots usually overlap their stores cheaply and are
+better left at the default. Inner-loop staging keeps first claim. Blackwell
+(MMAv5) only.
+
+#### `K | S` cap for same-partition (wait_group-drained) staging
+
+A staging group holds **S** subtiles (`S = indices.size()`, the fused
+`EPILOGUE_SUBTILE` / `DQ_SUBTILE` stores) that rotate through **K =
+numCopies** slots. How the buffer is drained — and therefore which K values
+are *correct* — depends on the channel's producer/consumer topology:
+
+- **Same-partition staging** (producer and consumer in the same warp task,
+  e.g. bwd `dk`/`dv`/`dq`): drained only by `cp.async.bulk.wait_group(K-1)`,
+  with the per-tile slot `theIdx % K` (see `getStaggeredAccumCnt`). The fixed
+  in-flight-count wait is correct only if same-slot stores are exactly K apart
+  across the tile boundary, i.e. **K must divide S**. A non-dividing K (e.g.
+  `K=3, S=4`, or `K > S`) makes a store clobber a slot before it drains →
+  wrong gradients, with nothing downstream to catch it.
+- **Cross-partition staging** (producer task ≠ consumer task, e.g. fwd
+  `desc_o`): the slot/phase come from a continuous `accumCnt` producer/consumer
+  mbarrier rotation and tolerate **any** K.
+
+Phase 3.7 therefore detects same-partition staging via
+`getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())` and, for
+those groups, only accepts a `tryCopies` that divides S (others are skipped).
+The check matters whenever the bump target exceeds a divisor of S: for
+example, with `num_stages = 3` and `S = 4`, depth 3 is skipped and the group
+stays at its largest accepted divisor. The cross-stage floor (`WSBuffer::minCopies`) is a hard
+correctness floor and is never reduced; if it itself violates `K | S` for a
+wait_group ring the pass emits an `LDBG` warning rather than dropping below it.
+
+`computeTotalSmem` accounts for the active `buffer.id` groups using
+`max(size) × copies` per ID. For TMA store staging groups this matches the
+physical result: see [Combined SMEM Cost](#combined-smem-cost).
+
+#### `TRITON_WS_STAGING_COPIES`: capping the Phase 3.7 target
+
+**Read by**: `getStagingCopiesCap` in `WSMemoryPlanner.cpp`, applied once at
+the top of `increaseFusedEpilogueCopies`.
+
+`TRITON_WS_STAGING_COPIES=K` lowers the copy target that Phase 3.7 bumps
+groups toward. Without it, the target is `numBuffers`, which is the
+`nvgpu-warp-specialization` pass option `num-stages`, i.e. the kernel's
+`num_stages` compile option. With it, the target is `min(num_stages, K)`.
+
+| Property | Behavior |
+|---|---|
+| How it is set | Process environment variable. There is no per-kernel or per-config equivalent; it applies to every kernel compiled while it is set. |
+| Legal values | A positive integer. The value is parsed with `std::atoi`, so unset, empty, `0`, negative, or non-numeric values all mean "no cap". |
+| Default | Unset (no cap). |
+| Cache key | Listed in `CACHE_INVALIDATING_ENV_VARS` (`include/triton/Tools/Sys/GetEnv.h`), so changing it produces a new compile. |
+| Resource | SMEM only. One copy of a group costs the group's largest member (`computeTotalSmem`); for a subtiled epilogue that is one subtile's staging buffer. |
+
+What the cap applies to:
+
+- **Every Phase 3.7 tier**, not only TMA store staging: `P2_InnerTMAStaging`,
+  `P3_OuterTMAStaging`, and `P4_Other` groups (for example epilogue-load
+  buffers merged by Phase 3.5).
+- **TMA-reduce staging by default.** The reduce target
+  (`tmaStaging == 2`) starts from the capped value. It is replaced by
+  `TRITON_WS_TMA_REDUCE_STAGING_COPIES` only when that variable is also set.
+
+The walk's existing rules (`K | S`, budget, reuse-host capacity) still apply,
+so the applied depth can be below `K`.
+
+The cap only limits bumps. It never lowers a group below its current copy
+count or its cross-stage floor (`WSBuffer::minCopies`): if the floor is above
+`K`, the floor is kept. SMEM that the cap leaves unclaimed stays in the budget
+for the Phase 4 `P0`/`P1` operand copy increase, which runs after Phase 3.7.
+Downstream, the resulting `buffer.copy` becomes `can_rotate_by_buffer_count`
+in `doAnnotateTMAStoreWaits` (see [Step 1](#step-1-doannotatetmastorewaits)),
+so fewer copies means each TMA store wait is placed after fewer subsequent
+stores.
+
+Cases where the variable has no effect:
+
+- **2-CTA modules** (`ttng.two-ctas`): ordinary TMA store staging
+  (`tmaStaging == 1`) is held at one copy before the cap is consulted.
+- **Groups with fewer than two members**, for example a single unsubtiled
+  store. Phase 3.7 skips these entirely.
+- **`TRITON_WS_SMEM_PLAN_SEARCH`**, when `allocateSmemBuffersViaSearch` does not
+  fall back to the heuristic. That path pins staging blocks to their floor and
+  never calls `increaseFusedEpilogueCopies`. It falls back, and the cap applies
+  again, when any staging buffer has more than one TMA store user.
+- **`smem_alloc_algo = 0`**: the original `MemoryPlanner` does not read the
+  variable.
+
+Nothing reports the cap's effect.
+
+### Combined SMEM Cost
+
+Staging allocs that share a `buffer.id` are merged into one physical
+allocation downstream, so the cost of a fused staging group is
+
+```
+tmaStoreSmem = size * copies
+```
+
+Allocs sharing a `buffer.id` collapse onto one representative
+(`replaceBufferReuse`; [Reuse Groups](ReuseGroups.md) case A3), unless their
+types differ. A mismatched member stays separate and `computeTotalSmem`
+undercounts it. Subtiles of one descriptor store have identical types, so the
+usual epilogue staging group is merged.
+
+### Phase 6: Hoist Before Outermost Loop
+
+All TMA staging allocs are moved before the outermost enclosing
+`scf.for` loop. This is required for the rotation mechanism
+(`doAnnotateTMAStoreWaits`) which reads `buffer.copy` and only annotates
+allocs that are outside all loops.
+
+## Wait Annotation and Reordering Pipeline
+
+Within the AutoWS monolithic pass (`WarpSpecialization.cpp`), three
+functions handle the wait ops after the memory planner:
+
+```
+doMemoryPlanner
+  → doAnnotateTMAStoreWaits      ← annotate waits with buffer count
+  → doValidateTMAStoreAnnotations ← safety check
+  → doCodePartition
+  → ...
+  → scheduleLoops                 ← SWP assigns pipeline stages
+  → cleanupWarpSpecializedLoops   ← prune dead loop-carried values
+  → doTMAStoreWaitReorder         ← move waits using the SWP schedule
+```
+
+This sequence is controlled by the `nvgpu-warp-specialization` pass option
+`tma-store-pipelining`, which defaults to `true`. When set to `false`, AutoWS
+skips all three steps: annotation, validation, and post-schedule reordering.
+This option is independent of `early_tma_store_lowering`, which controls
+whether descriptor stores are lowered into async TMA store operations before
+warp specialization.
+
+Each function is also available as a standalone MLIR pass for use outside
+the monolithic pipeline.
+
+## Step 1: `doAnnotateTMAStoreWaits`
+
+**Test pass**: `nvgpu-test-annotate-tma-store-waits` (`NVGPUTestAnnotateTMAStoreWaitsPass`)
+
+This pass inspects every `TMAStoreTokenWaitOp` enclosed by an `scf.for` loop
+or an `scf.while` loop containing a CLC scheduler operation. Atomic dynamic-
+persistent loops are deliberately excluded even though they use the same SCF
+operation: their next iteration may represent unrelated work, so rotating an
+epilogue wait across that boundary can race staging-buffer reuse.
+The pass marks CLC loops with `ttg.clc_persistent` before code partitioning so
+the per-partition loop clones remain identifiable after the CLC operations are
+isolated in the scheduler partition.
+For each wait, it traces the token back to the defining
+TMA store-like op (`AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp`),
+then looks at the SMEM buffer used by that store:
+
+1. Get the `LocalAllocOp` that produces the buffer.
+2. Read the `buffer.copy` attribute (set earlier by the memory planner),
+   which records how many physical copies of this buffer exist.
+3. If `buffer.copy = K`, set `can_rotate_by_buffer_count = K` on the wait op.
+
+The attribute means: "K buffer copies exist, so this wait can be delayed
+until the K-th subsequent TMA store to the same buffer — at that point
+the buffer slot is about to be overwritten and the earlier store must
+have finished reading."
+
+After the reorder is successfully realized, the pass records
+`planned_pending_count = K - 1` as stable lowering metadata for the equivalent
+`cp.async.bulk.wait_group(K-1)` protocol. Delaying this metadata prevents a
+failed or skipped rotation from changing the original wait semantics.
+Software-pipeline schedule serialization can move token waits through clusters
+without retaining enough linear IR context to reconstruct K reliably; final
+wait lowering therefore uses this explicit count when present and falls back
+to program-order counting for unplanned waits.
+
+### Token Tracing
+
+`getDefiningTMAStoreOp` handles two cases:
+
+| Case | Pattern |
+|------|---------|
+| **Direct** | Token is the direct SSA result of `AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp` |
+| **Loop-carried** | Token is a block argument of the `scf.for` body; the function follows the corresponding yield operand back to its `AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp` |
+
+## Step 2: `doValidateTMAStoreAnnotations`
+
+This is a safety pass that runs immediately after annotation. It
+re-checks every annotated wait and strips the `can_rotate_by_buffer_count`
+attribute if the defining TMA store or its `LocalAllocOp` can no longer
+be resolved. This guards against IR transformations between annotation
+and reordering that might invalidate assumptions.
+
+## Step 3: `doTMAStoreWaitReorder`
+
+**Test pass**: `nvgpu-test-tma-store-token-wait-reorder` (`NVGPUTestTMAStoreTokenWaitReorderPass`)
+
+This pass runs **after** `scheduleLoops` has assigned pipeline stages and
+clusters to every op. It uses the SWP `CoarseSchedule` to move waits
+forward in the linearized pipeline order.
+
+Straight-line epilogues use the same reuse-point rule without a coarse
+schedule. A direct-token wait moves to immediately before the next
+`local_store` that feeds any TMA store in the block. TMA `wait_group` is
+queue-wide rather than descriptor- or allocation-specific, so the final wait
+for one output (for example dV) may cross independent preparation for the next
+output (dK) and stop at dK's staging write. The last wait in the block remains
+the final drain.
+
+CLC epilogues are straight-line regions inside the persistent scheduler's
+`scf.while`. Their annotated waits retain `planned_pending_count = K - 1`, so
+the K-slot staging ring overlaps stores across scheduler iterations. Because
+the loop can terminate with stores still pending, the pass emits one
+queue-wide `wait_group(0)` after the `scf.while` for every issuing async task.
+This is the CLC counterpart of the post-`scf.for` drain used by merged
+epilogues.
+
+For annotated operations, merged epilogue loops
+(`tt.merge_epilogue_to_computation`) serialize the
+same-iteration part of the coarse schedule directly into block order: the pass
+selects the nearest matching writer before the chosen future TMA operation, so
+a two-slot dQ ring maps store 0's wait to store 2 rather than the earlier
+equivalent slot-0 writer. These loops are intentionally not expanded by the GPU
+pipeliner. Barrier-free wraparound token waits are therefore materialized as
+queue-wide `wait_group(K-1)` operations before the next iteration's staging
+writers, followed by one `wait_group(0)` drain after the loop. Ordinary
+software-pipelined loops retain their loop-carried token schedule.
+
+When a planned-count wait (K > 1) moves to a later iteration of an ordinary
+pipelined loop, it sits a stage after the staging writer, so the pipeliner's
+prologue has no copy of it: the first iterations of the next run of the loop
+(for example the next persistent tile's epilogue) would write the staging slots
+while the previous run's last K-1 stores are still in flight (the drain copies
+keep the rotated count). For barrier- and token-free waits the pass therefore
+also gives the target writer a queue-wide `wait_group(min(K-1, n))` in the
+writer's own stage, where n is the number of TMA store-like ops issued between
+the store and that writer. In steady state it waits for the same store as the
+token wait. One `wait_group(0)` after the outermost enclosing loop drains the
+last run.
+
+The merge attribute can be on an enclosing persistent loop rather than the
+loop containing the dQ stores. The pass therefore searches the loop ancestry:
+an inner reduction loop inherits the merged-epilogue realization and receives
+its final drain immediately after that inner loop. Checking only the immediate
+loop leaves loop-carried token waits in final TTGIR and loses the drain.
+
+### Algorithm
+
+For each annotated `TMAStoreTokenWaitOp` with `can_rotate_by_buffer_count = K`:
+
+1. **Deserialize the schedule** from the `scf.for` loop. If no schedule
+   exists, create a trivial single-stage schedule so the logic can still
+   proceed.
+
+2. **Linearize from the defining TMA store**: use
+   `schedule.linearized(forOp, tmaStore)` to get an iterator that walks
+   ops in pipeline-unrolled order (wrapping across stages up to
+   `numStages + K`). Note: That we may only increase by 1 stage (we move
+   by K TMA stores, not necessarily K pipeline stages).
+
+3. **Count K stores**: walk the linearized schedule, counting
+   `AsyncTMACopyLocalToGlobalOp` and `AsyncTMAReduceOp` ops. Stop at the K-th
+   store-like op — this is the point where the buffer slot would be reused.
+
+4. **Adjust for barriers**: scan backwards from the insertion target to
+   find a preceding `WaitBarrierOp`. If one exists, insert before it
+   instead — this avoids placing the TMA store wait between a barrier
+   wait and the ops it guards.
+
+5. **Update the schedule**: split the cluster at the insertion target and
+   create a new cluster for the wait op, assigned to the target's pipeline
+   stage. Serialize the modified schedule back to the loop.
+
+6. **Remove the annotation**: strip `can_rotate_by_buffer_count` from the
+   wait op.
+
+### Example
+
+With `buffer.copy = 2` (double-buffered) and a 3-stage pipeline:
+
+```
+Stage 0: AsyncTMACopyLocalToGlobal (store to buffer[0])
+         TMAStoreTokenWait          ← originally placed here
+Stage 1: ...compute...
+Stage 2: AsyncTMACopyLocalToGlobal (store to buffer[1])
+```
+
+After reordering with K=2, the wait moves forward to just before the 2nd
+copy (which would overwrite buffer[0]):
+
+```
+Stage 0: AsyncTMACopyLocalToGlobal (store to buffer[0])
+Stage 1: ...compute...
+Stage 2: TMAStoreTokenWait          ← moved here
+         AsyncTMACopyLocalToGlobal (store to buffer[1])
+```
+
+This allows the compute in stage 1 to overlap with the asynchronous TMA
+store instead of stalling.
+
+## Final Lowering: `NVGPUTMAStoreTokenWaitLoweringPass`
+
+**Pass**: `nvgpu-tma-store-token-wait-lowering`
+
+After reordering, a separate pass lowers each `TMAStoreTokenWaitOp` into
+concrete hardware operations:
+
+1. **Compute pendings**: count TMA store-like ops
+   (`AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp`) between the
+   defining store and the wait (in program order). For loop-carried
+   tokens, this wraps around the loop body boundary.
+2. **Emit `TMAStoreWaitOp`**: waits until at most `pendings` TMA stores
+   remain in flight.
+3. **Emit `ArriveBarrierOp`**: for each barrier attached to the wait,
+   signals that the SMEM buffer is now free for reuse.
+4. **Erase** the original `TMAStoreTokenWaitOp`.
+
+See also [Memory Lowering](MemoryLowering.md) for the broader context of
+how TMA stores fit into the WS memory lowering pipeline.
+
+## Code Partition: Realizing `allocation.reuseTarget`
+
+**File**: `WSCodePartition.cpp::doCodePartition`
+
+The planner's `allocation.reuseTarget = N` annotation is a SMEM-accounting
+hint. To actually realize the SMEM overlap in the emitted kernel, two
+coordinated steps are required inside `doCodePartition` before the layout
+pass (`AllocateSharedMemoryNv`) runs:
+
+### Step 1: Insert the Cross-Tile Reuse WAR Barrier (Step 7.5)
+
+Because the staging buffer aliases the host operand SMEM, the **next tile's
+operand load** must not overwrite that SMEM until the **previous tile's staging
+TMA store** has finished reading it. Step 7.5 emits a dedicated, single-buffered
+cross-partition token for this write-after-read edge:
+
+- the **load task** does a `producer_acquire` at the **top of the persistent
+  outer loop** (before the operand loads), and
+- the **staging task** does a `consumer_release` at the **bottom of the outer
+  loop** (after the staging stores, which have already drained).
+
+Both are loop-carried (phase derived from the outer-loop induction variable via
+`getBufferIdxAndPhase`), so the edge serializes `load(tile N+1)` after
+`staging-store(tile N)`. The load and staging genuinely alias the same SMEM, so
+this serialization removes no legitimate overlap.
+
+```mlir
+scf.for %tile = ... {
+  nvws.producer_acquire %reuse_token, %idx, %phase   // load task, top
+  ... operand loads (v/do) ...
+  ... MMAs, epilogue, dv/dk staging stores + async_tma_store_token_wait ...
+  nvws.consumer_release %reuse_token, %idx           // staging task, bottom
+  scf.yield
+}
+```
+
+**Why a dedicated token (not the host operand's own barrier).** The host
+operand buffer's empty barrier is released by its MMA consumer, which finishes
+*before* the staging store — too early. It also cannot carry an extra release
+from the staging task: the staging task and the MMA task have different warp
+counts, which trips the `consumerWarps == nWarps` assert in `WSLowerToken`. A
+separate token has a uniform consumer (the staging task), avoiding the conflict.
+
+**Earlier (degenerate) design — fixed.** Step 7.5 previously emitted a
+`producer_acquire` on the *host* token before the staging store, with constant
+`bufferIdx = 0` / `phase = 0`. That gated the wrong direction (the staging
+*write* after the host read, which the dv/dk accumulator-complete wait already
+covers) and, with a constant phase, never alternated across the persistent loop
+— a no-op. It happened to be harmless on the non-persistent (single-tile) path
+but left the persistent path with a cross-tile SMEM race (non-deterministic
+wrong dv/dk gradients). The cross-tile WAR token above replaces it. Regression
+coverage: `test_bwd_tmem_dsT_reuse_3group_persistent`.
+
+**Important ordering constraint**: this insertion **must** run **before**
+`insertAsyncComm`, whose cleanup sweep (`removeTokenfNotUsed`) erases any token
+alloc currently lacking users — the freshly-created reuse token only gains uses
+once the acquire/release are inserted. This is enforced as "Step 7.5" — running
+between `createToken` (Step 7) and `insertAsyncComm` (Step 8). See commit
+`c67893c25` for the related ordering bug-fix.
+
+### Step 2: Reinterpret Staging Alloc into Host Alloc
+
+After Step 7.5 makes the cross-partition timing safe, the staging
+`local_alloc` is **replaced** by a `memdesc_reinterpret` view of the
+host alloc. All uses of the staging memdesc (TMA copy/reduce ops,
+`memdesc_index` for rotation, `local_store`, etc.) are rewritten to
+reference the reinterpret view, and the original staging alloc is
+erased.
+
+This is analogous to the TMEM path in the existing `replaceBufferReuse`
+(which uses `sliceAndReinterpretMDTMEM` to overlay multiple TMEM
+allocs into one region — see
+[ReuseGroups.md §3 Buffer Replacement](ReuseGroups.md#3-buffer-replacement)),
+extended to SMEM:
+
+```mlir
+# Before:
+%v             = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared>
+%dv_staging    = ttg.local_alloc {allocation.reuseTarget = 3}
+                                 : () -> !ttg.memdesc<2x128x64xf16, #shared>
+... %dv_staging uses ...
+
+# After:
+%v             = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared>
+%dv_staging.view = ttg.memdesc_reinterpret %v
+                  : !ttg.memdesc<128x128xf16> -> !ttg.memdesc<2x128x64xf16>
+... %dv_staging.view uses ...
+# (original %dv_staging is erased)
+```
+
+The reinterpret is sound because the host alloc's storage covers at
+least `staging.size × staging.numCopies` bytes (this is exactly the
+condition `findReuseCandidate` checks when picking a target).
+
+### Why both steps are necessary
+
+| Step omitted | Symptom |
+|---|---|
+| Step 1 (cross-partition barrier) | Race: staging writer can clobber the host region while the host's consumer is still reading. |
+| Step 2 (reinterpret merge) | `AllocateSharedMemoryNv` places staging at a fresh offset (it has no awareness of `allocation.reuseTarget`), so the planner's "free" accounting is wrong: actual SMEM usage = planner total + Σ(staging × copies). For FA-bwd idx=2 / idx=0 this gap is ~64 KB and pushes the kernel over B200's 232 KB SMEM ceiling at codegen time. |

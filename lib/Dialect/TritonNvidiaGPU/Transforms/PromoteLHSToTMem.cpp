@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/Support/JSON.h"
 
 namespace ttg = mlir::triton::gpu;
 
@@ -19,6 +20,41 @@ namespace nvidia_gpu {
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 
 namespace {
+
+enum class OpndAMemType { Unspecified, SMem, TMem };
+
+/// Extract the memory type for opndA from a tt.autows annotation.
+static OpndAMemType getOpndAMemType(Operation *op) {
+  auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+  if (!attr)
+    return OpndAMemType::Unspecified;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return OpndAMemType::Unspecified;
+  }
+  auto *obj = parsed->getAsObject();
+  if (!obj)
+    return OpndAMemType::Unspecified;
+  auto *channelsArr = obj->getArray("channels");
+  if (!channelsArr)
+    return OpndAMemType::Unspecified;
+  for (auto &elem : *channelsArr) {
+    auto str = elem.getAsString();
+    if (!str)
+      continue;
+    StringRef channel = *str;
+    if (!channel.consume_front("opndA,"))
+      continue;
+    StringRef memType = channel.take_front(channel.find(','));
+    if (memType == "smem")
+      return OpndAMemType::SMem;
+    if (memType == "tmem")
+      return OpndAMemType::TMem;
+  }
+  return OpndAMemType::Unspecified;
+}
+
 template <class MMAOpTy>
 Attribute getLHSTMemLayout(MMAOpTy tcGen5MMAOp, gpu::MemDescType lhsTMEMType) {
   int numWarps = ttg::lookupNumWarps(tcGen5MMAOp);
@@ -41,11 +77,51 @@ public:
     if (localAllocOp->getParentRegion() != tcGen5MMAOp->getParentRegion())
       return failure();
     Value src = localAllocOp.getSrc();
+    // A source-less operand A has no register source to promote. Decline
+    // instead of crashing on the null value below.
+    if (!src)
+      return failure();
+    // Check tt.autows annotation for explicit opndA memory type.
+    // If annotated as "smem", skip promotion. If "tmem", promote directly
+    // (skip the transposed-shared-source heuristic). If no annotation,
+    // fall through to the heuristic.
+    const OpndAMemType opndAMem = getOpndAMemType(tcGen5MMAOp);
+    if (opndAMem == OpndAMemType::SMem)
+      return failure();
+    const bool annotatedTmem = opndAMem == OpndAMemType::TMem;
+
+    // If the same source value is also allocated and transposed for use as
+    // operand A of another gen5 MMA, skip promotion. The transposed path
+    // cannot be promoted to tmem, so keeping both in smem avoids a redundant
+    // tmem allocation and copy for the same data. This covers both:
+    //   1. Same local_alloc used directly + through memdesc_trans
+    //   2. Separate local_allocs from the same src, one transposed
+    if (!annotatedTmem) {
+      for (Operation *srcUser : src.getUsers()) {
+        auto otherAlloc = dyn_cast<ttg::LocalAllocOp>(srcUser);
+        if (!otherAlloc)
+          continue;
+        for (Operation *allocUser : otherAlloc->getResult(0).getUsers()) {
+          if (auto transOp = dyn_cast<ttg::MemDescTransOp>(allocUser)) {
+            for (Operation *transUser : transOp->getResult(0).getUsers()) {
+              if (auto mmaOp = dyn_cast<TCGen5MMAOp>(transUser)) {
+                if (mmaOp.getA() == transOp->getResult(0))
+                  return failure();
+              } else if (auto mmaScaledOp =
+                             dyn_cast<TCGen5MMAScaledOp>(transUser)) {
+                if (mmaScaledOp.getA() == transOp->getResult(0))
+                  return failure();
+              }
+            }
+          }
+        }
+      }
+    }
     auto srcType = cast<RankedTensorType>(src.getType());
     auto srcLayout = srcType.getEncoding();
     auto accTMemEncoding = dyn_cast<TensorMemoryEncodingAttr>(
         tcGen5MMAOp.getD().getType().getEncoding());
-    auto cgaLayout = triton::gpu::getCGALayout(lhs.getType().getEncoding());
+    auto cgaLayout = triton::gpu::getCGALayout(srcLayout);
     // TMem encoding for A operand is the same as for D (Acc), with colStride 1,
     // i.e. densely packed in TMEM.
     unsigned elemBitWidth = lhs.getType().getElementTypeBitWidth();
@@ -56,16 +132,45 @@ public:
     if (isFp4Padded(lhs.getType().getEncoding())) {
       return failure();
     }
+    // The K=96 lowering takes A from shared memory; A in TMEM is not yet
+    // implemented (T296112607).
+    if constexpr (std::is_same_v<MMAOpTy, TCGen5MMAScaledOp>) {
+      auto mod = tcGen5MMAOp->template getParentOfType<ModuleOp>();
+      if (tcGen5MMAOp.getAType() == ScaleDotElemType::E2M1 &&
+          tcGen5MMAOp.getBType() == ScaleDotElemType::E2M1 &&
+          mod->hasAttr(ttg::AttrTargetName) &&
+          getTcgen05InstrK(
+              4, accTMemEncoding.getBlockM(), tcGen5MMAOp.getBlockK(), false,
+              TargetFeatures::fromModuleOp(mod).supportsK96Tcgen05MMA()) == 96)
+        return failure();
+    }
     const unsigned colStride = 1;
+    // An NPOT K sits in TMEM blocks of its pow2 alloc shape, like an NPOT N
+    // accumulator.
+    SmallVector<int64_t> lhsPow2AllocShape =
+        ttg::getNpotPow2AllocShape(lhs.getType().getShape());
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
-        context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
-        colStride, cgaLayout, accTMemEncoding.getTwoCTAs());
+        context, accTMemEncoding.getBlockM(), lhsPow2AllocShape[1], colStride,
+        cgaLayout, accTMemEncoding.getTwoCTAs(),
+        accTMemEncoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS
+            ? TensorMemoryCTAMode::TwoCTA_LHS
+            : accTMemEncoding.getCtaMode());
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     ttg::MemDescType lhsMemDescType = ttg::MemDescType::get(
         lhs.getType().getShape(), lhs.getType().getElementType(), aTMemEncoding,
         tensorMemorySpace,
-        /*mutableMemory=*/false);
+        /*mutableMemory=*/false, lhsPow2AllocShape);
+    // The accumulator and the promoted A are both live at the MMA, so they
+    // must fit in TMEM together (576 columns on sm_107, as the launch check).
+    auto target = tcGen5MMAOp->template getParentOfType<ModuleOp>()
+                      ->template getAttrOfType<StringAttr>(ttg::AttrTargetName);
+    unsigned maxTmemCols =
+        target && target.getValue() == "cuda:107" ? 576 : 512;
+    unsigned accCols = getTmemAllocSizes(tcGen5MMAOp.getD().getType()).numCols;
+    unsigned lhsCols = getTmemAllocSizes(lhsMemDescType).numCols;
+    if (accCols + lhsCols > maxTmemCols)
+      return failure();
     bool layoutTmemCompatible =
         isDistributedLayoutTMemCompatible(tcGen5MMAOp, srcType, lhsMemDescType);
     Attribute newLayout = srcLayout;

@@ -1,16 +1,12 @@
 #include "TraceDataIO/EntryDecoder.h"
 #include "TraceDataIO/TraceWriter.h"
 #include "nlohmann/json.hpp"
-#include <cerrno>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <iostream>
-#include <system_error>
-#include <unistd.h>
 #include <vector>
 
 using json = nlohmann::json;
@@ -18,26 +14,15 @@ using namespace proton;
 
 class ChromeTraceWriterTest : public ::testing::Test {
 public:
-  void SetUp() override {
-    // CTest can run individual cases alongside the whole test executable.
-    std::string pattern =
-        (std::filesystem::temp_directory_path() / "proton-chrome-trace-XXXXXX")
-            .string();
-    char *created = ::mkdtemp(pattern.data());
-    ASSERT_NE(created, nullptr) << std::strerror(errno);
-
-    chromeTraceDir = created;
-    chromeTracePath = (chromeTraceDir / "chrome_trace.json").string();
-  }
+  void SetUp() override {}
 
   void TearDown() override {
-    if (chromeTraceDir.empty())
-      return;
-
-    std::error_code error;
-    std::filesystem::remove_all(chromeTraceDir, error);
-    EXPECT_FALSE(error) << "Error cleaning up " << chromeTraceDir << ": "
-                        << error.message();
+    try {
+      std::filesystem::remove_all(chromeTracePath);
+    } catch (const std::filesystem::filesystem_error &e) {
+      std::cerr << "Error cleaning up test trace files: " << e.what()
+                << std::endl;
+    }
   }
 
   void printJsonTrace(json data) { std::cout << data.dump(4) << std::endl; }
@@ -81,8 +66,7 @@ public:
   }
 
 protected:
-  std::filesystem::path chromeTraceDir;
-  std::string chromeTracePath;
+  std::string chromeTracePath = "chrome_trace.json";
 };
 
 TEST_F(ChromeTraceWriterTest, SingleBlock) {

@@ -1,13 +1,16 @@
+import ast
 import functools
 import os
+import re
 import subprocess
 import triton
 import ctypes
 import sys
+from pathlib import Path
 from triton import knobs
 from triton._C.libtriton.gsan_testing import PER_DEVICE_STATE_STRIDE_BYTES as GSAN_PER_DEVICE_STATE_STRIDE
 from triton._instrumentation import is_enabled
-from triton.runtime.build import compile_module_from_file
+from triton.runtime.build import compile_module_from_src
 from triton.runtime import _allocation
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import (
@@ -21,8 +24,18 @@ from triton.backends.driver import (
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
+# Path to the shared data-driven launcher core. It lives in the nvidia backend
+# dir (next to driver.c / driver.py) and is the canonical source for C/C++
+# consumers (cc_library triton_launch_h). driver.c is compiled via a fixed
+# Remote-Execution command that ignores include_dirs, so we inline this header
+# into the driver.c source at build time (see CudaUtils.__init__) rather than
+# relying on an -I path. In both source and packaged/buck builds the header
+# sits next to this file.
+_launch_h_candidates = [
+    os.path.join(dirname, "launch.h"),
+]
 libdevice_dir = os.path.join(dirname, "lib")
-libraries = ['libcuda.so.1']
+libraries = ["libcuda.so.1"]
 PyCUtensorMap = None
 PyKernelArg = None
 ARG_CONSTEXPR = None
@@ -43,14 +56,14 @@ def libcuda_dirs():
     env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
     if env_ld_library_path and not dirs:
         dirs = [dir for dir in env_ld_library_path.split(":") if os.path.exists(os.path.join(dir, "libcuda.so.1"))]
-    msg = 'libcuda.so cannot found!\n'
+    msg = "libcuda.so cannot found!\n"
     if locs:
-        msg += 'Possible files are located at %s.' % str(locs)
-        msg += 'Please create a symlink of libcuda.so to any of the files.'
+        msg += "Possible files are located at %s." % str(locs)
+        msg += "Please create a symlink of libcuda.so to any of the files."
     else:
         msg += 'Please make sure GPU is set up and then run "/sbin/ldconfig"'
-        msg += ' (requires sudo) to refresh the linker cache.'
-    assert any(os.path.exists(os.path.join(path, 'libcuda.so.1')) for path in dirs), msg
+        msg += " (requires sudo) to refresh the linker cache."
+    assert any(os.path.exists(os.path.join(path, "libcuda.so.1")) for path in dirs), msg
     return dirs
 
 
@@ -106,8 +119,24 @@ class CudaUtils(object):
         return cls.instance
 
     def __init__(self):
-        mod = compile_module_from_file(
-            src_path=os.path.join(dirname, "driver.c"),
+        # Inline the shared launcher core (launch.h) directly into the driver
+        # source: the fbcode Remote-Execution compile uses a fixed clang command
+        # that does not honor include_dirs, so an `#include "triton/runtime/
+        # launch.h"` would not resolve. Substituting the header text keeps a
+        # single source of truth (launch.h) while making the compile
+        # self-contained.
+        driver_src = Path(os.path.join(dirname, "driver.c")).read_text(encoding="utf-8")
+        launch_h_path = next((p for p in _launch_h_candidates if os.path.exists(p)), None)
+        if launch_h_path is None:
+            raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
+        launch_h_src = Path(launch_h_path).read_text(encoding="utf-8")
+        include_marker = '#include "nvidia/backend/launch.h"'
+        if include_marker not in driver_src:
+            raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "
+                               "launch.h inlining, but it was not found")
+        driver_src = driver_src.replace(include_marker, launch_h_src)
+        mod = compile_module_from_src(
+            src=driver_src,
             name="cuda_utils",
             library_dirs=library_dirs(),
             include_dirs=include_dirs,
@@ -130,18 +159,25 @@ class CudaUtils(object):
         self.get_default_stream = mod.get_default_stream
         self.is_stream_capturing = mod.is_stream_capturing
         self.get_device_capability = mod.get_device_capability
-        self._get_device_properties = functools.lru_cache(maxsize=None)(mod.get_device_properties)
+        self.get_device_properties = mod.get_device_properties
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor_tiled = mod.fill_tma_descriptor_tiled
         self.fill_tma_descriptor_im2col = mod.fill_tma_descriptor_im2col
+        # Test-only hook to exercise the shared-core recipe TMA encoder.
+        self._test_construct_tma_desc = getattr(mod, "_test_construct_tma_desc", None)
+        self._tma_desc_bytes = getattr(mod, "_tma_desc_bytes", None)
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
-
-    def get_device_properties(self, device):
-        # CUDA device attributes are immutable. Keep the cached dictionary private
-        # so callers can continue to mutate their results independently.
-        return self._get_device_properties(device).copy()
+        self.fill_1d_tma_descriptor = mod.fill_1d_tma_descriptor
+        self.fill_2d_tma_descriptor = mod.fill_2d_tma_descriptor
+        self.fill_1d_tma_descriptor_type = mod.fill_1d_tma_descriptor_type
+        self.fill_2d_tma_descriptor_type = mod.fill_2d_tma_descriptor_type
+        self.TmaDescKernelParam = TmaDescKernelParam
+        self._TritonDispatcher = mod._TritonDispatcher
+        self._TritonJITRunner = mod._TritonJITRunner
+        self._ProxyRunner = mod._ProxyRunner
+        self.create_fast_jit_type = mod.create_fast_jit_type
 
 
 # ------------------------
@@ -150,7 +186,7 @@ class CudaUtils(object):
 
 
 def ty_to_cpp(ty):
-    if ty[0] == '*':
+    if ty[0] == "*":
         return "CUdeviceptr"
     if ty.startswith("tensordesc"):
         return "CUtensorMap"
@@ -175,6 +211,83 @@ def ty_to_cpp(ty):
     }[ty]
 
 
+def _flatten_schema_arg_type(ty, out):
+    """Flatten a schema arg ``type`` into the launcher-ABI scalar leaves.
+
+    A tuple-typed kernel argument is serialized in the Level 0 schema as a
+    stringified Python tuple, e.g. ``"('i32', 'constexpr')"``, ``"()"`` or
+    ``"(('constexpr',), ('i32',))"``. The variadic launcher
+    (``build_signature_metadata``) consumes only the flattened, non-constexpr
+    scalar leaves, mirroring ``make_kernel_signature``'s ``_flatten_signature``
+    plus the ``constexpr`` drop. Non-tuple types pass through unchanged; a type
+    that looks like a tuple but doesn't parse is left as-is so the launcher's
+    existing "Unknown data type" error still surfaces it.
+    """
+    if not ty.startswith("("):
+        out.append(ty)
+        return
+    try:
+        parsed = ast.literal_eval(ty)
+    except (ValueError, SyntaxError):
+        out.append(ty)
+        return
+
+    def _walk(node):
+        if isinstance(node, tuple):
+            for x in node:
+                _walk(x)
+        elif node != "constexpr":
+            out.append(node)
+
+    _walk(parsed)
+
+
+def build_kernel_signature_from_schema(schema):
+    """Derive kernel_signature bytes from Level 0 schema args array.
+
+    This makes the Level 0 schema the source of truth for type dispatch in the
+    shared variadic launcher (driver.c).  The schema's ``args`` list contains
+    only non-constant kernel parameters with their types already resolved.
+    """
+    flat_types = []
+    tensordesc_meta = schema.get("tensordesc_meta") or []
+    tensordesc_idx = 0
+
+    for arg in schema["args"]:
+        ty = arg["type"]
+        if ty.startswith("tensordesc"):
+            meta = (tensordesc_meta[tensordesc_idx] if tensordesc_idx < len(tensordesc_meta) else None)
+            tensordesc_idx += 1
+
+            match = re.match(r"tensordesc<([^[>]*)\[([^]]*)\]", ty)
+            dtype = match.group(1)
+            shape = match.group(2)
+            ndim = shape.count(",") + 1
+
+            if meta is None:
+                # Host TMA path: base pointer + shape + strides + padding flag
+                # + round_f32_to_tf32 flag. Must mirror expand_signature()'s host
+                # TMA path (two i1 flags) and make_tensordesc_arg()'s arg layout
+                # (arg.padding == "nan", arg.round_f32_to_tf32); see PR #9295.
+                flat_types.append("*" + dtype)
+                for _ in range(2 * ndim):
+                    flat_types.append("i64")
+                flat_types.append("i1")
+                flat_types.append("i1")
+            else:
+                # Device TMA path: nvTmaDesc
+                flat_types.append("nvTmaDesc")
+
+            for _ in range(ndim):
+                flat_types.append("i32")
+            for _ in range(ndim):
+                flat_types.append("i64")
+        else:
+            _flatten_schema_arg_type(ty, flat_types)
+
+    return triton.runtime.driver.active.utils.build_signature_metadata(flat_types)
+
+
 def annotate_arguments(signature):
     """
     This recreates the signature with annotations as C objects which can then
@@ -197,6 +310,20 @@ TMA_DTYPE_DEVICE_TO_HOST[8] = 10
 TMA_DTYPE_DEVICE_TO_HOST[9] = 8
 TMA_DTYPE_DEVICE_TO_HOST[10] = 9
 TMA_TF32 = 11
+TMA_B4X16_P64 = 14
+
+
+class TmaDescKernelParam:
+    TMA_DESC_SIZE = 128
+
+    def __init__(self):
+        import torch
+
+        self.desc = torch.empty(self.TMA_DESC_SIZE, dtype=torch.uint8, device="cpu")
+
+    # Return a CUtensorMap* pointer in host memory
+    def tma_desc_cpu_ptr(self):
+        return self.desc.data_ptr()
 
 
 def make_tensordesc_arg(arg, metadata, _):
@@ -207,7 +334,6 @@ def make_tensordesc_arg(arg, metadata, _):
     elem_size = metadata["elem_size"]
     elem_type = metadata["elem_type"]
     block_size = metadata["block_size"]
-    fp4_padded = metadata["fp4_padded"]
     is_im2col = metadata.get("is_im2col", False)
 
     shape = arg.shape
@@ -215,7 +341,8 @@ def make_tensordesc_arg(arg, metadata, _):
     assert strides[-1] == 1
     padding = 1 if arg.padding == "nan" else 0
 
-    if fp4_padded:
+    if elem_type == TMA_B4X16_P64:
+        # CUDA counts FP4 values. The backing tensor stores two per byte.
         expanded_shape = list(shape)
         expanded_shape[-1] *= 2
     else:
@@ -227,7 +354,7 @@ def make_tensordesc_arg(arg, metadata, _):
     if is_im2col:
         # Im2col mode - use im2col descriptor fill function
         # block_size from metadata is [pixelsPerColumn, channelsPerPixel] (possibly clamped)
-        element_strides = arg.element_strides if arg.element_strides is not None else [1] * len(shape)
+        element_strides = (arg.element_strides if arg.element_strides is not None else [1] * len(shape))
         cu_tensor_map = triton.runtime.driver.active.utils.fill_tma_descriptor_im2col(
             arg.base.data_ptr(),
             swizzle,
@@ -269,7 +396,6 @@ class CudaLauncher(object):
         tensordesc_abi = TensorDescABI.CUDA_TMA if tensordesc_meta else TensorDescABI.DECOMPOSED
 
         self.gsan_enabled = is_enabled(metadata, "gsan")
-        self.gsan_profile_enabled = is_enabled(metadata, "gsan-profile")
         self.shared = metadata.shared
         max_occupancy = getattr(metadata, "max_occupancy", None)
         if max_occupancy is not None:
@@ -284,18 +410,33 @@ class CudaLauncher(object):
             shared_per_cta = properties["max_shared_mem_per_multiprocessor"] // max_occupancy
             min_shared = shared_per_cta // 128 * 128 - properties["reserved_shared_mem_per_block"]
             self.shared = max(self.shared, min_shared)
-        if self.gsan_enabled or self.gsan_profile_enabled:
+        if self.gsan_enabled:
             signature["_gsan_globals_ptr"] = "*i8"
             signature["_gsan_launch_table_ptr"] = "*i8"
             signature["_gsan_launch_index"] = "i64"
 
         utils = triton.runtime.driver.active.utils
         expanded_signature = expand_signature(signature.values(), tensordesc_abi)
-        self.arg_annotations = annotate_arguments(expanded_signature)
+        # kernel_signature + arg_annotations are both derived from the object
+        # signature (src.signature): expand_signature flattens tensordescs, then
+        # get_kernel_argument_layout / annotate_arguments walk the actual argument-type
+        # OBJECTS via isinstance(...). A NamedTuple *is* a tuple, so it flattens
+        # structurally like any other tuple -- no reliance on str(ty). Deriving the
+        # signature from the Level 0 schema's stringified types is a repr blind
+        # spot: a NamedTuple stringifies to a class repr ("Function(fn=...,
+        # captured=...)") rather than a tuple literal, so a string parser silently
+        # mis-flattens it. For every non-NamedTuple case this is byte-identical to
+        # the old schema path (asserted by
+        # test_launch_metadata.py::test_schema_derived_signature_matches_legacy).
         self.kernel_signature = utils.build_signature_metadata(
             [ty for _, ty in get_kernel_argument_layout(signature.values(), tensordesc_abi)])
+        self.arg_annotations = annotate_arguments(expanded_signature)
         self.num_ctas = getattr(metadata, "num_ctas", 1)
         self.launch = wrap_handle_tensordesc(utils.launch, signature, tensordesc_meta)
+        # Compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA): the
+        # launcher builds each CUtensorMap host-side from existing scalar args
+        # via the launch.h recipe core and injects it (no device global scratch).
+        self.auto_tma_recipes = getattr(metadata, "auto_tma_recipes", []) or []
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -303,8 +444,31 @@ class CudaLauncher(object):
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
         self.launch_pdl = metadata.launch_pdl
 
-    def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata, launch_metadata, launch_enter_hook,
-                 launch_exit_hook, *args):
+        # Distinguish between Triton's way and TLX's way by checking if ctas_per_cga
+        # was explicitly set:
+        # - Triton's way: Uses num_ctas > 1. Grid is multiplied by num_ctas to get total CTAs.
+        # - TLX's way (CUDA native): Uses ctas_per_cga to set cluster shape.
+        #   Grid equals total CTAs, and ctas_per_cga regroups them into clusters.
+        # When ctas_per_cga is set, num_ctas must be 1 to prevent multiplicative behavior.
+        if getattr(metadata, "ctas_per_cga", None) is not None:
+            self.num_ctas = 1
+        else:
+            self.num_ctas = metadata.num_ctas
+
+    def __call__(
+        self,
+        gridX,
+        gridY,
+        gridZ,
+        stream,
+        function,
+        kernel_metadata,
+        launch_metadata,
+        launch_enter_hook,
+        launch_exit_hook,
+        *args,
+    ):
+
         active_driver = triton.runtime.driver.active
 
         def allocate_scratch(size, align, allocator):
@@ -324,32 +488,49 @@ class CudaLauncher(object):
 
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
         if _allocation.has_profile_allocator():
-            profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
-                                               _allocation._profile_allocator)
+            profile_scratch = allocate_scratch(
+                self.profile_scratch_size,
+                self.profile_scratch_align,
+                _allocation._profile_allocator,
+            )
         else:
             profile_scratch = allocate_default_profile_scratch(self.profile_scratch_size, self.profile_scratch_align)
 
         kernel_args = args
-        if self.gsan_profile_enabled:
-            from triton.experimental.gsan.profile import _launch_state
-            kernel_args = (*args, _launch_state(), 0, 0)
-        elif self.gsan_enabled:
+        if self.gsan_enabled:
             if active_driver.utils.is_stream_capturing(stream):
                 raise RuntimeError("GSan does not support CUDA graph capture")
 
             import triton.experimental.gsan._allocator as gsan_allocator
             import triton.experimental.gsan._stream_sync as gsan_stream_sync
-            device = triton.runtime.driver.active.get_current_device()
+
+            device = active_driver.get_current_device()
             device_rank = gsan_allocator.get_device_rank(device)
             gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
             launch_table, launch_index = gsan_stream_sync.get_launch_state(device, stream, self.launch_pdl)
             kernel_args = (*args, gsan_state_ptr, launch_table, launch_index)
 
-        num_warps, num_ctas, _ = kernel_metadata
-        kernel_metadata = (num_warps, num_ctas, self.shared)
-        self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
-                    kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, global_scratch,
-                    profile_scratch, self.arg_annotations, self.kernel_signature, kernel_args)
+        num_warps, num_ctas, _, *cluster_dims = kernel_metadata
+        kernel_metadata = (num_warps, num_ctas, self.shared, *cluster_dims)
+        self.launch(
+            gridX,
+            gridY,
+            gridZ,
+            stream,
+            function,
+            self.launch_cooperative_grid,
+            self.launch_pdl,
+            kernel_metadata,
+            launch_metadata,
+            launch_enter_hook,
+            launch_exit_hook,
+            global_scratch,
+            profile_scratch,
+            self.arg_annotations,
+            self.kernel_signature,
+            self.auto_tma_recipes,
+            kernel_args,
+        )
 
 
 class CudaDriver(GPUDriver):
@@ -389,14 +570,23 @@ class CudaDriver(GPUDriver):
 
     def get_active_torch_device(self):
         import torch
+
         return torch.device("cuda", self.get_current_device())
 
     def get_device_interface(self):
         import torch
+
         return torch.cuda
 
     @staticmethod
     def is_active():
+        # TODO: Replace with the result of https://github.com/triton-lang/triton/issues/10938
+        # Temporary workaround for torch-loaded processes: cuInit(0) is not
+        # fork-safe after CUDA initialization and can make Triton report no
+        # active driver from forked workers.
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            return torch.cuda.is_available() and torch.version.hip is None
         return _cuda_driver_is_active()
 
     def map_python_to_cpp_type(self, ty: str) -> str:
@@ -404,6 +594,7 @@ class CudaDriver(GPUDriver):
 
     def get_benchmarker(self):
         from triton.testing import do_bench
+
         return do_bench
 
     def get_empty_cache_for_benchmark(self):
@@ -413,7 +604,7 @@ class CudaDriver(GPUDriver):
         # before each kernel call to make sure that the L2 cache
         # doesn't contain any input data before the run
         cache_size = 256 * 1024 * 1024
-        return torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')
+        return torch.empty(int(cache_size // 4), dtype=torch.int, device="cuda")
 
     def clear_cache(self, cache):
         cache.zero_()

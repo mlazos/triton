@@ -174,13 +174,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-// The shared layout should not be changed
+// A swizzled fp16 dst whose per-thread width collapses to 16-bit (here the bare
+// src has no contiguity so vec=1) cannot be lowered as a direct-to-LDS copy on
+// CDNA -- 16-bit is unsupported for both swizzled and padded dsts. Fall back to
+// a synchronous tt.load + ttg.local_store instead of leaving an op that fails to
+// legalize later. The swizzled shared layout is still not rewritten.
 // CHECK: #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 // CHECK-NOT: #shared1
-// CHECK-LABEL: async_copy_2d_swizzled
-tt.func @async_copy_2d_swizzled(%input: tensor<64x64x!tt.ptr<f16>, #blocked>,
+// CHECK-LABEL: async_copy_2d_swizzled_unsupported_vec
+tt.func @async_copy_2d_swizzled_unsupported_vec(%input: tensor<64x64x!tt.ptr<f16>, #blocked>,
     %view: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) {
-  // CHECK: %{{.*}} = ttg.async_copy_global_to_local {{.*}} -> <64x64xf16, #shared, #smem, mutable>
+  // CHECK-NOT: ttg.async_copy_global_to_local
+  // CHECK: %[[V:.*]] = tt.load %{{.*}} : tensor<64x64x!tt.ptr<f16>, #blocked>
+  // CHECK: ttg.local_store %[[V]], %{{.*}} : tensor<64x64xf16, #blocked> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
   %token = ttg.async_copy_global_to_local %input, %view: tensor<64x64x!tt.ptr<f16>, #blocked> -> <64x64xf16, #shared, #smem, mutable>
   tt.return
 }
@@ -200,6 +206,37 @@ tt.func @async_copy_with_padding_different_vec(%input: tensor<256x!tt.ptr<f32>, 
     %view: !ttg.memdesc<256xf32, #shared, #smem, mutable>) {
   // CHECK: %{{.*}} = ttg.async_copy_global_to_local %{{.*}}: tensor<256x!tt.ptr<f32>, #[[$NEW_SRC_ENCODING]]>
   %token = ttg.async_copy_global_to_local %input, %view: tensor<256x!tt.ptr<f32>, #blocked> -> <256xf32, #shared, #smem, mutable>
+  tt.return
+}
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// A gather-transpose can be contiguous along dimension 0 even though the
+// initial register and shared layouts select dimension 1. Retarget a simple
+// TLX allocation and its index view so gfx950 can issue a 128-bit direct load.
+// CHECK: #[[$GATHER_BLOCKED:.*]] = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [16, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+// CHECK: #[[$GATHER_SHARED:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+// CHECK-LABEL: async_copy_gather_transpose
+tt.func @async_copy_gather_transpose(
+    %input: tensor<128x64x!tt.ptr<bf16>, #blocked>
+        {tt.contiguity = dense<[8, 1]> : tensor<2xi32>,
+         tt.divisibility = dense<[16, 2]> : tensor<2xi32>}) {
+  // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x128x64xbf16, #[[$GATHER_SHARED]], #smem, mutable>
+  %smem = ttg.local_alloc : () -> !ttg.memdesc<2x128x64xbf16, #shared, #smem, mutable>
+  %c0 = arith.constant 0 : i32
+  // CHECK: %[[VIEW:.*]] = ttg.memdesc_index %[[ALLOC]]
+  // CHECK-SAME: !ttg.memdesc<128x64xbf16, #[[$GATHER_SHARED]], #smem, mutable>
+  %view = ttg.memdesc_index %smem[%c0] : !ttg.memdesc<2x128x64xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xbf16, #shared, #smem, mutable>
+  // CHECK: %[[SRC:.*]] = ttg.convert_layout %{{.*}} : {{.*}} -> tensor<128x64x!tt.ptr<bf16>, #[[$GATHER_BLOCKED]]>
+  // CHECK: ttg.async_copy_global_to_local %[[SRC]], %[[VIEW]]
+  // CHECK-SAME: contiguity = 8
+  %token = ttg.async_copy_global_to_local %input, %view : tensor<128x64x!tt.ptr<bf16>, #blocked> -> <128x64xbf16, #shared, #smem, mutable>
+  %value = ttg.local_load %view : !ttg.memdesc<128x64xbf16, #shared, #smem, mutable> -> tensor<128x64xbf16, #blocked>
   tt.return
 }
 }
@@ -277,6 +314,27 @@ tt.func @async_copy_with_padding_different_vec(%input: tensor<256x!tt.ptr<f32>, 
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.padded_shared<[16:+2] {order = [0], shape = [256]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// A padded dst whose per-thread width collapses below a supported direct-to-LDS
+// bitwidth (here 16-bit) cannot be lowered as a direct-to-LDS copy on CDNA. Instead
+// of leaving an op that fails to legalize later, fall back to a synchronous
+// tt.load + ttg.local_store (Membar adds the LDS barrier).
+// CHECK-LABEL: async_copy_fp16_padded_unsupported_vec
+tt.func @async_copy_fp16_padded_unsupported_vec(%input: tensor<256x!tt.ptr<f16>, #blocked>,
+    %view: !ttg.memdesc<256xf16, #shared, #smem, mutable>) {
+  // CHECK-NOT: ttg.async_copy_global_to_local
+  // CHECK: %[[V:.*]] = tt.load %{{.*}} : tensor<256x!tt.ptr<f16>, #blocked>
+  // CHECK: ttg.local_store %[[V]], %{{.*}} : tensor<256xf16, #blocked> -> !ttg.memdesc<256xf16, #shared, #smem, mutable>
+  %token = ttg.async_copy_global_to_local %input, %view : tensor<256x!tt.ptr<f16>, #blocked> -> <256xf16, #shared, #smem, mutable>
+  tt.return
+}
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
 #smem = #ttg.shared_memory
@@ -288,6 +346,25 @@ tt.func @async_copy_with_mismatching_order_and_unsupported_vec_width(%input: ten
   // CHECK: %[[CVT:.*]] = ttg.convert_layout %{{.*}} : {{.*}} -> tensor<64x2x!tt.ptr<f32>, #[[$NEW_BLOCKED]]>
   // CHECK: %{{.*}} = ttg.async_copy_global_to_local %[[CVT]], %{{.*}} : tensor<64x2x!tt.ptr<f32>, #[[$NEW_BLOCKED]]>
   %token = ttg.async_copy_global_to_local %input, %view {contiguity = 2 : i32} : tensor<64x2x!tt.ptr<f32>, #blocked> -> <64x2xf32, #shared, #smem, mutable>
+  tt.return
+}
+}
+
+// -----
+
+// Volatile async copies cannot use direct-to-LDS buffer intrinsics, so they
+// are decomposed into a synchronous volatile tt.load plus a local_store.
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// CHECK-LABEL: async_copy_volatile_decomposed
+tt.func @async_copy_volatile_decomposed(%input: tensor<1024x!tt.ptr<f32>, #blocked>,
+    %view: !ttg.memdesc<1024xf32, #shared, #smem, mutable>) {
+  // CHECK: %{{.*}} = tt.load %{{.*}} {isVolatile = true}
+  // CHECK: ttg.local_store %{{.*}}, %{{.*}}
+  // CHECK-NOT: ttg.async_copy_global_to_local
+  %token = ttg.async_copy_global_to_local %input, %view {isVolatile = true} : tensor<1024x!tt.ptr<f32>, #blocked> -> <1024xf32, #shared, #smem, mutable>
   tt.return
 }
 }

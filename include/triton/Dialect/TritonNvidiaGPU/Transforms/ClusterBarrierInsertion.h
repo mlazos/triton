@@ -3,6 +3,7 @@
 
 #include "mlir/Support/LogicalResult.h"
 #include "triton/Analysis/Allocation.h"
+#include "llvm/ADT/ArrayRef.h"
 
 namespace mlir {
 namespace triton {
@@ -19,9 +20,11 @@ void runClusterBarrierInsertion(ModuleAllocation &moduleAllocation,
 /// Inserts the mbarrier-init sequencing ops
 /// (fence_mbarrier_init_release_cluster + cluster_barrier(relaxed=true))
 /// for cross-CTA mbarriers using the provided allocation analysis.
+/// Skips only initialization operations covered by an earlier entry bootstrap.
 LogicalResult
 runCrossCTAMBarrierInitSyncInsertion(ModuleAllocation &moduleAllocation,
-                                     int computeCapability);
+                                     int computeCapability,
+                                     ArrayRef<Operation *> coveredInitOps = {});
 
 } // namespace nvidia_gpu
 } // namespace triton

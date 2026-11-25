@@ -5,7 +5,6 @@ from multiprocessing.connection import Client
 from pathlib import Path
 from types import SimpleNamespace
 
-import cloudpickle
 import pytest
 import torch
 
@@ -86,6 +85,7 @@ def test_compile_warmup_random_helpers_preserve_normal_randomness():
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_compile_warmup_coordinator_deduplicates_and_propagates_errors(monkeypatch, fails):
+    pytest.importorskip("cloudpickle")
     coordinator = SharedWarmupCoordinator(max_workers=1, trace_directory=None)
     submissions = []
 
@@ -285,6 +285,7 @@ def test_compile_warmup_spreads_prioritized_tests_across_capture_workers(monkeyp
 
 
 def test_compile_warmup_serializes_patched_source_globals(monkeypatch):
+    cloudpickle = pytest.importorskip("cloudpickle")
 
     @triton.jit
     def helper(value):
@@ -301,6 +302,7 @@ def test_compile_warmup_serializes_patched_source_globals(monkeypatch):
 
 
 def test_compile_warmup_reuses_equivalent_kernel_payloads(monkeypatch):
+    pytest.importorskip("cloudpickle")
     dispatcher = ProcessPoolWarmupDispatcher(max_workers=1, trace_directory=None, phase="warmup")
     dispatcher.current_test = "test"
     serialized = []

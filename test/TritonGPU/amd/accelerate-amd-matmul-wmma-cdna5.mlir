@@ -1,15 +1,23 @@
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx1250" | FileCheck %s --check-prefixes=CHECK,GFX1250
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx1250-strict" | FileCheck %s --check-prefixes=STRICT
+// STRICT-NOT: instrShape = [16, 16, 32]
+// STRICT-NOT: instrShape = [16, 16, 64]
+// STRICT-NOT: instrShape = [16, 16, 128]
+// STRICT-NOT: instrShape = [32, 16,
+// STRICT: instrShape = [16, 16, 4]
+// STRICT-NOT: instrShape = [16, 16, 32]
+// STRICT-NOT: instrShape = [16, 16, 64]
+// STRICT-NOT: instrShape = [16, 16, 128]
+// STRICT-NOT: instrShape = [32, 16,
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked3 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
-// CHECK{LITERAL}: #linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [16, 0]], block = []}>
-// CHECK{LITERAL}: #linear1 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = []}>
-// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 128]}>
-// CHECK{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 64]}>
-// STRICT{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 128]}>
+// CHECK{LITERAL}: #linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = []}>
+// CHECK{LITERAL}: #linear1 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [0, 0]], block = []}>
+// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[1, 0], [2, 0]]}, instrShape = [32, 16, 128]}>
+// CHECK{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[1, 0], [2, 0]]}, instrShape = [32, 16, 64]}>
 // CHECK-LABEL: wmma_dot_scaled_mxfp4_mxfp4
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @wmma_dot_scaled_mxfp4_mxfp4(
@@ -40,8 +48,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #blocked = #ttg.blocked<{sizePerThread = [16, 2], threadsPerWarp = [2, 16], warpsPerCTA = [1, 4], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [2, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
-// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 128]}>
-// CHECK{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 64]}>
+// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [0, 2]]}, instrShape = [32, 16, 128]}>
+// CHECK{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [0, 2]]}, instrShape = [32, 16, 64]}>
 // CHECK-LABEL: wmma_dot_scaled_mxfp4_mxfp4_packed_mn
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @wmma_dot_scaled_mxfp4_mxfp4_packed_mn(
@@ -57,6 +65,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %cst = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #blocked2>
     %0 = tt.dot_scaled %arg0, %arg1, %cst lhs = e2m1 rhs = e2m1 {fastMath = false, lhs_k_pack = false, rhs_k_pack = false} : tensor<32x128xi8, #blocked> * tensor<128x32xi8, #blocked1> -> tensor<64x64xf32, #blocked2>
     tt.store %arg2, %0 : tensor<64x64x!tt.ptr<f32>, #blocked2>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked3 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+// CHECK-DAG: #[[$MMA_TPW:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = {{\[\[0, 1\], \[1, 0\]\]}}, warp = {{\[\[0, 2\], \[2, 0\]\]}}}, instrShape = [16, 16, 128]}>
+// CHECK-LABEL: wmma_dot_scaled_explicit_tiles_per_warp
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @wmma_dot_scaled_explicit_tiles_per_warp(
+      %arg0: tensor<256x256xf8E4M3FN, #blocked>,
+      %arg1: tensor<256x256xf8E4M3FN, #blocked1>,
+      %arg2: tensor<256x8xi8, #blocked2>,
+      %arg3: tensor<256x8xi8, #blocked2>,
+      %arg4: tensor<256x256x!tt.ptr<f32>, #blocked3>
+      ) {
+    // CHECK: tt.dot_scaled {{.*}} -> tensor<256x256xf32, #[[$MMA_TPW]]>
+    %cst = arith.constant dense<0.000000e+00> : tensor<256x256xf32, #blocked3>
+    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e4m3 rhs = e4m3 {fastMath = false, amdg.wmma_tiles_per_warp = array<i32: 2, 2>} : tensor<256x256xf8E4M3FN, #blocked>, tensor<256x8xi8, #blocked2> * tensor<256x256xf8E4M3FN, #blocked1>, tensor<256x8xi8, #blocked2> -> tensor<256x256xf32, #blocked3>
+    tt.store %arg4, %1 : tensor<256x256x!tt.ptr<f32>, #blocked3>
     tt.return
   }
 }
@@ -463,10 +495,10 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked3 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
-// CHECK-DAG: #[[$SCALE0_LAYOUT:.+]] = #ttg.linear{{<{register = \[\[0, 1\], \[0, 2\]\], lane = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[0, 0\]\], warp = \[\[0, 0\], \[16, 0\]\], block = \[\]}>}}
-// CHECK-DAG: #[[$SCALE1_LAYOUT:.+]] = #ttg.linear{{<{register = \[\[0, 1\], \[0, 2\]\], lane = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[0, 0\]\], warp = \[\[16, 0\], \[0, 0\]\], block = \[\]}>}}
-// CHECK-DAG: #[[$MMA:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[0, 1\], \[1, 0\]\]}}}, instrShape = [16, 16, 128]}>
-// CHECK-DAG: #[[$MMA1:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[0, 1\], \[1, 0\]\]}}}, instrShape = [16, 16, 64]}>
+// CHECK-DAG: #[[$SCALE0_LAYOUT:.+]] = #ttg.linear{{<{register = \[\[0, 1\], \[0, 2\]\], lane = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[0, 0\]\], warp = \[\[16, 0\], \[0, 0\]\], block = \[\]}>}}
+// CHECK-DAG: #[[$SCALE1_LAYOUT:.+]] = #ttg.linear{{<{register = \[\[0, 1\], \[0, 2\]\], lane = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[16, 0\]\], warp = \[\[0, 0\], \[0, 0\]\], block = \[\]}>}}
+// CHECK-DAG: #[[$MMA:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[1, 0\], \[2, 0\]\]}}}, instrShape = [32, 16, 128]}>
+// CHECK-DAG: #[[$MMA1:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[1, 0\], \[2, 0\]\]}}}, instrShape = [32, 16, 64]}>
 // CHECK-LABEL: wmma_dot_scaled_mxfp4_mxfp4_missing_scale
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @wmma_dot_scaled_mxfp4_mxfp4_missing_scale(
@@ -495,7 +527,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 // GFX1250{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 128]}>
-// STRICT{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 64]}>
 // CHECK-LABEL: wmma_dot_fp8_k128
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @wmma_dot_fp8_k128(
@@ -517,7 +548,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #op1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
 
 // CHECK: instrShape = [16, 16, 4]
-// STRICT: instrShape = [16, 16, 4]
 // CHECK-LABEL: wmma_dot_f32_16x16x4
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @wmma_dot_f32_16x16x4(

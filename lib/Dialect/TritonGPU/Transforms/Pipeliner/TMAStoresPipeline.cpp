@@ -84,7 +84,8 @@ static void createTMAAsyncCopy(const TMAStore &store, Value alloc) {
                                               storeOp.getIndices(), alloc);
   } else if (auto reduceOp = dyn_cast<tt::DescriptorReduceOp>(store.op)) {
     ttng::AsyncTMAReduceOp::create(builder, loc, reduceOp.getKind(), desc,
-                                   reduceOp.getIndices(), alloc);
+                                   reduceOp.getIndices(), alloc,
+                                   triton::EvictionPolicy::NORMAL);
   } else {
     auto scatterOp = cast<tt::DescriptorScatterOp>(store.op);
     Value xOffsets =

@@ -2,9 +2,11 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -13,6 +15,12 @@ using namespace mlir;
 using namespace triton;
 using namespace triton::gpu;
 namespace ttng = triton::nvidia_gpu;
+namespace tlx = mlir::triton::tlx;
+
+namespace {
+constexpr StringLiteral kComputationPartitionType = "computation";
+constexpr StringLiteral kReductionPartitionType = "reduction";
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // relayoutWarps
@@ -125,10 +133,10 @@ static LogicalResult relayoutWarps(ModuleAxisInfoAnalysis &axisInfo,
 
   pm.clear();
   pm.addPass(createTritonGPUCoalesce());
-  pm.addPass(createTritonGPURemoveLayoutConversions());
+  pm.addPass(createTritonGPURemoveLayoutConversions({0}));
   pm.addPass(createTritonGPUOptimizeThreadLocality());
   pm.addPass(createTritonGPUAccelerateMatmul());
-  pm.addPass(createTritonGPURemoveLayoutConversions());
+  pm.addPass(createTritonGPURemoveLayoutConversions({0}));
   if (failed(runPipeline(pm, *container)))
     return failure();
 
@@ -159,13 +167,29 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   // Because the partition region is isolated from above, we could in theory
   // compile it to PTX and read the number of registers that got allocated.
   SmallVector<unsigned> maxTensorRegs;
+  // Whether a partition contains any tensor at all (including single-element
+  // ones). This gates layout relayout when the warp count changes, and is kept
+  // separate from the register-budget estimate below: a single-element tensor
+  // (e.g. the scalar broadcast AutoWS synthesizes for a dynamic-persistent tile
+  // id) must be relayouted if its partition's warps change, but must NOT
+  // reclassify an otherwise non-tensor partition into the tensor register
+  // class.
+  SmallVector<bool> partitionHasTensor;
   for (Region *partition : wsOp.getPartitionRegions()) {
     unsigned &tensorRegs = maxTensorRegs.emplace_back(0);
+    bool &hasTensor = partitionHasTensor.emplace_back(false);
+
     partition->walk([&](Operation *op) {
       for (Type type :
            llvm::concat<Type>(op->getOperandTypes(), op->getResultTypes())) {
-        if (auto tensor = dyn_cast<RankedTensorType>(type))
+        if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+          hasTensor = true;
+          // A single-element tensor is logically a scalar and carries no
+          // meaningful tensor register footprint, so ignore it for the budget.
+          if (tensor.getNumElements() <= 1)
+            continue;
           tensorRegs = std::max(tensorRegs, getTensorNumI32Regs(tensor));
+        }
       }
     });
     // Assume that the largest tensor accounts for half of the registers used
@@ -197,15 +221,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   for (auto [minWarps, region] :
        llvm::zip(minWarpsForPartition, wsOp.getPartitionRegions())) {
     region->walk([minWarps = &minWarps](Operation *op) {
-      // Some instructions have critical throughput if have low register usage.
-      // Make sure there are enough warps for these ops to execute quickly.
-      // TMAStoreLikeOps stay in the main partition, so they should not appear
-      // in partition regions here.
-      if (isa<ttng::TMALoadLikeOpInterface>(op))
-        *minWarps = 2;
-      // TMEM ops require at least 4 warps to be able to read all lanes.
-      else if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp>(op))
-        *minWarps = 4;
+      *minWarps = std::max(*minWarps, ttng::getMinWarpsForOp(op));
     });
   }
 
@@ -252,16 +268,95 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     }
   } while (changed);
 
-  SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
-  for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
-       llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
-                 wsOp.getPartitionNumWarps(), maxTensorRegs, estRegUsage)) {
-    // "Guess" the register usage for each partition.
-    estRegs = tensorRegs ? 88 : 24;
+  // Read partition types if available for type-aware warp assignment.
+  SmallVector<StringRef> partitionTypes;
+  if (auto typesAttr =
+          wsOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+    for (Attribute attr : typesAttr) {
+      if (auto strAttr = dyn_cast<StringAttr>(attr))
+        partitionTypes.push_back(strAttr.getValue());
+      else
+        partitionTypes.push_back("");
+    }
+  }
 
-    // Layouts need to be reassigned if the number of warps changed and there
-    // are tensor computations.
-    if (newNumWarps == prevNumWarps || !tensorRegs)
+  // Apply type-aware warp assignment overrides BEFORE relayout.
+  // This ensures layouts are computed with the correct warp counts.
+  //
+  // For bwd FA (has reduction): computation partition gets 8 warps.
+  // With reduction=4 (TMEM floor), gemm=1, load=1, computation=8,
+  // total = 14, within the 16 warp budget.
+  //
+  // The types array comes from the scheduler and may be longer than
+  // partitionNumWarps: it also covers the default region, and empty partitions
+  // may have been removed. Rather than assume a fixed role position (dependent
+  // 2-CTA attention appends a one-warp relay partition after computation), look
+  // the role up per region and key the warp overrides off that.
+  //
+  // The lookup is positional, not a real role map: it assumes the surviving
+  // regions are the LAST partitionNumWarps.size() entries of partitionTypes,
+  // i.e. that any extra entries sit at the front. That holds for the default
+  // region, and today for removed-empty partitions, but it is an invariant of
+  // the scheduler's emission order rather than something checked here. If a
+  // partition were ever dropped from the middle or the end, every role label
+  // would shift and a warp override could land on the wrong partition. The
+  // !isTwoCTA guard below bounds the blast radius; a genuine role map keyed by
+  // region would remove the assumption.
+  std::optional<size_t> partitionTypeOffset;
+  if (partitionTypes.size() >= partitionNumWarps.size())
+    partitionTypeOffset = partitionTypes.size() - partitionNumWarps.size();
+  auto getPartitionType = [&](size_t partitionIdx) -> StringRef {
+    if (!partitionTypeOffset)
+      return {};
+    size_t typeIdx = partitionIdx + *partitionTypeOffset;
+    return typeIdx < partitionTypes.size() ? partitionTypes[typeIdx]
+                                           : StringRef();
+  };
+
+  bool hasReduction = false;
+  bool hasComputation = false;
+  ModuleOp mod = axisInfo.getModuleOp();
+  bool isTwoCTA = mod->hasAttr(ttng::AttrTwoCTAsName);
+  // The type list also includes the default region, which may carry the only
+  // reduction/computation role. Scan the complete list for pattern detection,
+  // but use getPartitionType() for per-specialized-region assignments.
+  for (StringRef type : partitionTypes) {
+    if (type == kReductionPartitionType)
+      hasReduction = true;
+    if (type == kComputationPartitionType)
+      hasComputation = true;
+  }
+
+  if (hasReduction && hasComputation && !partitionNumWarps.empty()) {
+    for (size_t idx = 0; idx < partitionNumWarps.size(); ++idx) {
+      StringRef type = getPartitionType(idx);
+      if (type == kComputationPartitionType && !isTwoCTA)
+        partitionNumWarps[idx] = 8;
+    }
+  }
+
+  auto minRegAttr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName);
+  auto maxRegAttr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName);
+  bool hasMax = !!maxRegAttr;
+  int minRegAutoWS = minRegAttr ? minRegAttr.getInt() : 24;
+  int maxRegAutoWS = hasMax ? maxRegAttr.getInt() : -1;
+
+  SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
+  for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, hasTensor,
+             estRegs] : llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
+                                  wsOp.getPartitionNumWarps(), maxTensorRegs,
+                                  partitionHasTensor, estRegUsage)) {
+    // When both min and max are provided, use the current heuristic.
+    // When only min is provided (the default), tensor partitions get -1
+    // (sentinel for "split leftover evenly") while non-tensor partitions
+    // get the fixed minRegAutoWS allocation.
+    estRegs = hasMax ? (tensorRegs ? maxRegAutoWS : minRegAutoWS)
+                     : (tensorRegs ? -1 : minRegAutoWS);
+
+    // Layouts need to be reassigned if the number of warps changed and the
+    // partition contains any tensor (even a single-element broadcast tensor,
+    // which is excluded from tensorRegs above but still needs relayout).
+    if (newNumWarps == prevNumWarps || !hasTensor)
       continue;
     // We need to reassign layouts.
     if (failed(relayoutWarps(axisInfo, partition, prevNumWarps, newNumWarps,
@@ -290,10 +385,19 @@ struct OptimizePartitionWarps
       TritonGPUOptimizePartitionWarpsBase;
 
   void runOnOperation() override;
+  bool shouldBail(ModuleOp &mod) const {
+    auto hasManualWarpSpec =
+        mod->getAttrOfType<BoolAttr>(tlx::AttrHasWarpSpecOpsName);
+    return hasManualWarpSpec != nullptr && hasManualWarpSpec.getValue() == true;
+  }
 };
 } // namespace
 
 void OptimizePartitionWarps::runOnOperation() {
+  ModuleOp m = getOperation();
+  if (shouldBail(m))
+    return;
+
   SmallVector<WarpSpecializeOp> wsOps;
   getOperation().walk([&](WarpSpecializeOp wsOp) { wsOps.push_back(wsOp); });
 

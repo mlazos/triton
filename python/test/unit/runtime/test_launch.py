@@ -77,6 +77,8 @@ def test_max_occupancy_launch(max_occupancy, num_warps, num_ctas, device, monkey
         assert 0 <= launcher.shared <= properties["max_shared_mem"]
         if num_ctas == 1:
             # Check CUDA's occupancy calculation, independently of the reservation formula.
+            # Load libcuda by soname, as the launcher does. TRITON_LIBCUDA_PATH may
+            # name the library file rather than its directory.
             # Match the runtime loader's driver selection, including CUDA compatibility libraries.
             cuda = ctypes.CDLL("libcuda.so.1")
             occupancy = cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor
@@ -304,30 +306,6 @@ def test_launch_with_options(options, monkeypatch) -> None:
             assert compile_info[option_key] == tuple(option_val.items())
     else:
         assert compile_info[option_key] == option_val
-
-
-@pytest.mark.interpreter
-@pytest.mark.parametrize("keyword", [False, True])
-def test_callable_grid_launch_arguments(device, keyword):
-
-    @triton.jit
-    def kernel(X, N, VALUE: tl.constexpr = 7):
-        offset = tl.program_id(0) * N + tl.program_id(1)
-        tl.store(X + offset, VALUE)
-
-    x = torch.zeros((2, 4), dtype=torch.int32, device=device)
-
-    def grid(args):
-        assert args["X"] is x
-        assert isinstance(args["N"], int)
-        assert args["VALUE"] == 7
-        return (args["X"].numel() // args["N"], args["X"].shape[1])
-
-    if keyword:
-        kernel[grid](N=x.shape[1], X=x)
-    else:
-        kernel[grid](x, x.shape[1])
-    torch.testing.assert_close(x, torch.full_like(x, 7))
 
 
 @pytest.mark.interpreter

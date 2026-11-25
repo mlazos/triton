@@ -6,6 +6,7 @@ add_triton_library(TritonAnalysis
   Membar.cpp
   Alias.cpp
   Utility.cpp
+  ReductionOrder.cpp
 
   DEPENDS
   TritonTableGen
@@ -13,6 +14,7 @@ add_triton_library(TritonAnalysis
   TritonGPUAttrDefsIncGen
   TritonGPUTypeInterfacesIncGen
   TritonGPUOpInterfacesIncGen
+  TritonInstrumentTableGen
 
   LINK_LIBS PUBLIC
   MLIRAnalysis
@@ -20,4 +22,5 @@ add_triton_library(TritonAnalysis
   TritonGPUIR
   GluonIR
   TritonNvidiaGPUIR
+  TritonInstrumentIR
 )

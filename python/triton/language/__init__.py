@@ -3,6 +3,15 @@
 
 from . import math
 from . import extra
+# Import TLX features (async_task, async_tasks) for backward compatibility
+from .extra.tlx import async_task, async_tasks
+from .clc import clc_tile_scheduler, ClcTileScheduler
+from .schedule import (
+    TileScheduler,
+    NonPersistentScheduler,
+    StaticPersistent1DScheduler,
+    DynamicPersistent1DScheduler,
+)
 from .standard import (
     all,
     any,
@@ -31,15 +40,22 @@ from .standard import (
     zeros_like,
 )
 from .core import (
+    CompositeReductionOrdering,
     PropagateNan,
+    ReductionOrdering,
+    ReductionOrderingBase,
     TRITON_MAX_TENSOR_NUMEL,
+    _experimental_descriptor_load,
+    _experimental_descriptor_store,
     aggregate_replace,
     load_tensor_descriptor,
     store_tensor_descriptor,
     make_tensor_descriptor,
+    _experimental_reinterpret_tensor_descriptor,
     tensor_descriptor,
     tensor_descriptor_type,
     add,
+    advance,
     arange,
     associative_scan,
     assume,
@@ -105,6 +121,7 @@ from .core import (
     permute,
     pi32_t,
     pointer_type,
+    nv_tma_desc_type,
     program_id,
     range,
     reduce,
@@ -115,6 +132,7 @@ from .core import (
     static_print,
     static_range,
     store,
+    sr_store,
     sub,
     tensor,
     to_tensor,
@@ -147,21 +165,37 @@ from .random import (
 from . import target_info
 
 __all__ = [
+    "CompositeReductionOrdering",
     "PropagateNan",
+    "ReductionOrdering",
+    "ReductionOrderingBase",
     "TRITON_MAX_TENSOR_NUMEL",
+    "_experimental_descriptor_load",
+    "_experimental_descriptor_store",
     "load_tensor_descriptor",
     "store_tensor_descriptor",
     "make_tensor_descriptor",
+    "_experimental_reinterpret_tensor_descriptor",
     "tensor_descriptor",
     "abs",
     "add",
+    "aggregate_replace",
+    "advance",
     "all",
     "any",
     "arange",
     "argmax",
     "argmin",
     "associative_scan",
+    "async_task",
+    "async_tasks",
     "assume",
+    "clc_tile_scheduler",
+    "ClcTileScheduler",
+    "TileScheduler",
+    "NonPersistentScheduler",
+    "StaticPersistent1DScheduler",
+    "DynamicPersistent1DScheduler",
     "atomic_add",
     "atomic_and",
     "atomic_cas",
@@ -248,6 +282,7 @@ __all__ = [
     "philox_impl",
     "pi32_t",
     "pointer_type",
+    "nv_tma_desc_type",
     "program_id",
     "rand",
     "rand4x",
@@ -274,6 +309,7 @@ __all__ = [
     "static_print",
     "static_range",
     "store",
+    "sr_store",
     "sub",
     "sum",
     "swizzle2d",
@@ -357,6 +393,9 @@ def str_to_ty(name, c):
             else:
                 return amd_tensor_descriptor_type(block, shape_type, stride_type, layout)
         return tensor_descriptor_type(block, shape_type, stride_type, fp6_format)
+
+    if name.startswith("nvTmaDesc"):
+        return nv_tma_desc_type()
 
     if name.startswith("constexpr"):
         return constexpr_type(c)

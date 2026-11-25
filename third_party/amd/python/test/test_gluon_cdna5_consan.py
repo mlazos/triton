@@ -6,6 +6,8 @@ import os
 
 from triton._internal_testing import is_hip_cdna5
 
+pytestmark = pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+
 
 def _run_consan_subprocess(test_name, *args, timeout=120):
     """Run a ConSan test in a subprocess, validate its outcome, and return stderr.
@@ -63,7 +65,6 @@ def test_consan_subprocess_completion(script, timeout, error):
             _run_consan_command(command, timeout=timeout)
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize(
     ("mode", "message"),
     [
@@ -83,7 +84,6 @@ def test_barrier_storage_lifetime(mode, message):
         assert message in stderr, stderr
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("wait", [False, True])
 def test_barrier_storage_pending_completion(wait):
     stderr = _run_consan_subprocess("barrier_storage_pending_completion", wait)
@@ -93,7 +93,6 @@ def test_barrier_storage_pending_completion(wait):
         assert "Buffer being accessed has outstanding reads" in stderr, stderr
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_ws_store_wait_load(FAILURE):
     """
@@ -112,7 +111,6 @@ def test_ws_store_wait_load(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_ws_load_wait_store(FAILURE):
     """
@@ -131,7 +129,6 @@ def test_ws_load_wait_store(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_deadlock_two_partitions():
     """
     Verifies that ConSan detects a deadlock when two warp-specialize partitions
@@ -142,7 +139,6 @@ def test_deadlock_two_partitions():
     assert "Deadlock detected" in stderr_str, f"Expected 'Deadlock detected' in stderr, got:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_deadlock_overarrival():
     """
     Verifies that ConSan detects a deadlock caused by over-arrival on an mbarrier.
@@ -153,7 +149,6 @@ def test_deadlock_overarrival():
     assert "Deadlock detected" in stderr_str, f"Expected 'Deadlock detected' in stderr, got:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_deadlock_underarrival():
     """
     Verifies that ConSan detects a deadlock caused by under-arrival on mbarriers.
@@ -165,7 +160,6 @@ def test_deadlock_underarrival():
     assert "Deadlock detected" in stderr_str, f"Expected 'Deadlock detected' in stderr, got:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_deadlock_different_phases():
     """
     Positive test: verifies ConSan does NOT report a false deadlock when two
@@ -177,7 +171,6 @@ def test_deadlock_different_phases():
         f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_barrier_underflow():
     """
     Verifies that ConSan detects a barrier arrive underflow when each thread
@@ -190,7 +183,6 @@ def test_barrier_underflow():
         f"Expected 'Barrier arrive underflow' in stderr, got:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("MISSING_BAR", [True, False])
 @pytest.mark.parametrize("OVERLAP", [True, False])
 def test_aliasing_shared_visibility(MISSING_BAR, OVERLAP):
@@ -213,7 +205,6 @@ def test_aliasing_shared_visibility(MISSING_BAR, OVERLAP):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("MISSING_BAR", ["none", "1", "2"])
 def test_ws_two_loads_two_bars(MISSING_BAR):
     """
@@ -235,7 +226,6 @@ def test_ws_two_loads_two_bars(MISSING_BAR):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_ws_two_loads_one_bar(FAILURE):
     """
@@ -281,7 +271,6 @@ def test_ws_two_loads_two_bars_loop(MISSING_BAR):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_ws_load_ordering(FAILURE):
     """
@@ -302,7 +291,6 @@ def test_ws_load_ordering(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("MISSING_BAR", ["none", "1", "2"])
 def test_ws_different_warp_sizes(MISSING_BAR):
     """
@@ -322,7 +310,6 @@ def test_ws_different_warp_sizes(MISSING_BAR):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_async_tdm_kernel(FAILURE):
     """
@@ -342,7 +329,6 @@ def test_async_tdm_kernel(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_async_tdm_kernel_2bufs_1bar(FAILURE):
     """
@@ -359,7 +345,6 @@ def test_async_tdm_kernel_2bufs_1bar(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_tdm_interleave_kernel(FAILURE):
     """
@@ -376,7 +361,6 @@ def test_tdm_interleave_kernel(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_async_copy(FAILURE):
     """
@@ -410,139 +394,6 @@ def test_async_wait_count_bounds(mode, message):
         assert message in stderr, stderr
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
-@pytest.mark.parametrize(
-    ("mode", "message"),
-    [
-        ("load", None),
-        ("store", None),
-        ("wait_zero", "Accessing buffer with pending access. Pending access type: async_copy_global_to_shared"),
-        ("store_wait_zero", "Accessing buffer with pending access. Pending access type: async_copy_shared_to_global"),
-    ],
-)
-def test_async_wait_uncommitted(mode, message):
-    stderr = _run_consan_subprocess("async_wait_uncommitted", mode)
-    if message is None:
-        assert not stderr, stderr
-    else:
-        assert message in stderr, stderr
-
-
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
-@pytest.mark.parametrize(
-    ("mode", "message"),
-    [
-        ("interleaved", None),
-        ("read_store_source", None),
-        ("store_partial_wait", None),
-        ("store_partial_wait_younger",
-         "Accessing buffer with pending access. Pending access type: async_copy_shared_to_global"),
-        ("load_into_store_source",
-         "Accessing buffer with pending access. Pending access type: async_copy_shared_to_global"),
-    ],
-)
-def test_async_copy_load_store(mode, message):
-    stderr = _run_consan_subprocess("async_copy_load_store", mode)
-    if message is None:
-        assert not stderr, stderr
-    else:
-        assert message in stderr, stderr
-
-
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
-@pytest.mark.parametrize(
-    ("mode", "num_warps", "message"),
-    [
-        ("wait", 4, None),
-        ("committed", 4, None),
-        ("masked", 4, None),
-        ("two_arrivals", 4, None),
-        ("empty", 4, None),
-        ("missing_wait", 4, "Accessing buffer with pending access. Pending access type: async_copy_global_to_shared"),
-        ("wrong_barrier", 4, "Accessing buffer with pending access. Pending access type: async_copy_global_to_shared"),
-        ("after_arrive", 4, "Accessing buffer with pending access. Pending access type: async_copy_global_to_shared"),
-        ("reused_buffer", 4, "Accessing buffer with pending access. Pending access type: async_copy_global_to_shared"),
-        ("uninitialized", 4, "Barrier used before initialization or after invalidation"),
-        ("store_not_covered", 4,
-         "Accessing buffer with pending access. Pending access type: async_copy_shared_to_global"),
-        ("tdm_not_covered", 4, "Accessing buffer with pending access. Pending access type: async_tdm_global_to_shared"),
-    ],
-)
-def test_async_copy_mbarrier_completion(mode, num_warps, message):
-    stderr = _run_consan_subprocess("async_copy_mbarrier_completion", mode, num_warps)
-    if message is None:
-        assert not stderr, stderr
-    else:
-        assert message in stderr, stderr
-
-
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
-@pytest.mark.parametrize("wait_tdm", [False, True])
-def test_async_copy_wait_pending_tdm(wait_tdm):
-    stderr = _run_consan_subprocess("async_copy_wait_pending_tdm", wait_tdm)
-    if wait_tdm:
-        assert not stderr, stderr
-    else:
-        assert "Buffer being accessed has outstanding writes" in stderr, stderr
-
-
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
-@pytest.mark.parametrize(
-    ("mode", "message"),
-    [
-        ("group_before", None),
-        ("group_after", None),
-        ("handoff", None),
-        ("non_acquiring", "Buffer being accessed has outstanding writes"),
-    ],
-)
-def test_async_copy_mbarrier_warp_specialized(mode, message):
-    stderr = _run_consan_subprocess("async_copy_mbarrier_warp_specialized", mode)
-    if message is None:
-        assert not stderr, stderr
-    else:
-        assert message in stderr, stderr
-
-
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
-@pytest.mark.parametrize(
-    ("mode", "num_warps", "message"),
-    [
-        ("after_barrier_wait", 4, None),
-        ("after_tdm_barrier_wait", 4, "Buffer being accessed has outstanding reads"),
-        ("after_wait_group_all", 4, "Buffer being accessed has outstanding reads"),
-        ("pending", 4, "Buffer being accessed has outstanding reads"),
-        ("tdm_after_wait_group_all", 4, "Buffer being accessed has outstanding reads"),
-        ("other_partition", 4, "Buffer being accessed has outstanding reads"),
-    ],
-)
-def test_async_copy_mbarrier_storage_lifetime(mode, num_warps, message):
-    stderr = _run_consan_subprocess("async_copy_mbarrier_storage", mode, num_warps)
-    if message is None:
-        assert not stderr, stderr
-    else:
-        assert message in stderr, stderr
-
-
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
-@pytest.mark.parametrize(
-    ("mode", "message"),
-    [
-        ("wait_phases", None),
-        ("drain_all", "Buffer being accessed has outstanding reads"),
-        ("drain_zero", "Buffer being accessed has outstanding reads"),
-        ("no_drain", "Accessing buffer with pending access. Pending access type: async_copy_global_to_shared"),
-    ],
-)
-def test_async_copy_mbarrier_pipeline_drain(mode, message):
-    stderr = _run_consan_subprocess("async_copy_mbarrier_pipeline_drain", mode)
-    if message is None:
-        assert not stderr, stderr
-    else:
-        assert message in stderr, stderr
-
-
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_store(FAILURE):
     """
@@ -560,7 +411,6 @@ def test_consan_tdm_store(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_load_no_barrier(FAILURE):
     """
@@ -578,7 +428,6 @@ def test_consan_tdm_load_no_barrier(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_two_bufs_one_wait(FAILURE):
     """
@@ -596,7 +445,6 @@ def test_consan_tdm_two_bufs_one_wait(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_load_store_combined(FAILURE):
     """
@@ -614,7 +462,6 @@ def test_consan_tdm_load_store_combined(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_cross_partition(FAILURE):
     """
@@ -633,7 +480,6 @@ def test_consan_tdm_cross_partition(FAILURE):
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
 
 
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_cross_partition_load_store(FAILURE):
     """

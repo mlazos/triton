@@ -279,15 +279,6 @@ struct LoadGroupInfo {
   bool hasTMALoad = false;
 };
 
-static bool allUsersAreMMAv5(Operation *op) {
-  return llvm::all_of(op->getUsers(), [](Operation *user) {
-    if (user->hasTrait<OpTrait::MemDescViewTrait>())
-      return allUsersAreMMAv5(user);
-    // MMA completion waits only track operand lifetimes.
-    return isa<ttng::MMAv5OpInterface, ttng::WaitBarrierOp>(user);
-  });
-}
-
 // Convert a scalar load to a load of a tensor of shape <1>.
 void convertScalarToTensorLoad(Operation *op, CoarseSchedule &schedule,
                                scf::ForOp forOp) {
@@ -384,27 +375,17 @@ void createTMABarrierAndWait(
 
   // For each group calculate the size and insert the barrier after the last
   // load.
-  bool twoCTAs = ttng::getModuleTwoCTAs(forOp);
   for (SmallVector<Operation *> &group : commonWaitGroups) {
     int sizeInBytes = 0;
     int numBuffers = asyncLoads[group[0]].stageDiff;
     const LoadGroupInfo loadGroup = loadGroups.find(numBuffers)->second;
     for (Operation *op : group) {
       auto tensorTy = cast<RankedTensorType>(op->getResultTypes()[0]);
-      int loadSize = product(getShapePerCTA(tensorTy));
       sizeInBytes +=
-          loadSize * getIntOrFloatOrPtrBitWidth(tensorTy.getElementType()) / 8;
+          ttng::getDescriptorLoadBytes(op, tensorTy, op->getOperand(0));
     }
 
-    bool mmaOnly = llvm::all_of(group, [](Operation *load) {
-      if (mustLoadToRegisters(load))
-        return false;
-      // mustLoadToRegisters established a single LocalAllocOp user.
-      return allUsersAreMMAv5(*load->getUsers().begin());
-    });
-    bool usePairBarrier = twoCTAs && mmaOnly;
-    Value barrierAlloc = triton::createBarrierAlloc(
-        forOp, numBuffers, /*arriveCount=*/1, usePairBarrier);
+    Value barrierAlloc = triton::createBarrierAlloc(forOp, numBuffers);
     OpBuilderForStage builder(forOp.getLoc(), group[0], schedule);
     Value barrier = triton::createSingleBufferView(builder, barrierAlloc,
                                                    loadGroup.insertIdx);
@@ -416,16 +397,13 @@ void createTMABarrierAndWait(
     builder.setStageCluster(schedule[firstUse]);
     Value barrierViewWait = triton::createSingleBufferView(
         builder, barrierAlloc, loadGroup.extractIdx);
-    Operation *waitOp =
+    auto wait =
         ttng::WaitBarrierOp::create(builder, barrierViewWait, loadGroup.phase);
-    if (twoCTAs && !mmaOnly) {
-      waitOp = ttng::ClusterBarrierOp::create(builder);
-    }
 
-    // Update the async loads requirements.
+    // Update the async loads info.
     for (Operation *op : group) {
       asyncLoads[op].barrier = barrier;
-      asyncLoads[op].waitOp = waitOp;
+      asyncLoads[op].waitOp = wait;
     }
   }
 }
@@ -488,15 +466,14 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         sharedEncoding = getSharedEncoding(&op);
         // Do not create async loads for small loads (cp.async requires at least
         // 4 bytes)
-        // TODO: Support 2CTA MMA for regular tt.load/cp.async paths. For now,
-        // automatic 2CTA MMA is limited to descriptor/TMA loads.
         canUseAsyncCp =
             isa<tt::LoadOp>(op) &&
-            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis);
-        int copyVecBytes = getCopyVecBytes(
-            cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
-
-        canUseAsyncCp &= copyVecBytes >= 4;
+            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis) &&
+            canPipelineInSharedMemory(cast<tt::LoadOp>(op));
+        if (canUseAsyncCp)
+          canUseAsyncCp =
+              getCopyVecBytes(cast<RankedTensorType>(op.getResultTypes()[0]),
+                              sharedEncoding) >= 4;
         if (canUseAsyncCp) {
           auto loadOp = cast<tt::LoadOp>(op);
           auto ptr = loadOp.getPtr();
@@ -707,10 +684,11 @@ Operation *hoistBufferOutOfLoop(scf::ForOp forOp, Operation *op,
     return nullptr;
   OpBuilderForStage builder(op->getLoc(), forOp, schedule);
   auto allocType = dyn_cast<MemDescType>(op->getResult(0).getType());
+  // Keep the alloc shape: an NPOT tile's buffer is its pow2 alloc shape.
   auto newType = triton::gpu::MemDescType::get(
       allocType.getShape(), allocType.getElementType(), allocType.getEncoding(),
       allocType.getMemorySpace(),
-      /*mutableMemory=*/true);
+      /*mutableMemory=*/true, allocType.getAllocShape());
   auto newAlloc = builder.clone(*op);
   newAlloc->getResult(0).setType(newType);
   builder.setStageCluster(schedule[op]);
@@ -790,23 +768,9 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   }
 
   int numStages = mainWaitStage - schedule[mma].first + 1;
-  if (mma.getTwoCtas()) {
-    // With four prefetched operand tiles, two completion-barrier slots are
-    // insufficient:
-    //   tc_gen5_mma ... %bar0 ...  // MMA 0
-    //   tc_gen5_mma ... %bar1 ...  // MMA 1
-    //   wait_barrier %bar0, %phase0
-    //   tc_gen5_mma ... %bar0 ...  // MMA 2 reuses bar0
-    // The leader can issue MMA 2 before the peer observes MMA 0's completion.
-    // Both completions flip %bar0's phase, so the peer may miss the first
-    // completion and deadlock. Size the barrier ring for the full pipeline
-    // depth to prevent premature slot reuse.
-    numStages = std::max(numStages, schedule.getNumStages());
-  }
 
   OpBuilderForStage builder(mma.getLoc(), mma, schedule);
-  Value barrierAlloc = createBarrierAlloc(forOp, numStages, /*arriveCount=*/1,
-                                          /*twoCTAs=*/false);
+  Value barrierAlloc = createBarrierAlloc(forOp, numStages);
   Value vTrue = arith::ConstantIntOp::create(builder, 1, 1);
   Value phase = forOp.getRegionIterArg(phaseArgIdx);
   Value zero = arith::ConstantIntOp::create(builder, forOp.getLoc(), 0, 32);
@@ -902,6 +866,35 @@ void multibufferTensorMemory(scf::ForOp forOp, CoarseSchedule &schedule,
 
   SmallVector<Operation *> allocUsers =
       llvm::to_vector(alloc.getResult().getUsers());
+  auto isConstTrue = [](Value v) {
+    if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
+      if (auto attr = dyn_cast<BoolAttr>(constOp.getValueAttr())) {
+        return attr.getValue();
+      }
+    }
+    return false;
+  };
+  // A multibuffered tile's buffer index admits at most one net advance per
+  // iteration: two advances freeze rotation (net +2 = 0 mod numStages) while
+  // the scheduled wait distances assume one step per iteration, so consumers
+  // would read wrong-iteration data. The first overwrite (in dominance
+  // order) spends the iteration's single advance; every later overwrite
+  // reuses its index. Basing this on dominance rather than use-list order
+  // keeps it independent of processing order (HoistTMEMAlloc-materialized
+  // stores are created after the MMAs they precede) and gives each
+  // conditional path its own single advance.
+  auto hasPriorAdvance = [&](Operation *op) {
+    for (Operation *u : allocUsers) {
+      if (u == op || !forOp->isAncestor(u))
+        continue;
+      bool overwrites = isa<ttng::TMEMStoreOp>(u);
+      if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(u))
+        overwrites = !isConstTrue(mma.useAccumulator());
+      if (overwrites && domInfo.properlyDominates(u, op))
+        return true;
+    }
+    return false;
+  };
   auto auxBuilder = OpBuilder(forOp);
   Value replTok = ub::PoisonOp::create(auxBuilder, forOp.getLoc(),
                                        builder.getType<AsyncTokenType>());
@@ -918,15 +911,19 @@ void multibufferTensorMemory(scf::ForOp forOp, CoarseSchedule &schedule,
         multibufferingIsValid = true;
         builder.setStageCluster(schedule[store]);
         builder.setInsertionPoint(store);
-        // Change the buffer index to the new buffer index on store.
+        // Change the buffer index to the new buffer index on store, unless
+        // the iteration's single advance was already spent.
         Value curBufIdx = getCurrBufIdx(store);
-        Value newBufIdx = createIncrementModulo(
-            builder, forOp.getLoc(), curBufIdx, numStagesVal, zero, one);
-        if (Value pred = store.getPred()) {
-          newBufIdx = arith::SelectOp::create(builder, newBufIdx.getType(),
-                                              pred, newBufIdx, curBufIdx);
+        Value newBufIdx = curBufIdx;
+        if (!hasPriorAdvance(store)) {
+          newBufIdx = createIncrementModulo(builder, forOp.getLoc(), curBufIdx,
+                                            numStagesVal, zero, one);
+          if (Value pred = store.getPred()) {
+            newBufIdx = arith::SelectOp::create(builder, newBufIdx.getType(),
+                                                pred, newBufIdx, curBufIdx);
+          }
+          replaceAllUsesDominatedBy(store, newBufIdx, curBufIdx, domInfo);
         }
-        replaceAllUsesDominatedBy(store, newBufIdx, curBufIdx, domInfo);
         bufIdxDefs.push_back({store, newBufIdx});
         auto tmemSlice =
             triton::createSingleBufferView(builder, newAlloc, newBufIdx);
@@ -964,23 +961,18 @@ void multibufferTensorMemory(scf::ForOp forOp, CoarseSchedule &schedule,
       builder.setInsertionPoint(mma);
       // We can legally switch to next buffer index if the mma does not use the
       // accumulator
-      auto isConstTrue = [](Value v) {
-        if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
-          if (auto attr = dyn_cast<BoolAttr>(constOp.getValueAttr())) {
-            return attr.getValue();
-          }
-        }
-        return false;
-      };
-      multibufferingIsValid = !isConstTrue(mma.useAccumulator());
+      multibufferingIsValid |= !isConstTrue(mma.useAccumulator());
       Value curBufIdx = getCurrBufIdx(mma.getOperation());
-      Value newBufIdx = createIncrementModulo(
-          builder, forOp.getLoc(), curBufIdx, numStagesVal, zero, one);
-      newBufIdx =
-          arith::SelectOp::create(builder, newBufIdx.getType(),
-                                  mma.useAccumulator(), curBufIdx, newBufIdx);
-      replaceAllUsesDominatedBy(mma.getOperation(), newBufIdx, curBufIdx,
-                                domInfo);
+      Value newBufIdx = curBufIdx;
+      if (!hasPriorAdvance(mma.getOperation())) {
+        newBufIdx = createIncrementModulo(builder, forOp.getLoc(), curBufIdx,
+                                          numStagesVal, zero, one);
+        newBufIdx =
+            arith::SelectOp::create(builder, newBufIdx.getType(),
+                                    mma.useAccumulator(), curBufIdx, newBufIdx);
+        replaceAllUsesDominatedBy(mma.getOperation(), newBufIdx, curBufIdx,
+                                  domInfo);
+      }
       bufIdxDefs.push_back({mma.getOperation(), newBufIdx});
       auto tmemSlice =
           triton::createSingleBufferView(builder, newAlloc, newBufIdx);
@@ -1003,114 +995,19 @@ void multibufferTensorMemory(scf::ForOp forOp, CoarseSchedule &schedule,
                             domInfo);
 }
 
-// Protect the peer CTA's TMEM read before the leader reuses its buffer.
-//   barrier_expect %tma2, ...  // arrive.expect_tx during prefetch
-//   async_tma_copy ... %tma2
-//   tc_gen5_mma ... %acc0 ...  // MMA 0
-//   tc_gen5_mma ... %acc1 ...  // MMA 1
-//   wait_barrier %done0
-//   scf.if %read0 {
-//     %v0 = tmem_load %acc0
-//   }
-//   wait_barrier %tma2
-//   tc_gen5_mma ... %acc0 ...  // MMA 2 reuses acc0
-// The leader can finish its read and issue MMA 2 while the peer is still
-// reading %acc0. createBarrierAndWaitOps creates %done0 as a per-CTA barrier,
-// which waits for MMA 0, before the TMEM read.
-// createTMABarrierAndWait creates %tma2 as a pair-shared barrier for MMA-only
-// operands, waited on only by the leader CTA. TMA completion
-// only decrements the pending transaction-byte count; it does not arrive after
-// the TMEM read. Thus %tma2 can complete before the peer reads %acc0.
-// Add a pair-shared arrive after all reads and a leader wait before reuse.
-// A single reader keeps its predicate; multiple readers release
-// unconditionally.
-scf::ForOp protectTwoCTAAccumulatorReuse(scf::ForOp forOp,
-                                         CoarseSchedule &schedule,
-                                         ttng::MMAv5OpInterface mma,
-                                         Value alloc, int numBuffers) {
-  // Accept loads directly in the loop or under nested scf.if.
-  ttng::TMEMLoadOp load;
-  Operation *loadOrParent = nullptr;
-  unsigned numReads = 0;
-  for (Operation *user : alloc.getUsers()) {
-    if (!forOp->isAncestor(user) || user == mma.getOperation())
-      continue;
-    auto read = dyn_cast<ttng::TMEMLoadOp>(user);
-    // Case 1: reject non-load accumulator users.
-    if (!read)
-      return forOp;
-    Operation *reader = read;
-    while (reader->getBlock() != forOp.getBody()) {
-      reader = reader->getParentOp();
-      // Case 2: reject nesting through regions other than scf.if.
-      if (!isa<scf::IfOp>(reader))
-        return forOp;
-    }
-    // Case 3: reject readers not scheduled after the MMA.
-    if (!schedule.isOpBefore(mma, reader))
-      return forOp;
-    ++numReads;
-    if (!loadOrParent || schedule.isOpBefore(loadOrParent, reader)) {
-      load = read;
-      loadOrParent = reader;
-    }
-  }
-  if (!load)
-    return forOp;
-  bool singleRead = numReads == 1;
-  Block *readBlock = singleRead ? load->getBlock() : forOp.getBody();
-
-  IRRewriter rewriter(forOp);
-  Value zero = arith::ConstantIntOp::create(rewriter, forOp.getLoc(), 0, 32);
-  Value one = arith::ConstantIntOp::create(rewriter, forOp.getLoc(), 1, 32);
-  unsigned firstArg = forOp.getNumRegionIterArgs();
-  forOp = addIterArgsToLoop(rewriter, forOp, {zero, zero});
-  appendToForOpYield(forOp, {zero, zero});
-  Value index = forOp.getRegionIterArg(firstArg);
-  Value phase = forOp.getRegionIterArg(firstArg + 1);
-  Value barriers = createBarrierAlloc(forOp, numBuffers, 1, /*twoCTAs=*/true);
-
-  auto waitCluster =
-      schedule.clusters.newBefore(schedule.splitClusterBefore(mma, forOp));
-  auto readStage = schedule[loadOrParent];
-  OpBuilderForStage builder(load.getLoc(), loadOrParent, schedule);
-  Value barrier = triton::createSingleBufferView(builder, barriers, index);
-  Value ringSize = arith::ConstantIntOp::create(builder, numBuffers, 32);
-  Value vFalse = arith::ConstantIntOp::create(builder, 0, 1);
-  Value vTrue = arith::ConstantIntOp::create(builder, 1, 1);
-
-  if (singleRead)
-    builder.setInsertionPoint(readBlock->getTerminator());
-  else
-    builder.setInsertionPointAfter(loadOrParent);
-  ttng::ArriveBarrierOp::create(builder, barrier, 1);
-  // Multiple readers share one unconditional release after their last use.
-  Value wrap;
-  Value nextIndex = createIncrementModulo(builder, load.getLoc(), index,
-                                          ringSize, zero, one, &wrap);
-  Value toggled = arith::XOrIOp::create(builder, phase, one);
-  Value nextPhase = arith::SelectOp::create(builder, wrap, toggled, phase);
-  nextIndex = sinkValueRedefinition(rewriter, index, nextIndex, readBlock);
-  auto yield = forOp.getBody()->getTerminator();
-  yield->setOperand(firstArg, nextIndex);
-  nextPhase = sinkValueRedefinition(rewriter, phase, nextPhase, readBlock);
-  yield->setOperand(firstArg + 1, nextPhase);
-  Value didRead = sinkValueRedefinition(rewriter, vFalse, vTrue, readBlock);
-
-  Operation *newLoadOrParent =
-      singleRead ? forOp.getBody()->findAncestorOpInBlock(*load) : loadOrParent;
-  if (newLoadOrParent != loadOrParent) {
-    schedule.erase(loadOrParent);
-    schedule.insert(newLoadOrParent, readStage.first, readStage.second);
-  }
-  builder.setInsertionPoint(yield);
-  builder.setStageCluster({schedule[mma].first + numBuffers, waitCluster});
-  ttng::WaitBarrierOp::create(builder, barrier, phase, didRead);
-  return forOp;
+bool isCompletionManagedByWarpSpecialization(ttng::MMAv5OpInterface mma) {
+  // AWS marks both operand-D channel endpoints on the MMA only when warp
+  // specialization owns its accumulator completion protocol. Require both
+  // markers so the bail-out fails closed.
+  // TODO: Have AWS emit a dedicated `ttg.mma_completion_managed` attribute.
+  return mma->hasAttr("tmem.start") && mma->hasAttr("tmem.end");
 }
 
 scf::ForOp lowerMMA(ttng::MMAv5OpInterface mma, scf::ForOp forOp,
                     CoarseSchedule &schedule) {
+  if (isCompletionManagedByWarpSpecialization(mma))
+    return forOp;
+
   Value alloc = mma.getAccumulator();
 
   int mmaSelfLatency = getSelfLatencyFromAttr(mma.getOperation());
@@ -1175,10 +1072,6 @@ scf::ForOp lowerMMA(ttng::MMAv5OpInterface mma, scf::ForOp forOp,
 
   createBarrierAndWaitOps(forOp, schedule, mma, mmaSelfLatency, alloc,
                           phaseArgIdx, barrierIdxArgIdx);
-
-  if (mma.getTwoCtas())
-    forOp = protectTwoCTAAccumulatorReuse(forOp, schedule, mma, alloc,
-                                          tmemUseNumStages);
 
   if (tmemUseNumStages > 1) {
     multibufferTensorMemory(forOp, schedule,

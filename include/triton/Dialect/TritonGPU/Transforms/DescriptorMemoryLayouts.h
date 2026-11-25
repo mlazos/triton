@@ -12,7 +12,18 @@ namespace mlir::triton::gpu {
 struct UseInfo;
 struct EncodingInfo;
 
-/// Update shared encoding given a new shape
+/// Adapt a CGA layout to a new shape (rank-increasing/reducing)
+CGAEncodingAttr updateCGALayoutForShape(CGAEncodingAttr cgaLayout,
+                                        ArrayRef<int64_t> shape);
+
+/// Whether a tile of the given shape splits into whole pieces of a
+/// partitioned shared encoding.
+bool isPartitionedEncodingCompatibleWithShape(
+    PartitionedSharedEncodingAttr encoding, ArrayRef<int64_t> shape);
+
+/// Update shared encoding given a new shape. A partitioned encoding must be
+/// compatible with the new shape (see
+/// isPartitionedEncodingCompatibleWithShape).
 SharedEncodingTrait updateEncodingForShape(Operation *op,
                                            SharedEncodingTrait encoding,
                                            RankedTensorType tensorType);
@@ -43,6 +54,11 @@ private:
                                       unsigned numCTAs);
 
 protected:
+  virtual Attribute
+  getDesiredDescriptorEncoding(TypedValue<triton::TensorDescType> descriptor) {
+    return {};
+  }
+
   virtual Attribute getCompatibleSharedEncoding(Attribute enc,
                                                 ArrayRef<int64_t> shape,
                                                 Type elementType) {

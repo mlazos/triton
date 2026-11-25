@@ -1,6 +1,7 @@
 #include "triton/Tools/LinearLayout.h"
 
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <vector>
 
@@ -8,6 +9,7 @@
 #include "third_party/f2reduce/f2reduce.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/StringRef.h"
@@ -37,6 +39,13 @@ namespace {
 using BasesT = LinearLayout::BasesT;
 using llvm::SmallDenseSet;
 using llvm::Twine;
+
+LinearLayout::RadicesT makeBinaryRadices(const BasesT &bases) {
+  LinearLayout::RadicesT radices;
+  for (const auto &[inDim, inDimBases] : bases)
+    radices[inDim].assign(inDimBases.size(), 2);
+  return radices;
+}
 
 BasesT makeBasesMap(
     ArrayRef<std::pair<StringAttr, std::vector<std::vector<int32_t>>>> bases) {
@@ -106,9 +115,38 @@ void assertDimsSubsetIgnoringOrder(T &&small, U &&big) {
 LinearLayout::tryCreate(BasesT bases,
                         ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                         bool requireSurjective) {
-  LinearLayout ll(std::move(bases), std::move(outDims), NoCheckInvariants{});
-  std::optional<std::string> error = ll.checkInvariants(requireSurjective);
+  LinearLayout ll(std::move(bases), outDims, NoCheckInvariants{});
+  std::optional<std::string> error =
+      ll.checkInvariants(requireSurjective, /*allowMixedRadixSizes=*/false);
   if (error) {
+    return std::nullopt;
+  }
+  return ll;
+}
+
+/*static*/ std::optional<LinearLayout>
+LinearLayout::tryCreate(BasesT bases, RadicesT inputRadices,
+                        ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                        bool requireSurjective, std::string *diagnostic) {
+  return tryCreate(std::move(bases), std::move(inputRadices), outDims, {}, {},
+                   requireSurjective, diagnostic);
+}
+
+/*static*/ std::optional<LinearLayout>
+LinearLayout::tryCreate(BasesT bases, RadicesT inputRadices,
+                        ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                        TableDigitsT tableDigits, TableOffsetsT tableOffsets,
+                        bool requireSurjective, std::string *diagnostic) {
+  LinearLayout ll(std::move(bases), std::move(inputRadices), outDims,
+                  NoCheckInvariants{});
+  std::optional<std::string> error =
+      ll.setTables(std::move(tableDigits), std::move(tableOffsets));
+  if (!error)
+    error =
+        ll.checkInvariants(requireSurjective, /*allowMixedRadixSizes=*/true);
+  if (error) {
+    if (diagnostic)
+      *diagnostic = *error;
     return std::nullopt;
   }
   return ll;
@@ -117,7 +155,15 @@ LinearLayout::tryCreate(BasesT bases,
 LinearLayout::LinearLayout(BasesT bases,
                            ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                            NoCheckInvariants)
-    : bases(std::move(bases)) {
+    : LinearLayout(std::move(bases), RadicesT(), outDims, NoCheckInvariants{}) {
+}
+
+LinearLayout::LinearLayout(BasesT bases, RadicesT inputRadices,
+                           ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                           NoCheckInvariants)
+    : bases(std::move(bases)), inputRadices(std::move(inputRadices)) {
+  if (this->inputRadices.empty())
+    this->inputRadices = makeBinaryRadices(this->bases);
   for (auto [outDim, size] : outDims) {
     this->outDims[outDim] = size;
   }
@@ -125,6 +171,7 @@ LinearLayout::LinearLayout(BasesT bases,
 
 LinearLayout::LinearLayout(BasesT bases, ArrayRef<StringAttr> outDimNames)
     : bases(std::move(bases)) {
+  inputRadices = makeBinaryRadices(this->bases);
   // Infer out-dim sizes.
   for (StringAttr outDim : outDimNames) {
     outDims[outDim] = 1;
@@ -138,8 +185,8 @@ LinearLayout::LinearLayout(BasesT bases, ArrayRef<StringAttr> outDimNames)
     }
   }
 
-  std::optional<std::string> error =
-      checkInvariants(/*requireSurjective=*/true);
+  std::optional<std::string> error = checkInvariants(
+      /*requireSurjective=*/true, /*allowMixedRadixSizes=*/false);
   if (error.has_value()) {
     llvm::report_fatal_error(StringRef(*error));
   }
@@ -148,15 +195,38 @@ LinearLayout::LinearLayout(BasesT bases, ArrayRef<StringAttr> outDimNames)
 LinearLayout::LinearLayout(BasesT bases,
                            ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                            bool requireSurjective)
-    : LinearLayout(std::move(bases), std::move(outDims), NoCheckInvariants{}) {
-  std::optional<std::string> error = checkInvariants(requireSurjective);
+    : LinearLayout(std::move(bases), outDims, NoCheckInvariants{}) {
+  std::optional<std::string> error =
+      checkInvariants(requireSurjective, /*allowMixedRadixSizes=*/false);
+  if (error.has_value()) {
+    llvm::report_fatal_error(StringRef(*error));
+  }
+}
+
+LinearLayout::LinearLayout(BasesT bases, RadicesT inputRadices,
+                           ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                           bool requireSurjective)
+    : LinearLayout(std::move(bases), std::move(inputRadices), outDims, {}, {},
+                   requireSurjective) {}
+
+LinearLayout::LinearLayout(BasesT bases, RadicesT inputRadices,
+                           ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                           TableDigitsT tableDigits, TableOffsetsT tableOffsets,
+                           bool requireSurjective)
+    : LinearLayout(std::move(bases), std::move(inputRadices), outDims,
+                   NoCheckInvariants{}) {
+  std::optional<std::string> error =
+      setTables(std::move(tableDigits), std::move(tableOffsets));
+  if (!error)
+    error = checkInvariants(requireSurjective, /*allowMixedRadixSizes=*/true);
   if (error.has_value()) {
     llvm::report_fatal_error(StringRef(*error));
   }
 }
 
 std::optional<std::string>
-LinearLayout::checkInvariants(bool requireSurjective) {
+LinearLayout::checkInvariants(bool requireSurjective,
+                              bool allowMixedRadixSizes) {
   // Check that basis values are non-negative.
   for (const auto &[inDim, inDimBases] : bases) {
     for (const auto &basis : inDimBases) {
@@ -182,11 +252,14 @@ LinearLayout::checkInvariants(bool requireSurjective) {
     }
   }
 
-  // Check that the out-dim sizes are powers of 2.
+  // Check that the out-dim sizes are powers of 2. The radices constructor and
+  // its tryCreate allow any positive size, even with empty radices; a size
+  // that is not a power of 2 makes a mixed-radix output.
   for (const auto &[outDim, size] : outDims) {
-    if (!llvm::isPowerOf2_32(size)) {
+    if (allowMixedRadixSizes ? size <= 0 : !llvm::isPowerOf2_32(size)) {
       return "Invalid out-dim size " + std::to_string(size) + " for out-dim '" +
-             outDim.str() + "'.  Out-dim sizes must be powers of 2.\n";
+             outDim.str() + "'.  Out-dim sizes must be " +
+             (allowMixedRadixSizes ? "positive" : "powers of 2") + ".\n";
     }
   }
 
@@ -204,6 +277,9 @@ LinearLayout::checkInvariants(bool requireSurjective) {
     }
   }
 
+  if (std::optional<std::string> error = checkInputRadices())
+    return error;
+
   // Determine whether the this layout is surjective, i.e. that every `out`
   // coordinate can be reached by some `in` coordinate.
   //
@@ -214,9 +290,15 @@ LinearLayout::checkInvariants(bool requireSurjective) {
   // the rank of our matrix using Gaussian elimination, which runs in O(n^3)
   // for an n x n matrix.  Our matrix size is sum(inDimSizeLog2) x
   // sum(outDimSizeLog2), so this should be plenty fast.
-  this->rank =
-      getMatrixRank(getMatrix(*this), /*numRows=*/getTotalOutDimSizeLog2(),
-                    /*numCols=*/getTotalInDimSizeLog2());
+  if (hasNonPow2OutDim() || !tables.empty()) {
+    if (std::optional<std::string> error = checkTables())
+      return error;
+    this->rank = getMixedRadixRank();
+  } else {
+    this->rank =
+        getMatrixRank(getMatrix(*this), /*numRows=*/getTotalOutDimSizeLog2(),
+                      /*numCols=*/getTotalInDimSizeLog2());
+  }
 
   if (requireSurjective && !isSurjective()) {
     return "Layout is expected to be surjective, i.e. every `out` coordinate "
@@ -242,6 +324,8 @@ LinearLayout::LinearLayout(
                                                 StringAttr outDimName) {
   if (size == 0)
     return LinearLayout::empty();
+  if (!llvm::isPowerOf2_32(size) && mlir::triton::tools::isNpotAllowed())
+    return mixedRadixStrided1D(size, stride, inDimName, outDimName);
 
   assert(llvm::isPowerOf2_32(size));
   std::vector<std::vector<int32_t>> bases;
@@ -287,6 +371,28 @@ int32_t LinearLayout::getInDimSizeLog2(StringAttr inDim) const {
   return it->second.size();
 }
 
+int32_t LinearLayout::getInDimSize(StringAttr inDim) const {
+  int64_t size = 1;
+  for (int32_t radix : getInputRadices(inDim))
+    size *= radix;
+  return size;
+}
+
+int32_t LinearLayout::getTotalInDimSize() const {
+  int64_t size = 1;
+  for (StringAttr inDim : getInDimNames())
+    size *= getInDimSize(inDim);
+  return size;
+}
+
+bool LinearLayout::isRadix2() const {
+  return !hasNonPow2OutDim() &&
+         llvm::all_of(inputRadices, [](const auto &dimAndRadices) {
+           return llvm::all_of(dimAndRadices.second,
+                               [](int32_t radix) { return radix == 2; });
+         });
+}
+
 int32_t LinearLayout::getTotalInDimSizeLog2() const {
   return std::accumulate(getInDimNames().begin(), getInDimNames().end(), 0,
                          [&](int32_t acc, StringAttr inDim) {
@@ -300,6 +406,19 @@ int32_t LinearLayout::getOutDimSizeLog2(StringAttr outDim) const {
   return llvm::Log2_32(it->second);
 }
 
+int32_t LinearLayout::getOutDimSize(StringAttr outDim) const {
+  auto it = outDims.find(outDim);
+  assert(it != outDims.end() && "outDim not found in layout");
+  return it->second;
+}
+
+int32_t LinearLayout::getTotalOutDimSize() const {
+  int32_t size = 1;
+  for (int32_t outDimSize : llvm::make_second_range(outDims))
+    size *= outDimSize;
+  return size;
+}
+
 int32_t LinearLayout::getTotalOutDimSizeLog2() const {
   return std::accumulate(getOutDimNames().begin(), getOutDimNames().end(), 0,
                          [&](int32_t acc, StringAttr outDim) {
@@ -308,14 +427,34 @@ int32_t LinearLayout::getTotalOutDimSizeLog2() const {
 }
 
 int32_t LinearLayout::getNumConsecutiveInOut() const {
+  assert(!hasNonPow2OutDim());
   if (bases.empty() || getNumOutDims() == 0)
     return 1;
-  StringAttr inDim = *getInDimNames().begin();
-  StringAttr outDim = *getOutDimNames().begin();
-  return factorMaximalIdentityPrefix(
-             *this, inDim, outDim,
-             std::min(getInDimSize(inDim), getOutDimSize(outDim)))
-      .size;
+  // Count how many of the initial bases for the first in-dim are
+  // (2^i, 0, ..., 0).
+  const auto &firstInDimBases = bases.begin()->second;
+  int consec = 0;
+  for (; consec < firstInDimBases.size(); consec++) {
+    const auto &basis = firstInDimBases[consec];
+    if (basis[0] != (1 << consec) ||
+        !std::all_of(basis.begin() + 1, basis.end(),
+                     [](int32_t x) { return x == 0; })) {
+      break;
+    }
+  }
+
+  // `or` together all other bases' first out-dim.
+  int32_t otherBits = 0;
+  for (const auto &[inDim, inDimBases] : bases) {
+    for (int i = 0; i < inDimBases.size(); i++) {
+      if (inDim != bases.begin()->first || i >= consec) {
+        otherBits |= inDimBases[i][0];
+      }
+    }
+  }
+  int32_t trailingZeros = otherBits != 0 ? __builtin_ctz(otherBits) : 31;
+
+  return 1 << std::min(consec, trailingZeros);
 }
 
 int32_t LinearLayout::contiguousElemsAlongOutputDim(StringAttr outDim) const {
@@ -338,11 +477,15 @@ LinearLayout LinearLayout::transposeIns(ArrayRef<StringAttr> newInDims) const {
   assertDimsEqualIgnoringOrder(newInDims, getInDimNames());
 
   BasesT newBases;
+  RadicesT newRadices;
   for (const auto &inDim : newInDims) {
     newBases[inDim] = bases.find(inDim)->second;
+    newRadices[inDim] = inputRadices.find(inDim)->second;
   }
-  return LinearLayout(std::move(newBases), llvm::to_vector(outDims),
-                      isSurjective());
+  auto [digits, offsets] = getTableMaps();
+  return LinearLayout(std::move(newBases), std::move(newRadices),
+                      llvm::to_vector(outDims), std::move(digits),
+                      std::move(offsets), isSurjective());
 }
 
 LinearLayout
@@ -370,11 +513,15 @@ LinearLayout::transposeOuts(ArrayRef<StringAttr> newOutDims) const {
   for (auto outDim : newOutDims) {
     newOutDimSizes.push_back({outDim, getOutDimSize(outDim)});
   }
-  return LinearLayout(std::move(newBases), newOutDimSizes, isSurjective());
+  auto [digits, offsets] = getTableMaps();
+  return LinearLayout(std::move(newBases), inputRadices, newOutDimSizes,
+                      std::move(digits), std::move(offsets), isSurjective());
 }
 
 LinearLayout LinearLayout::reshapeIns(
     ArrayRef<std::pair<StringAttr, int32_t>> newInDims) const {
+  if (!isRadix2())
+    return reshapeMixedRadixIns(newInDims);
   assert(llvm::all_of(newInDims, [&](auto &inDim) {
     return llvm::isPowerOf2_32(inDim.second);
   }));
@@ -407,6 +554,10 @@ LinearLayout LinearLayout::reshapeIns(
 
 LinearLayout LinearLayout::reshapeOuts(
     ArrayRef<std::pair<StringAttr, int32_t>> newOutDims) const {
+  if (hasNonPow2OutDim() || llvm::any_of(newOutDims, [](auto &outDim) {
+        return !llvm::isPowerOf2_32(outDim.second);
+      }))
+    return reshapeMixedRadixOuts(newOutDims).value();
   assert(llvm::all_of(newOutDims, [&](auto &outDim) {
     return llvm::isPowerOf2_32(outDim.second);
   }));
@@ -448,13 +599,17 @@ LinearLayout LinearLayout::reshapeOuts(
     }
   }
 
-  return LinearLayout(std::move(newBases), newOutDims, isSurjective());
+  return LinearLayout(std::move(newBases), inputRadices, newOutDims,
+                      isSurjective());
 }
 
 LinearLayout LinearLayout::resizeInDim(StringAttr inDim,
                                        int32_t newSize) const {
   assert(hasInDim(inDim));
+  if (!isRadix2())
+    return resizeMixedRadixInDim(inDim, newSize).value();
   assert(llvm::isPowerOf2_32(newSize));
+  assert(isRadix2());
   auto newBases = bases;
   newBases[inDim].resize(llvm::Log2_32(newSize),
                          std::vector<int32_t>(getNumOutDims(), 0));
@@ -464,6 +619,8 @@ LinearLayout LinearLayout::resizeInDim(StringAttr inDim,
 
 LinearLayout LinearLayout::resizeOutDim(StringAttr outDim,
                                         int32_t newSize) const {
+  if (!isRadix2() || !llvm::isPowerOf2_32(newSize))
+    return resizeMixedRadixOutDim(outDim, newSize).value();
   assert(llvm::isPowerOf2_32(newSize));
   assert(newSize <= getOutDimSize(outDim));
   auto newBases = bases;
@@ -482,7 +639,7 @@ LinearLayout LinearLayout::resizeOutDim(StringAttr outDim,
       size = newSize;
     }
   }
-  return LinearLayout(std::move(newBases), outDims,
+  return LinearLayout(std::move(newBases), inputRadices, outDims,
                       /*requiresSurjective=*/false);
 }
 
@@ -501,15 +658,20 @@ LinearLayout LinearLayout::concatIns(const LinearLayout &other) const {
   }
   for (StringAttr inDim : other.getInDimNames())
     assert(!hasInDim(inDim) && "layouts must have disjoint input dimensions");
+  if (!hasOddPartForm() || !other.hasOddPartForm())
+    return concatMixedRadixIns(other).value();
 
   LinearLayout::BasesT resultBases = getBases();
+  LinearLayout::RadicesT resultRadices = getInputRadices();
   for (auto &bases : other.getBases())
     resultBases.insert(bases);
+  for (auto &radices : other.getInputRadices())
+    resultRadices.insert(radices);
   SmallVector<std::pair<StringAttr, int32_t>> newOutDims;
   for (auto &[outDim, outDimSize] : outDims)
     newOutDims.emplace_back(outDim, outDimSize);
-  return LinearLayout(std::move(resultBases), newOutDims,
-                      /*requiresSurjective=*/false);
+  return LinearLayout(std::move(resultBases), std::move(resultRadices),
+                      newOutDims, /*requiresSurjective=*/false);
 }
 
 LinearLayout LinearLayout::concatOuts(const LinearLayout &other) const {
@@ -520,9 +682,13 @@ LinearLayout LinearLayout::concatOuts(const LinearLayout &other) const {
     assert(getInDimSize(inDim) == other.getInDimSize(inDim) &&
            "layouts must have the same input dimension sizes");
   }
+  assert(llvm::equal(inputRadices, other.inputRadices) &&
+         "layouts must have the same input radices");
   for (StringAttr outDim : other.getOutDimNames())
     assert(!hasOutDim(outDim) &&
            "layouts must have disjoint output dimensions");
+  if (!hasOddPartForm() || !other.hasOddPartForm())
+    return concatMixedRadixOuts(other).value();
 
   LinearLayout::BasesT result;
   for (auto [lhsBases, rhsBases] : llvm::zip(getBases(), other.getBases())) {
@@ -541,7 +707,7 @@ LinearLayout LinearLayout::concatOuts(const LinearLayout &other) const {
     newOutDims.emplace_back(outDim, outDimSize);
   for (auto &[outDim, outDimSize] : other.outDims)
     newOutDims.emplace_back(outDim, outDimSize);
-  return LinearLayout(std::move(result), newOutDims,
+  return LinearLayout(std::move(result), inputRadices, newOutDims,
                       /*requiresSurjective=*/false);
 }
 
@@ -553,6 +719,7 @@ std::optional<LinearLayout> divideLeft(const LinearLayout &A,
   // [[B, 0],
   //  [0, C]]
   // as a matrix, whenever those dimensions are present in B.
+  assert(A.isRadix2() && B.isRadix2());
   for (StringAttr dim : B.getInDimNames()) {
     if (!llvm::is_contained(A.getInDimNames(), dim))
       return std::nullopt;
@@ -629,6 +796,7 @@ std::optional<LinearLayout> divideRight(const LinearLayout &A,
   // as a matrix, whenever those dimensions are present in B.
 
   // Check that B's in-dimensions and out-dimensions are contained in A.
+  assert(A.isRadix2() && B.isRadix2());
   for (StringAttr dim : B.getInDimNames()) {
     if (!llvm::is_contained(A.getInDimNames(), dim))
       return std::nullopt;
@@ -707,22 +875,25 @@ LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
                          llvm::to_vector(outer.getInDimNames()));
   auto outDims = supremum(llvm::to_vector(inner.getOutDimNames()),
                           llvm::to_vector(outer.getOutDimNames()));
+  if (!inner.hasOddPartForm() || !outer.hasOddPartForm())
+    return LinearLayout::mixedRadixProduct(inner, outer, inDims, outDims)
+        .value();
 
   // Get the sizeLog2 of all input and output dimensions we're going to
   // consider, in order.  `inner` is more minor, so its dimensions come
   // first.
   llvm::MapVector<StringAttr, int32_t> inDimSizesLog2;
-  llvm::MapVector<StringAttr, int32_t> outDimSizesLog2;
+  llvm::MapVector<StringAttr, int32_t> outDimSizes;
   for (const auto &dim : inDims)
     inDimSizesLog2.insert({dim, 0});
   for (const auto &dim : outDims)
-    outDimSizesLog2.insert({dim, 0});
+    outDimSizes.insert({dim, 1});
   for (const auto &layout : {inner, outer}) {
     for (StringAttr inDim : layout.getInDimNames()) {
       inDimSizesLog2[inDim] += layout.getInDimSizeLog2(inDim);
     }
     for (StringAttr outDim : layout.getOutDimNames()) {
-      outDimSizesLog2[outDim] += layout.getOutDimSizeLog2(outDim);
+      outDimSizes[outDim] *= layout.getOutDimSize(outDim);
     }
   }
 
@@ -732,35 +903,46 @@ LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
 
     // Fill with zeros.
     inDimBases = std::vector<std::vector<int32_t>>(
-        inDimSizeLog2, std::vector<int32_t>(outDimSizesLog2.size(), 0));
+        inDimSizeLog2, std::vector<int32_t>(outDimSizes.size(), 0));
 
-    for (auto [outDimIdx, outDimNameAndSize] :
-         llvm::enumerate(outDimSizesLog2)) {
+    for (auto [outDimIdx, outDimNameAndSize] : llvm::enumerate(outDimSizes)) {
       auto [outDimName, outDimSize] = outDimNameAndSize;
+      int32_t innerSize =
+          inner.hasOutDim(outDimName) ? inner.getOutDimSize(outDimName) : 1;
+      // On a mixed-radix output, outer digits land above inner's binary part
+      // and inner's odd part moves above them.
+      int32_t innerTwoPart = LinearLayout::twoPartOf(innerSize);
       if (inner.hasInDim(inDimName) && inner.hasOutDim(outDimName)) {
         for (int i = 0; i < inner.getInDimSizeLog2(inDimName); i++) {
-          inDimBases[i][outDimIdx] = inner.getBasis(inDimName, i, outDimName);
+          int32_t basis = inner.getBasis(inDimName, i, outDimName);
+          inDimBases[i][outDimIdx] =
+              basis % innerTwoPart +
+              basis / innerTwoPart * (outDimSize / innerSize * innerTwoPart);
         }
       }
       if (outer.hasInDim(inDimName) && outer.hasOutDim(outDimName)) {
         int offset =
             inner.hasInDim(inDimName) ? inner.getInDimSizeLog2(inDimName) : 0;
-        int shift = inner.hasOutDim(outDimName)
-                        ? inner.getOutDimSizeLog2(outDimName)
-                        : 0;
         for (int i = 0; i < outer.getInDimSizeLog2(inDimName); i++) {
           inDimBases[offset + i][outDimIdx] =
-              outer.getBasis(inDimName, i, outDimName) << shift;
+              outer.getBasis(inDimName, i, outDimName) * innerTwoPart;
         }
       }
     }
   }
 
-  llvm::SmallVector<std::pair<StringAttr, int32_t>> outDimSizes;
-  for (auto [outDim, sizeLog2] : outDimSizesLog2) {
-    outDimSizes.push_back({outDim, 1 << sizeLog2});
+  // Inner digits come first, then outer digits.
+  LinearLayout::RadicesT allRadices;
+  for (StringAttr inDim : inDims) {
+    auto &radices = allRadices[inDim];
+    for (const LinearLayout *layout : {&inner, &outer}) {
+      if (layout->hasInDim(inDim))
+        llvm::append_range(radices, layout->getInputRadices(inDim));
+    }
   }
-  return LinearLayout(std::move(allBases), outDimSizes,
+
+  return LinearLayout(std::move(allBases), std::move(allRadices),
+                      llvm::to_vector(outDimSizes),
                       inner.isSurjective() && outer.isSurjective());
 }
 
@@ -852,10 +1034,12 @@ LinearLayout LinearLayout::sublayout(ArrayRef<StringAttr> inDimNames,
     }
   }
   BasesT newBases;
+  RadicesT newRadices;
   for (auto [inDim, inDimBases] : bases) {
     if (!inDimSet.contains(inDim)) {
       continue;
     }
+    newRadices[inDim] = inputRadices.lookup(inDim);
     auto &newInDimBases = newBases[inDim];
     for (auto &basis : inDimBases) {
       auto &newBasis = newInDimBases.emplace_back();
@@ -871,7 +1055,12 @@ LinearLayout LinearLayout::sublayout(ArrayRef<StringAttr> inDimNames,
       newOutDims.push_back({outDim, outDimSize});
     }
   }
-  return LinearLayout(std::move(newBases), std::move(newOutDims),
+  TableDigitsT newDigits;
+  TableOffsetsT newOffsets;
+  sublayoutTables(inDimNames, outDimNames, newDigits, newOffsets);
+  return LinearLayout(std::move(newBases), std::move(newRadices),
+                      std::move(newOutDims), std::move(newDigits),
+                      std::move(newOffsets),
                       /*requireSurjective=*/false);
 }
 
@@ -885,6 +1074,9 @@ bool LinearLayout::sublayoutIsZero(ArrayRef<StringAttr> inDimNames,
 SmallVector<std::pair<StringAttr, int32_t>>
 LinearLayout::apply(ArrayRef<std::pair<StringAttr, int32_t>> ins) const {
   assertDimsEqualIgnoringOrder(llvm::make_first_range(ins), getInDimNames());
+
+  if (!isRadix2())
+    return applyMixedRadix(ins);
 
   SmallVector<std::pair<StringAttr, int32_t>> ret;
   for (StringAttr outDim : getOutDimNames()) {
@@ -901,6 +1093,9 @@ LinearLayout::apply(ArrayRef<std::pair<StringAttr, int32_t>> ins) const {
 }
 
 LinearLayout LinearLayout::compose(const LinearLayout &outer) const {
+  if (hasNonPow2OutDim() || outer.hasNonPow2OutDim())
+    return tryCompose(outer).value();
+  assert(isRadix2() && outer.isRadix2());
   assertDimsEqualIgnoringOrder(getOutDimNames(), outer.getInDimNames());
   for (StringAttr outDim : getOutDimNames()) {
     assert(getOutDimSize(outDim) <= outer.getInDimSize(outDim));
@@ -933,10 +1128,10 @@ LinearLayout LinearLayout::compose(const LinearLayout &outer) const {
 namespace {
 std::unique_ptr<uint64_t[]> concatMatrices(const LinearLayout &A,
                                            const LinearLayout &B) {
+  // conv
   assert(A.getTotalOutDimSizeLog2() >= B.getTotalOutDimSizeLog2() &&
          "A must have at least as many output bits as B");
   int numColsA = A.getTotalInDimSizeLog2();
-  int numColsB = B.getTotalInDimSizeLog2();
 
   // rref expects the lower bits to be the lower indices of the matrix.
   auto concat = getMatrix(A);
@@ -946,8 +1141,7 @@ std::unique_ptr<uint64_t[]> concatMatrices(const LinearLayout &A,
   for (auto [outDim, outDimSize] : A.getOutDims()) {
     for (int r = 0; r < llvm::Log2_32(outDimSize); r++) {
       if (r < llvm::Log2_32(B.getOutDimSize(outDim))) {
-        if (numColsB)
-          concat[rowA] |= BMat[rowB] << numColsA;
+        concat[rowA] |= BMat[rowB] << numColsA;
         rowB++;
       }
       rowA++;
@@ -955,6 +1149,7 @@ std::unique_ptr<uint64_t[]> concatMatrices(const LinearLayout &A,
   }
   return concat;
 }
+
 } // namespace
 
 std::optional<LinearLayout> lstsq(const LinearLayout &A,
@@ -974,6 +1169,7 @@ std::optional<LinearLayout> lstsq(const LinearLayout &A,
   for (StringAttr outDim : A.getOutDimNames())
     if (B.getOutDimSize(outDim) > A.getOutDimSize(outDim))
       return std::nullopt;
+  assert(A.isRadix2() && B.isRadix2());
 
   auto orderedB = B.transposeOuts(llvm::to_vector(A.getOutDimNames()));
   int numRows = A.getTotalOutDimSizeLog2();
@@ -1050,6 +1246,9 @@ LinearLayout LinearLayout::invertAndCompose(const LinearLayout &outer) const {
   // The order of dims does not matter. We choose to transpose outer
   auto outDims = llvm::to_vector(getOutDimNames());
   assertDimsEqualIgnoringOrder(outDims, outer.getOutDimNames());
+  if (hasNonPow2OutDim() || outer.hasNonPow2OutDim())
+    return tryInvertAndCompose(outer).value();
+  assert(isRadix2() && outer.isRadix2());
   const auto &B = *this;
   const auto A = outer.transposeOuts(outDims);
   for (auto dim : outDims) {
@@ -1165,6 +1364,9 @@ LinearLayout LinearLayout::squeezeOuts(StringAttr dim) const {
 
 llvm::MapVector<StringAttr, int32_t>
 LinearLayout::getFreeVariableMasks() const {
+  if (hasNonPow2OutDim())
+    return getMixedRadixFreeVariableMasks();
+  assert(isRadix2());
   std::unique_ptr<uint64_t[]> mat = getMatrix(*this);
   int numRows = getTotalOutDimSizeLog2();
   int numCols = getTotalInDimSizeLog2();
@@ -1199,18 +1401,23 @@ LinearLayout::getFreeVariableMasks() const {
 }
 
 LinearLayout LinearLayout::removeZeroBasesAlongDim(StringAttr stripDim) const {
+  if (!hasOddPartForm())
+    return removeMixedRadixZeroBases(stripDim);
   uint64_t nonZeroBases =
       getInputBasisMask(*this, stripDim, llvm::to_vector(getOutDimNames()));
   LinearLayout::BasesT result;
+  LinearLayout::RadicesT radices = inputRadices;
   for (auto &[inDim, inDimBases] : getBases()) {
     auto &newInDimBases = result[inDim];
     if (inDim != stripDim) {
       newInDimBases = inDimBases;
       continue;
     }
+    radices[inDim].clear();
     for (auto [i, basis] : llvm::enumerate(inDimBases)) {
       if (nonZeroBases & (uint64_t{1} << i)) {
         newInDimBases.push_back(basis);
+        radices[inDim].push_back(getInputRadix(inDim, i));
       }
     }
   }
@@ -1218,8 +1425,8 @@ LinearLayout LinearLayout::removeZeroBasesAlongDim(StringAttr stripDim) const {
   for (auto outDim : getOutDimNames()) {
     newOutDimSizes.push_back({outDim, getOutDimSize(outDim)});
   }
-  auto newLayout = LinearLayout(std::move(result), ArrayRef(newOutDimSizes),
-                                this->isSurjective());
+  auto newLayout = LinearLayout(std::move(result), std::move(radices),
+                                ArrayRef(newOutDimSizes), this->isSurjective());
   return newLayout;
 }
 
@@ -1243,6 +1450,8 @@ size_t hash_value(const LinearLayout &layout) {
   for (const auto &outDim : layout.getOutDimNames()) {
     seed = llvm::hash_combine(seed, outDim, layout.getOutDimSize(outDim));
   }
+  if (!layout.isRadix2())
+    seed = layout.hashMixedRadix(seed);
   // Don't hash the surjective flag as it's a cached property
   return seed;
 }
@@ -1271,7 +1480,17 @@ bool LinearLayout::equalIgnoringOutDimSizes(const LinearLayout &other) const {
     if (*it1 != *it2)
       return false;
   }
-  return true;
+  if (!llvm::equal(inputRadices, other.inputRadices) ||
+      !llvm::equal(tables, other.tables))
+    return false;
+  // A mixed-radix output reads its bases against its size's power-of-two
+  // factor.
+  return llvm::all_of(llvm::zip(outDims, other.outDims), [](auto dims) {
+    int32_t size = std::get<0>(dims).second;
+    int32_t otherSize = std::get<1>(dims).second;
+    return (llvm::isPowerOf2_32(size) && llvm::isPowerOf2_32(otherSize)) ||
+           twoPartOf(size) == twoPartOf(otherSize);
+  });
 }
 
 std::string LinearLayout::toString() const {
@@ -1303,44 +1522,66 @@ std::string LinearLayout::toString() const {
       continue;
     }
 
+    // Rejected layouts print too, so a missing radix reads as 2.
+    std::vector<int32_t> radices = inputRadices.lookup(inDim);
+    int64_t weight = 1;
     ret += " - " +
            join(llvm::seq(inDimBases.size()), "\n   ",
                 [&, &inDim = inDim, &inDimBases = inDimBases](int i) {
-                  return inDim.str() + "=" + std::to_string(1 << i) + " -> (" +
-                         join(inDimBases[i], ", ") + ")";
+                  int32_t radix = i < radices.size() ? radices[i] : 2;
+                  std::string digit =
+                      inDim.str() + "=" + std::to_string(weight);
+                  if (radix != 2)
+                    digit += " (radix " + std::to_string(radix) + ")";
+                  weight *= radix;
+                  return digit + " -> (" + join(inDimBases[i], ", ") + ")";
                 }) +
            "\n";
   }
+  ret += tablesToString();
   ret += "where out dims are: " + outDimsStr;
   return ret;
 }
 
 LinearLayout ColumnAction::apply(const LinearLayout &layout) const {
   assert(layout.hasInDim(inDim));
+  assert((isRadix2()
+              ? layout.getNumLeadingRadix2Digits(inDim) == inSizeLog2
+              : llvm::equal(inputRadices, layout.getInputRadices(inDim))) &&
+         "Layout has different radices than the ColumnAction");
   assert(layout.getInDimSizeLog2(inDim) == inSizeLog2 &&
          "Layout has a different size than the ColumnAction");
   if (m_isIdentity) {
     return layout;
   }
+  if (!layout.hasOddPartForm())
+    return applyMixedRadix(layout);
 
   auto bases = layout.getBases();
+  auto radices = layout.getInputRadices();
   const auto &basesInDim = bases[inDim];
+  const auto &radicesInDim = radices[inDim];
   std::vector<std::vector<int32_t>> newBases;
+  std::vector<int32_t> newRadices;
   newBases.reserve(action.size());
   for (size_t a : action) {
     newBases.push_back(basesInDim[a]);
+    newRadices.push_back(radicesInDim[a]);
   }
   bases[inDim] = std::move(newBases);
+  radices[inDim] = std::move(newRadices);
 
   SmallVector<std::pair<StringAttr, int32_t>> outDims;
   for (auto outDim : layout.getOutDimNames()) {
     outDims.emplace_back(outDim, layout.getOutDimSize(outDim));
   }
-  return LinearLayout(std::move(bases), std::move(outDims),
+  return LinearLayout(std::move(bases), std::move(radices), std::move(outDims),
                       /*requireSurjective=*/false);
 }
 
 SmallVector<Value> ColumnAction::apply(ValueRange values) const {
+  if (!isRadix2())
+    return applyMixedRadix(values);
   assert(values.size() == (1 << inSizeLog2) &&
          "Values have a different size than the ColumnAction");
   assert(inDim.str() == "register" && "Values are in registers, so we can only "
@@ -1359,6 +1600,7 @@ SmallVector<Value> ColumnAction::apply(ValueRange values) const {
 }
 
 ColumnAction ColumnAction::leftCompose(const ColumnAction &other) const {
+  assert(isRadix2() && other.isRadix2());
   assert(inDim == other.inDim);
   assert(inSizeLog2 == other.inSizeLog2);
   assert(action.size() == other.action.size());
@@ -1374,7 +1616,11 @@ ColumnAction ColumnAction::inverse() const {
   for (size_t i = 0; i < action.size(); i++) {
     invPerm[action[i]] = i;
   }
-  return ColumnAction(invPerm, inDim, inSizeLog2);
+  // The inverse acts on the permuted digits, so it takes their radices.
+  SmallVector<int32_t> invRadices;
+  for (size_t a : inputRadices.empty() ? ArrayRef<size_t>() : action)
+    invRadices.push_back(inputRadices[a]);
+  return ColumnAction(invPerm, inDim, inSizeLog2, invRadices);
 }
 
 std::string ColumnAction::toString() const {

@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/STLExtras.h"
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -18,6 +19,18 @@ using mlir::triton::amdgpu::TargetFeatures;
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace {
+
+static Attribute unwrapPinnedSharedLayout(Attribute encoding) {
+  while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
+    encoding = pinned.getPinnedLayout();
+  if (auto partitioned = dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
+    return ttg::PartitionedSharedEncodingAttr::get(
+        encoding.getContext(), partitioned.getNumPartitions(),
+        partitioned.getNumGroups(), partitioned.getPartitionDim(),
+        cast<ttg::SharedEncodingTrait>(
+            unwrapPinnedSharedLayout(partitioned.getPartitionLayout())));
+  return encoding;
+}
 
 // If all the transitive uses of the given value have are used by a convert to
 // the same dot operand encoding, return true and get the shared encoding that
@@ -129,9 +142,10 @@ class AMDGPUAssignDescriptorMemoryLayouts
     : public ttg::AssignDescriptorMemoryLayouts {
 public:
   AMDGPUAssignDescriptorMemoryLayouts() = default;
-  ~AMDGPUAssignDescriptorMemoryLayouts() override = default;
 
 private:
+  Attribute getDesiredDescriptorEncoding(
+      TypedValue<tt::TensorDescType> descriptor) override;
   Attribute buildFallbackSharedEncoding(mlir::MLIRContext *ctx,
                                         ArrayRef<int64_t> shape,
                                         ArrayRef<unsigned> order,
@@ -139,6 +153,100 @@ private:
                                         Type elementType) override;
   bool isCompatibleSharedEncoding(Attribute enc) override;
 };
+
+Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
+    TypedValue<tt::TensorDescType> descriptor) {
+  SmallVector<Value> worklist{descriptor};
+  SmallVector<Value> visited;
+  Attribute desiredEncoding;
+
+  auto mergeEncoding = [&](ttg::MemDescType memoryType) {
+    Attribute encoding = unwrapPinnedSharedLayout(memoryType.getEncoding());
+    // TDM lowering uses the descriptor's partition mapping to select the LDS
+    // base and distribute work across waves. Keeping only its padded child
+    // would make the descriptor and the destination disagree physically.
+    encoding = getCompatibleSharedEncoding(encoding, memoryType.getShape(),
+                                           memoryType.getElementType());
+    if (!encoding)
+      return true;
+    // Compare descriptor encodings, not allocation types. A full tile and a
+    // slice of a larger allocation may require exactly the same descriptor.
+    // The TDM verifier separately checks that the tile's physical strides
+    // agree with the preserved allocation layout.
+    auto descTy = descriptor.getType();
+    // A descriptor whose tile does not split into the allocation's partition
+    // pieces (e.g. a rank-reducing one) cannot use its layout. Leave it to the
+    // fallback encoding; the TDM verifier then reports the mismatch.
+    if (auto partitioned =
+            dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding);
+        partitioned && !ttg::isPartitionedEncodingCompatibleWithShape(
+                           partitioned, descTy.getShape()))
+      return false;
+    auto tensorTy = RankedTensorType::get(descTy.getShape(),
+                                          descTy.getElementType(), encoding);
+    encoding = ttg::updateEncodingForShape(
+        nullptr, cast<ttg::SharedEncodingTrait>(encoding), tensorTy);
+    if (desiredEncoding && desiredEncoding != encoding)
+      return false;
+    desiredEncoding = encoding;
+    return true;
+  };
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (llvm::is_contained(visited, value))
+      continue;
+    visited.push_back(value);
+
+    for (Operation *user : value.getUsers()) {
+      if (auto update =
+              dyn_cast<triton::amdgpu::UpdateTensorDescriptorOp>(user)) {
+        if (update.getDesc() == value)
+          worklist.push_back(update.getResult());
+        continue;
+      }
+
+      ttg::MemDescType memoryType;
+      if (auto load =
+              dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(user)) {
+        if (load.getDesc() == value)
+          memoryType = load.getResult().getType();
+      } else if (auto fused =
+                     dyn_cast<triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+                         user)) {
+        for (auto [desc, dest] :
+             llvm::zip_equal(fused.getDescs(), fused.getDests())) {
+          if (desc != value)
+            continue;
+          if (!mergeEncoding(cast<ttg::MemDescType>(dest.getType())))
+            return {};
+        }
+        continue;
+      } else if (auto store =
+                     dyn_cast<triton::amdgpu::AsyncTDMCopyLocalToGlobalOp>(
+                         user)) {
+        if (store.getDesc() == value)
+          memoryType = store.getSrc().getType();
+      } else if (auto gather =
+                     dyn_cast<triton::amdgpu::AsyncTDMGatherOp>(user)) {
+        if (gather.getDesc() == value)
+          memoryType = gather.getDst().getType();
+      } else if (auto scatter =
+                     dyn_cast<triton::amdgpu::AsyncTDMScatterOp>(user)) {
+        if (scatter.getDesc() == value)
+          memoryType = scatter.getSrc().getType();
+      }
+
+      if (!memoryType)
+        continue;
+
+      if (!mergeEncoding(memoryType))
+        return {};
+    }
+  }
+
+  return desiredEncoding;
+}
 
 Attribute AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding(
     mlir::MLIRContext *ctx, ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
@@ -163,6 +271,8 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding(
 
 bool AMDGPUAssignDescriptorMemoryLayouts::isCompatibleSharedEncoding(
     Attribute enc) {
+  if (auto partitioned = dyn_cast<ttg::PartitionedSharedEncodingAttr>(enc))
+    return isCompatibleSharedEncoding(partitioned.getPartitionLayout());
   return isa<ttg::PaddedSharedEncodingAttr, ttg::SwizzledSharedEncodingAttr>(
       enc);
 }

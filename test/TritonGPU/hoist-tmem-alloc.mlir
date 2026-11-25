@@ -44,6 +44,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A post-specialization, tokenless predicated TMEM read-modify-write must
+// become real control flow. Otherwise the accumulator load and multiply still
+// execute when the store predicate is false.
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // POST-PIPELINE-LABEL: @materialize_tokenless_conditional_tmem_update
+  // POST-PIPELINE: scf.if %[[PRED:.*]] {
+  // POST-PIPELINE-NEXT: %[[ACC:.*]] = ttng.tmem_load
+  // POST-PIPELINE-NEXT: %[[SCALED:.*]] = arith.mulf %[[ACC]],
+  // POST-PIPELINE-NEXT: ttng.tmem_store %[[SCALED]],
+  // POST-PIPELINE-NEXT: }
+  tt.func public @materialize_tokenless_conditional_tmem_update(
+      %mem: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %pred: i1,
+      %alpha: tensor<128x128xf32, #blocked>) {
+    %acc = ttng.tmem_load %mem : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    %scaled = arith.mulf %acc, %alpha : tensor<128x128xf32, #blocked>
+    ttng.tmem_store %scaled, %mem, %pred : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
@@ -255,51 +280,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     } {tt.scheduled_max_stage = 3 : i32}
     %res_f16 = arith.truncf %res : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
     tt.return %res_f16 : tensor<128x128xf16, #blocked>
-  }
-}
-
-// -----
-
-// The tmem_store predicate is a scalar i1: a splatted select condition folds
-// into it as its scalar source, and a per-element condition must not fold.
-
-#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
-!acc = !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: @select_splat_cond(
-  // CHECK: %[[NEG:.*]] = arith.xori %arg2, %true
-  // CHECK-NEXT: ttng.tmem_store %arg3, %arg0[%arg1], %[[NEG]] :
-  tt.func @select_splat_cond(%tm: !acc, %tok: !ttg.async.token, %cnd: i1, %x: tensor<128x128xf32, #blocked>) -> !ttg.async.token {
-    %true = arith.constant true
-    %v, %load_tok = ttng.tmem_load %tm[%tok] : !acc -> tensor<128x128xf32, #blocked>
-    %c = tt.splat %cnd : i1 -> tensor<128x128xi1, #blocked>
-    %s = arith.select %c, %v, %x : tensor<128x128xi1, #blocked>, tensor<128x128xf32, #blocked>
-    %store_tok = ttng.tmem_store %s, %tm[%load_tok], %true : tensor<128x128xf32, #blocked> -> !acc
-    tt.return %store_tok : !ttg.async.token
-  }
-
-  // CHECK-LABEL: @select_splat_cond_inverted(
-  // CHECK-NOT: arith.select
-  // CHECK: ttng.tmem_store %arg3, %arg0[%arg1], %arg2 :
-  tt.func @select_splat_cond_inverted(%tm: !acc, %tok: !ttg.async.token, %cnd: i1, %x: tensor<128x128xf32, #blocked>) -> !ttg.async.token {
-    %true = arith.constant true
-    %v, %load_tok = ttng.tmem_load %tm[%tok] : !acc -> tensor<128x128xf32, #blocked>
-    %c = tt.splat %cnd : i1 -> tensor<128x128xi1, #blocked>
-    %s = arith.select %c, %x, %v : tensor<128x128xi1, #blocked>, tensor<128x128xf32, #blocked>
-    %store_tok = ttng.tmem_store %s, %tm[%load_tok], %true : tensor<128x128xf32, #blocked> -> !acc
-    tt.return %store_tok : !ttg.async.token
-  }
-
-  // CHECK-LABEL: @select_tensor_cond(
-  // CHECK: %[[SEL:.*]] = arith.select %arg2
-  // CHECK: ttng.tmem_store %[[SEL]], {{.*}}, %true :
-  tt.func @select_tensor_cond(%tm: !acc, %tok: !ttg.async.token, %c: tensor<128x128xi1, #blocked>, %x: tensor<128x128xf32, #blocked>) -> !ttg.async.token {
-    %true = arith.constant true
-    %v, %load_tok = ttng.tmem_load %tm[%tok] : !acc -> tensor<128x128xf32, #blocked>
-    %s = arith.select %c, %v, %x : tensor<128x128xi1, #blocked>, tensor<128x128xf32, #blocked>
-    %store_tok = ttng.tmem_store %s, %tm[%load_tok], %true : tensor<128x128xf32, #blocked> -> !acc
-    tt.return %store_tok : !ttg.async.token
   }
 }
 
@@ -542,5 +522,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %def = "def_tensor" () : () -> tensor<128x128xf32, #blocked>
     %token2 = ttng.tmem_store %def, %result1[%token1], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return %result1, %token2 : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token
+  }
+}
+
+// -----
+
+// Regression test for SinkTMEMLoad. The tmem_load's dep token is defined outside
+// an enclosing scf.if, so sinkValueRedefinition threads the token *out* of the if
+// and the redefined token becomes the if's own result, which does not dominate
+// uses inside the if. The in-if token use (%ld_tok, consumed by "token_user")
+// must therefore keep the original token. Redirecting it used to (a) deref an
+// OpOperand* invalidated by the threaded yield's operand-storage reallocation
+// (use-after-free, caught under ASAN) and (b) point the in-if use at the if
+// result -> `operand does not dominate this use` (deterministic verifier error
+// without the fix; "token_user" keeps a stable, non-reallocated operand so the
+// bad redirect lands).
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @sink_tmem_load_through_if
+  // CHECK: scf.if
+  // The load is sunk below "barrier", and "token_user" keeps the load's own
+  // token (%[[LD_TOK]]) rather than the non-dominating scf.if result.
+  // CHECK: "barrier"
+  // CHECK: %{{.*}}, %[[LD_TOK:.*]] = ttng.tmem_load
+  // CHECK: "use"
+  // CHECK: "token_user"(%[[LD_TOK]])
+  tt.func public @sink_tmem_load_through_if(%mem: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, %arg_tok: !ttg.async.token, %cnd: i1, %n: i32) -> !ttg.async.token {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %res = scf.for %i = %c0_i32 to %n step %c1_i32 iter_args(%tok = %arg_tok) -> (!ttg.async.token)  : i32 {
+      %if_tok = scf.if %cnd -> (!ttg.async.token) {
+        %ld, %ld_tok = ttng.tmem_load %mem[%tok] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+        "barrier"() : () -> ()
+        "use"(%ld) : (tensor<128x128xf32, #blocked>) -> ()
+        "token_user"(%ld_tok) : (!ttg.async.token) -> ()
+        scf.yield %tok : !ttg.async.token
+      } else {
+        scf.yield %tok : !ttg.async.token
+      }
+      scf.yield %if_tok : !ttg.async.token
+    }
+    tt.return %res : !ttg.async.token
   }
 }

@@ -1,22 +1,33 @@
 from __future__ import annotations
+
+import copy
+import functools
 import hashlib
 import json
+import logging
+import os
+import re
+import time
+import warnings
+import weakref
+from pathlib import Path
+
+from .. import __version__, knobs
 from .._C.libtriton import get_cache_invalidating_env_vars, ir
 from ..backends import backends
-from ..backends.compiler import Language
-from ..backends.compiler import BaseBackend, GPUTarget
-from .. import __version__, knobs
+from ..backends.compiler import BaseBackend, GPUTarget, Language
+from ..magnon.flags import apply_enabled as _compile_iq_apply_enabled, collect_enabled as _compile_iq_collect_enabled
 from ..runtime.autotuner import OutOfResources
-from ..runtime.cache import get_cache_manager, get_dump_manager, get_override_manager, get_cache_key
+from ..runtime.cache import (
+    get_cache_key,
+    get_cache_manager,
+    get_dump_manager,
+    get_override_manager,
+)
 from ..runtime.driver import driver
 from ..tools.disasm import get_sass
-from pathlib import Path
-import re
-import functools
-import os
-import time
-import copy
 
+logger: logging.Logger = logging.getLogger(__name__)
 # - ^\s*tt\.func\s+ : match the start of the string, any leading whitespace, the keyword func,
 #    and any following whitespace
 # - (public\s+)? : optionally match the keyword public and any following whitespace
@@ -34,6 +45,10 @@ ptx_arg_type_pattern = r"\.param\s+\.(\w+)"
 arg_type_pattern = {
     "ptx": ptx_arg_type_pattern,
 }
+
+
+def _target_supports_triton_dispatcher(target) -> bool:
+    return getattr(target, "backend", None) in ("cuda", "hip")
 
 
 def convert_type_repr(x):
@@ -71,14 +86,27 @@ class ASTSource:
     def hash(self):
         sorted_sig = [v for k, v in sorted(self.signature.items())]
         get_key = lambda x: x.cache_key if hasattr(x, 'cache_key') else str(x)
-        constants_key = '-'.join([get_key(v) for k, v in sorted(self.constants.items())])
+        # Optional constexprs can have the same values at different argument
+        # positions. Include their paths so omitted defaults cannot alias a
+        # different specialization in the cache.
+        constants_key = repr([(k, get_key(v)) for k, v in sorted(self.constants.items())])
         key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     def make_ir(self, target: GPUTarget, options, codegen_fns, module_map, context):
         from .code_generator import ast_to_ttir
-        return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
-                           module_map=module_map)
+        src = self
+        if getattr(options, "sr_mode", "") == "enabled":
+            # The JIT reuses `attrs` after compilation, so launch values go on a copy.
+            src = copy.copy(self)
+            src.attrs = {path: list(specs) for path, specs in self.attrs.items()}
+            for name, value in options.sr_launch:
+                src.attrs.setdefault((self.fn.arg_names.index(name), ), []).append(("tt.sr_value", value))
+        module = ast_to_ttir(self.fn, src, context=context, options=options, codegen_fns=codegen_fns,
+                             module_map=module_map)
+        if post_ast_lowering := codegen_fns.get("post_ast_lowering"):
+            post_ast_lowering(module)
+        return module
 
     def parse_options(self):
         return dict()
@@ -91,7 +119,7 @@ class IRSource:
         path = Path(path)
         self.ext = path.suffix[1:]
         self.language = Language.GLUON if self.ext == "glir" else Language.TRITON
-        self.src = path.read_text()
+        self.src = path.read_text(encoding="utf-8")
         ir.load_dialects(context)
         backend.load_dialects(context)
 
@@ -131,18 +159,22 @@ class IRSource:
 
 
 @functools.lru_cache()
+def _max_shared_mem(device, driver_utils):
+    return driver_utils.get_device_properties(device)["max_shared_mem"]
+
+
 def max_shared_mem(device):
-    return driver.active.utils.get_device_properties(device)["max_shared_mem"]
+    return _max_shared_mem(device, driver.active.utils)
 
 
 def parse(full_name, ext, context):
-    if ext in ("ttir", "glir", "ttgir"):
+    if ext == "ttir" or ext == "glir" or ext == "ttgir" or ext == "ttcir" or ext == "tttcir":
         module = ir.parse_mlir_module(full_name, context)
         module.context = context
         return module
-    if ext == "llir" or ext == "ptx" or ext == "amdgcn":
-        return Path(full_name).read_text()
-    if ext == "cubin" or ext == "hsaco":
+    if ext == "llir" or ext == "ptx" or ext == "amdgcn" or ext == "asm":
+        return Path(full_name).read_text(encoding="utf-8")
+    if ext == "cubin" or ext == "hsaco" or ext == "so":
         return Path(full_name).read_bytes()
 
 
@@ -223,6 +255,39 @@ class CompileTimer:
         )
 
 
+# Facebook begin T207797237
+def _sanitize_extern_libs(options):
+    options = dict(options)
+    options["extern_libs"] = [name for name, path in options.get("extern_libs", [])]
+    return options
+
+
+# Facebook end T207797237
+
+
+def _replace_ptx_line_info(ptx_text: str, ptx_file_path: str) -> str:
+    lines = [line for line in ptx_text.split('\n') if not line.strip().startswith('.loc')]
+    # replace ".file"
+    for i in range(len(lines)):
+        line = lines[i]
+        if line.strip().startswith('.file'):
+            lines[i] = line.split('"')[0] + f'"{ptx_file_path}"'
+
+    i = 0
+    while i < len(lines):
+        # for iteration i, we're actually looking at file line i+1
+        if any(x in lines[i] for x in ('bar', 'sync', 'wait')):
+            # if i==1, insert ".loc\t1 3, 1" at file line 2, and original line 2 moves to line 3
+            lines.insert(i, f".loc\t1 {i+2} 1")
+            i += 2
+            continue
+        i += 1
+
+    with open(ptx_file_path, 'w') as f:
+        f.write('\n'.join(lines))
+    return '\n'.join(lines)
+
+
 def compile(src, target=None, options=None, _env_vars=None):
     compilation_listener = knobs.compilation.listener
     if compilation_listener:
@@ -255,7 +320,35 @@ def compile(src, target=None, options=None, _env_vars=None):
     enable_ir_dump = knobs.compilation.dump_ir
     store_only_binary = knobs.compilation.store_binary_only
     fn_override_manager = get_override_manager(src.hash()) if enable_override else None
-    fn_dump_manager = get_dump_manager(src.hash()) if enable_ir_dump else None
+    # For dumping, use fn.cache_key as base directory when autotuning (consistent across configs).
+    # Otherwise use src.hash() to keep different constant values in separate directories.
+    if enable_ir_dump and knobs.autotuning.print and not ir_source:
+        dump_base_key = hashlib.sha256(src.fn.cache_key.encode("utf-8")).hexdigest()
+    else:
+        dump_base_key = src.hash()
+    fn_dump_manager = get_dump_manager(dump_base_key) if enable_ir_dump else None
+    if enable_ir_dump and knobs.autotuning.print:
+        # Build readable config name from constants (block sizes) and options (warps, stages, ctas)
+        config_parts = []
+        if not ir_source:
+            # Map constant indices back to arg names for readable output
+            arg_names = src.fn.arg_names
+            for idx, val in sorted(src.constants.items()):
+                if isinstance(idx, tuple) and len(idx) == 1:
+                    name = arg_names[idx[0]]
+                    # Shorten common prefixes for brevity
+                    short_name = name.replace("BLOCK_SIZE_", "B").replace("GROUP_SIZE_", "G")
+                    config_parts.append(f"{short_name}_{val}")
+        config_parts.append(f"warps{options.num_warps}")
+        config_parts.append(f"stages{options.num_stages}")
+        config_parts.append(f"ctas{options.num_ctas}")
+        config_name = "_".join(config_parts)
+        if len(config_name) > 240:
+            config_name = config_name[:200] + "_" + hashlib.sha256(config_name.encode()).hexdigest()[:16]
+        config_dump_dir = os.path.join(fn_dump_manager.cache_dir, config_name)
+        os.makedirs(config_dump_dir, exist_ok=True)
+        fn_dump_manager.cache_dir = config_dump_dir
+        print(f"  IR dump dir: {config_dump_dir}", flush=True)
     # Pre-truncate the file name here to avoid hitting the 255 character limit on common platforms.
     # The final file name in the cache will have a format of f"{filename}.{ext}.tmp.pid_{pid}_{uuid}".
     # A PID string can be 5-character long. A UUID string has typically 36 characters. Let's truncate
@@ -267,7 +360,7 @@ def compile(src, target=None, options=None, _env_vars=None):
     always_compile = knobs.compilation.always_compile
     if not always_compile and metadata_path is not None:
         # cache hit!
-        res = CompiledKernel(src, metadata_group, hash)
+        res = _maybe_apply_compile_iq(CompiledKernel(src, metadata_group, hash))
         if compilation_listener:
             compilation_listener(
                 src=src,
@@ -305,6 +398,8 @@ def compile(src, target=None, options=None, _env_vars=None):
     module_map = backend.get_module_map()
     try:
         module = src.make_ir(target, options, codegen_fns, module_map, context)
+        if not isinstance(module, str):
+            module.validate_stochastic_rounding(target.backend)
     except Exception as e:
         filter_traceback(e)
         raise
@@ -330,6 +425,7 @@ def compile(src, target=None, options=None, _env_vars=None):
             # Users can override kernels at scale by setting `ir_override` in autotune config
             # without TRITON_KERNEL_OVERRIDE
             if (ir_override := metadata.get("ir_override", None)) and ir_override.endswith(f".{ext}"):
+                print(f"\nOverriding IR with filename set in triton config {src.constants}: {ir_override}")
                 next_module = parse(ir_override, ext, context)
         elif full_name := fn_override_manager.get_file(ir_filename):
             print(f"\nOverriding kernel with file {full_name}")
@@ -337,6 +433,11 @@ def compile(src, target=None, options=None, _env_vars=None):
         # If TRITON_STORE_BINARY_ONLY is 1, only store cubin/hsaco/json
         if (not store_only_binary) or (ext in ("cubin", "hsaco", "json")):
             metadata_group[ir_filename] = fn_cache_manager.put(next_module, ir_filename)
+
+        if knobs.compilation.use_ptx_loc and ext == 'ptx':
+            assert type(next_module) is str, f"expecting str ptx, but got {type(next_module)}"
+            full_ptx_path = fn_cache_manager.get_file(ir_filename).replace('.ptx', '.modifiled.ptx')
+            next_module = _replace_ptx_line_info(next_module, full_ptx_path)
         if fn_dump_manager is not None:
             fn_dump_manager.put(next_module, ir_filename)
             if ext == "cubin":
@@ -351,8 +452,24 @@ def compile(src, target=None, options=None, _env_vars=None):
         if compilation_listener:
             timer.stage_finished(ext)
     # write-back metadata
+    # facebook begin T207797237
+    # Sanitize the metadata; extern_libs comes in (name, path) pairs, but the path is
+    # some semi-random temporary location that we do not want to write to cache.
+    metadata = _sanitize_extern_libs(metadata)
+    # facebook end T207797237
     metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                              binary=False)
+    # Generate Level 0 launch metadata schema if the backend supports it.
+    if hasattr(backend, "make_launch_metadata"):
+        launch_metadata = backend.make_launch_metadata(metadata, src)
+        launch_metadata_filename = f"{file_name}.launch_metadata"
+        metadata_group[launch_metadata_filename] = fn_cache_manager.put(json.dumps(launch_metadata),
+                                                                        launch_metadata_filename, binary=False)
+    # Generate Level 1 standalone launcher C source if the backend supports it.
+    if hasattr(backend, "make_launcher_src"):
+        launcher_src = backend.make_launcher_src(metadata, src)
+        launcher_src_filename = f"{file_name}.launcher_src"
+        metadata_group[launcher_src_filename] = fn_cache_manager.put(launcher_src, launcher_src_filename, binary=False)
     fn_cache_manager.put_group(metadata_filename, metadata_group)
 
     # notify any listener
@@ -360,7 +477,7 @@ def compile(src, target=None, options=None, _env_vars=None):
         compilation_listener(src=src, metadata=metadata, metadata_group=metadata_group, times=timer.end(),
                              cache_hit=False)
     # return handle to compiled kernel
-    return CompiledKernel(src, metadata_group, hash)
+    return _maybe_apply_compile_iq(CompiledKernel(src, metadata_group, hash))
 
 
 def make_backend(target: GPUTarget) -> BaseBackend:
@@ -369,6 +486,24 @@ def make_backend(target: GPUTarget) -> BaseBackend:
         raise RuntimeError(
             f"{len(actives)} compatible backends for target ({target.backend}) ({actives}). There should only be one.")
     return actives[0](target)
+
+
+def _maybe_apply_compile_iq(compiled_kernel):
+    """compile_iq: apply a stored ACF in-memory (gated by TRITON_COMPILE_IQ_APPLY).
+
+    Runs on BOTH the cache-hit and freshly-compiled paths.
+
+    NO-ACF SASS in compilation cache is never overwritten
+    """
+    if not _compile_iq_apply_enabled():
+        return compiled_kernel
+    try:
+        backend = make_backend(compiled_kernel.metadata.target)
+        if hasattr(backend, "apply_compile_iq_acf"):
+            backend.apply_compile_iq_acf(compiled_kernel)
+    except Exception:
+        pass
+    return compiled_kernel
 
 
 class LazyDict:
@@ -400,8 +535,11 @@ class AsmDict(dict):
         return value
 
 
-def _raise_error(err, *args, **kwargs):
-    raise copy.deepcopy(err)
+def _raise_error(err_ref, *args, **kwargs):
+    exc = err_ref()  # follow the weak ref
+    if exc is None:
+        raise RuntimeError("Original exception has been garbage-collected")
+    raise exc
 
 
 class CompiledKernel:
@@ -409,7 +547,11 @@ class CompiledKernel:
     def __init__(self, src, metadata_group, hash):
         from collections import namedtuple
         metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
-        metadata = json.loads(metadata_path.read_text())
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get('ctas_per_cga') is not None:
+            metadata['ctas_per_cga'] = tuple(metadata['ctas_per_cga'])
+        if metadata.get('preferred_ctas_per_cga') is not None:
+            metadata['preferred_ctas_per_cga'] = tuple(metadata['preferred_ctas_per_cga'])
         # JSON serialization dumps the target as a dict. Restore it to a GPUTarget.
         target = metadata['target']
         metadata['target'] = GPUTarget(target['backend'], target['arch'], target['warp_size'])
@@ -424,7 +566,8 @@ class CompiledKernel:
         asm_files = [Path(p) for c, p in metadata_group.items() if not c.endswith(".json")]
         binary_ext = backend.binary_ext
         self.asm = AsmDict({
-            file.suffix[1:]: file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text()
+            file.suffix[1:]:
+            file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text(encoding="utf-8")
             for file in asm_files
         })
         self.metadata_group = metadata_group
@@ -436,6 +579,16 @@ class CompiledKernel:
         self._module_pid = None
         self.function = None
         self._run = None
+        self._unload_module = None
+        self._compile_iq_plain_module = None
+
+    @property
+    def launch_metadata_schema(self):
+        """Return the Level 0 launch metadata schema as a parsed dict, or None."""
+        raw = self.asm.get("launch_metadata")
+        if raw is None:
+            return None
+        return json.loads(raw) if isinstance(raw, str) else raw
 
     def __del__(self):
 
@@ -445,7 +598,12 @@ class CompiledKernel:
             if knobs.runtime.kernel_unload_hook is not None:
                 knobs.runtime.kernel_unload_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
-            driver.active.utils.unload_module(self.module)
+            if self._unload_module is not None:
+                self._unload_module(self.module)
+                # compile_iq: the plain module replaced by a winning ACF twin.
+                plain_module = getattr(self, "_compile_iq_plain_module", None)
+                if plain_module is not None:
+                    self._unload_module(plain_module)
             self.module = None
             self._module_pid = None
 
@@ -453,25 +611,41 @@ class CompiledKernel:
         if self.module is not None:
             return
 
+        # Facebook begin
+        # https://fb.workplace.com/groups/1405155842844877/permalink/26366525132947936/
         def raise_(err):
-            # clone the exception object so that the one saved in the closure
-            # of the partial function below doesn't get assigned a stack trace
-            # after the subsequent raise. otherwise, the CompiledKernel instance
-            # saved in the (global) kernel cache will keep references to all the
-            # locals in the traceback via the exception instance in the closure.
-            cloned_err = copy.deepcopy(err)
-            self._run = functools.partial(_raise_error, cloned_err)
+            self._run = functools.partial(_raise_error, weakref.ref(err))
             raise err
 
-        device = driver.active.get_current_device()
+        # Facebook end
+
+        active_driver = driver.active
+        device = active_driver.get_current_device()
+        utils = active_driver.utils
         # create launcher
-        self._run = driver.active.launcher_cls(self.src, self.metadata)
+        run = active_driver.launcher_cls(self.src, self.metadata)
+        if hasattr(run, "launcher_bytes") and run.launcher_bytes is not None:
+            # Used by external runtimes such as NativeRT.
+            self.asm["launcher.so"] = run.launcher_bytes
+        self._run = run
+        # compile_iq: collect a task / resolve a pending ACF on the first launch through `run`. Gated
+        # by TRITON_COMPILE_IQ_COLLECT / _APPLY; reaches kernels that bypass the JITFunction.run hooks.
+        if _compile_iq_collect_enabled() or _compile_iq_apply_enabled():
+            try:
+                from triton.magnon.collector import wrap_launcher
+                self._run = wrap_launcher(self, run)
+            except ImportError:  # fail-open: launch unwrapped
+                pass
         # Backends may reserve additional shared memory at launch time.
-        shared = getattr(self._run, "shared", self.metadata.shared)
+        # Read from the unwrapped launcher: the compile_iq wrapper is a plain
+        # function without the launcher's attributes.
+        shared = getattr(run, "shared", self.metadata.shared)
         # not enough shared memory to run the kernel
         max_shared = max_shared_mem(device)
         if shared > max_shared:
-            raise_(OutOfResources(shared, max_shared, "shared memory"))
+            raise_(
+                OutOfResources(shared, max_shared, "shared memory",
+                               getattr(self.metadata, "shared_memory_breakdown", None)))
         if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
             # Use blackwell max tmem size for now, this should be moved in device properties
             max_tmem_size = 512  # tmem size in number of columns
@@ -482,7 +656,8 @@ class CompiledKernel:
         if knobs.runtime.kernel_load_start_hook is not None:
             knobs.runtime.kernel_load_start_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
         # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
-        self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = driver.active.utils.load_binary(
+        self._unload_module = utils.unload_module
+        self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = utils.load_binary(
             self.name, self.kernel, shared, device)
         self._module_pid = os.getpid()
         warp_size = self.metadata.warp_size
@@ -491,14 +666,136 @@ class CompiledKernel:
         if knobs.runtime.kernel_load_end_hook is not None:
             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
+        # Create C dispatcher if enabled and schema is available.
+        self._launch_shared = shared
+        self._build_dispatcher()
+
+    def _build_dispatcher(self):
+        # Create C dispatcher (if enabled and schema is available) for the current self.function.
+        # Factored out so it can be rebuilt after the function handle is swapped (e.g. the compile_iq
+        # free-win competition replacing the plain function with the ACF twin).
+        self._dispatcher = None
+        self._dispatch_arg_indices = None
+        self._num_kernel_args = None
+        self._dispatcher_launch = None
+        if (knobs.runtime.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+                and "launch_metadata" in self.asm):
+            try:
+                if self.metadata.target.backend == "hip":
+                    from triton.backends.amd.triton_dispatcher_factory import make_triton_dispatcher
+                else:
+                    from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
+                schema = json.loads(self.asm["launch_metadata"])
+                # Build both values before assigning to self so that a failure
+                # in either step leaves both attributes as None (atomic assignment).
+                # Auto-TMA kernels carry compiler-synthesized descriptor params
+                # that only the variadic CudaLauncher injects; skip the dispatcher
+                # (fast path) for them so they fall back to the working launcher.
+                # The dispatcher launches with the schema's static shared size, so a launcher
+                # that reserves more at launch time (max_occupancy) keeps the launcher path.
+                if schema.get("auto_tma_recipes") or getattr(self, "_launch_shared",
+                                                             schema["shared_mem"]) != schema["shared_mem"]:
+                    dispatcher = None
+                else:
+                    dispatcher = make_triton_dispatcher(schema, self.function)
+                if dispatcher is not None:
+                    indices = tuple(a["index"] for a in schema["args"])
+                    self._dispatcher = dispatcher
+                    self._dispatch_arg_indices = indices
+                    self._num_kernel_args = len(schema["args"])
+                    self._dispatcher_launch = getattr(self._run, "launch", None)
+            except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as e:
+                logger.warning("Triton dispatcher creation failed for %s: %s", self.name, e)
+
+    def _compile_iq_resolve(self, grid_0, grid_1, grid_2, stream, bound_args):
+        """compile_iq free-win competition (one-shot, fail-open). A tuned ACF cubin candidate was
+        stashed at consume (apply_compile_iq_acf); it is a launch-equivalent twin of the plain cubin.
+        No regression: plain and ACF are benchmarked with the real launch args (autotuner benchmarker,
+        min median) and only the winner is kept as the live function -- plain stays in the pool, so
+        this can never be slower than baseline. In-memory only; the compile cache keeps its plain cubin.
+
+        Idempotency: the A/B runs on copies of the launch args (magnon.consume.scratch_args), so
+        in-place / accumulating kernels never touch the caller's buffers. When the args cannot be
+        copied safely, the A/B is skipped and plain is kept.
+
+        TODO(compile_iq): optional cross-process winner cache (key sha256(PTX) x arch x acf_sha ->
+        plain|acf) so later processes skip re-benchmarking; today the winner is in-memory per process.
+        TODO(compile_iq): ACF-wedge protection deferred to a separate PR -- the A/B piggybacks on
+        Triton's benchmarker (no timeout/watchdog), same exposure as autotuning any config. A stored
+        ACF was already screened out-of-process at the factory (spawn + per-candidate timeout +
+        self-consistency), so it has run without wedging before reaching consume.
+        """
+        acf_cubin = getattr(self, "_compile_iq_acf_cubin", None)
+        self._compile_iq_acf_cubin = None  # one-shot: resolve once, win or lose
+        if acf_cubin is None:
+            return
+        acf_module = None  # set while the loaded twin is not the live module; unloaded on exit
+        try:
+            self._init_handles()  # ensure the plain function/module are loaded
+            device = driver.active.get_current_device()
+            plain_function = self.function
+            acf_module, acf_function, _, _, _ = driver.active.utils.load_binary(self.name, acf_cubin,
+                                                                                self.metadata.shared, device)
+            # Force-apply knob (default off): install the ACF twin without running the plain-vs-ACF
+            # competition. Production keeps the no-regression A/B; smoke tests set this so a store HIT
+            # deterministically applies regardless of in-process measurement noise.
+            if os.environ.get("TRITON_COMPILE_IQ_FORCE_APPLY"):
+                self._compile_iq_adopt(acf_module, acf_function, acf_cubin)
+                acf_module = None
+                if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
+                    print(f"[compile_iq.freewin] {self.name}: FORCE-APPLY -> kept acf "
+                          "(competition skipped)", flush=True)
+                return
+            from triton.magnon.consume import scratch_args
+
+            # Run the A/B on copies so in-place / accumulating kernels never touch the caller's buffers.
+            bargs = scratch_args(bound_args.values())
+            if bargs is None:
+                return  # cannot copy safely: keep plain (the finally unloads the ACF module)
+
+            def _call(func):
+                self._run(grid_0, grid_1, grid_2, stream, func, self.packed_metadata, None, None, None, *bargs)
+
+            benchmarker = driver.active.get_benchmarker()
+            warmup, rep = knobs.autotuning.warmup, knobs.autotuning.rep
+            plain_ms = benchmarker(lambda: _call(plain_function), warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8))[0]
+            acf_ms = benchmarker(lambda: _call(acf_function), warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8))[0]
+            winner = "acf" if acf_ms < plain_ms else "plain"
+            if winner == "acf":
+                # ACF wins -> make the twin the live kernel (in-memory only; compile cache untouched).
+                self._compile_iq_adopt(acf_module, acf_function, acf_cubin)
+                acf_module = None
+            if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
+                print(
+                    f"[compile_iq.freewin] {self.name}: plain={plain_ms:.4f}ms acf={acf_ms:.4f}ms "
+                    f"-> kept {winner}", flush=True)
+        except Exception as e:  # never break the user's launch
+            if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
+                print(f"[compile_iq.freewin] {self.name}: error (fail-open, kept plain): "
+                      f"{type(e).__name__}: {e}", flush=True)
+        finally:
+            if acf_module is not None and self._unload_module is not None:
+                try:
+                    self._unload_module(acf_module)
+                except Exception:
+                    pass
+
+    def _compile_iq_adopt(self, module, function, cubin):
+        """Make the ACF twin the live kernel. The plain module stays loaded until __del__, because
+        callers may still hold its function handle (see magnon.collector.wrap_launcher)."""
+        self._compile_iq_plain_module = self.module
+        self.module, self.function, self.kernel = module, function, cubin
+        self.asm["cubin"] = cubin
+        self._build_dispatcher()  # rebuild the C dispatcher for the new function, if used
+
     @property
     def run(self):
-        if self._run is None:
+        if self._run is None or self.module is None:
             self._init_handles()
         return self._run
 
     def launch_metadata(self, grid, stream, *args):
-        if knobs.runtime.launch_enter_hook is None:
+        if not knobs.runtime.launch_enter_hook:
             return None
         self._init_handles()
         ret = LazyDict({"name": self.name, "function": self.function, "stream": stream})
@@ -511,6 +808,77 @@ class CompiledKernel:
     def __getitem__(self, grid):
         self._init_handles()
 
+        if self.metadata.target.backend == "hip":
+            grid_tuple = tuple(grid) + (1, ) * (3 - len(grid))
+
+            def runner(*args, stream=None):
+                if stream is None:
+                    device = driver.active.get_current_device()
+                    stream = driver.active.get_current_stream(device)
+                dispatcher = self._dispatcher
+                if (knobs.runtime.use_triton_dispatcher and dispatcher is not None
+                        and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
+                        and len(args) == len(self.src.signature)):
+                    dispatcher(*grid_tuple, stream, *(args[index] for index in self._dispatch_arg_indices))
+                else:
+                    launch_metadata = self.launch_metadata(grid_tuple, stream, *args)
+                    self.run(*grid_tuple, stream, self.function, self.packed_metadata, launch_metadata,
+                             knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
+
+            if knobs.runtime.use_triton_dispatcher and self._dispatcher is None:
+                warnings.warn(
+                    f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
+                    f"falling back to Python runner",
+                    stacklevel=2,
+                )
+            return runner
+
+        dispatcher = getattr(self, '_dispatcher', None)
+        # The dispatcher replicates launcher.launch; a replaced launch must not be bypassed.
+        if (knobs.runtime.use_triton_dispatcher and dispatcher is not None and not callable(grid)
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
+                and getattr(self._run, "launch", None) is self._dispatcher_launch):
+            # Try to create a _TritonJITRunner for maximum speed
+            try:
+                from triton.backends.nvidia.triton_dispatcher_factory import _load_module
+                mod = _load_module()
+                grid_tuple = grid if isinstance(grid, tuple) else (grid, )
+                while len(grid_tuple) < 3:
+                    grid_tuple = grid_tuple + (1, )
+
+                num_kernel_args = self._num_kernel_args
+
+                def slow_path(*args, stream=None):
+                    """Fallback: full Python dispatch on cache miss."""
+                    if stream is None:
+                        stream = driver.active.get_current_stream(driver.active.get_current_device())
+                    gx, gy, gz = grid_tuple
+                    dispatcher(gx, gy, gz, stream, *args)
+
+                jit_runner = mod._TritonJITRunner(
+                    dispatcher=dispatcher,
+                    grid=grid_tuple,
+                    get_stream_fn=driver.active.get_current_stream,
+                    get_device_fn=driver.active.get_current_device,
+                    slow_path_fn=slow_path,
+                    num_kernel_args=num_kernel_args,
+                )
+                return jit_runner
+            except (KeyError, TypeError, ValueError, RuntimeError, AttributeError) as e:
+                logging.warning("_TritonJITRunner creation failed for %s, using fallback: %s", self.name, e)
+
+            # Fallback: Python wrapper around dispatcher
+            def runner(*args, stream=None):
+                if stream is None:
+                    device = driver.active.get_current_device()
+                    stream = driver.active.get_current_stream(device)
+                gx = grid[0]
+                gy = grid[1] if len(grid) > 1 else 1
+                gz = grid[2] if len(grid) > 2 else 1
+                dispatcher(gx, gy, gz, stream, *args)
+
+            return runner
+
         def runner(*args, stream=None):
             if stream is None:
                 device = driver.active.get_current_device()
@@ -519,4 +887,11 @@ class CompiledKernel:
             self.run(grid[0], grid[1], grid[2], stream, self.function, self.packed_metadata, launch_metadata,
                      knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
 
+        if (knobs.runtime.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+                and dispatcher is None):
+            warnings.warn(
+                f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
+                f"falling back to Python runner",
+                stacklevel=2,
+            )
         return runner

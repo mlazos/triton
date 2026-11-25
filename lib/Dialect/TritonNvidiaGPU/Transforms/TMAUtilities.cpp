@@ -30,11 +30,20 @@ ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,
   return ttg::updateEncodingForShape(op, sharedEnc, tensorType);
 }
 
-bool hasCGABroadcast(ttg::MemDescType memDescType) {
-  auto kBlock = StringAttr::get(memDescType.getContext(), "block");
-  return ttg::toLinearLayoutIgnoringPadding(memDescType)
-             .getFreeVariableMasks()
-             .lookup(kBlock) != 0;
+int64_t getDescriptorLoadBytes(Operation *op, RankedTensorType tensorType,
+                               Value desc) {
+  auto encoding = getEncodingFromDescriptor(op, tensorType, desc);
+  auto shapePerCTA = ttg::getShapePerCTA(encoding, tensorType.getShape());
+  int64_t bytes = product(shapePerCTA) *
+                  getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+  return isFp6Padded(encoding) ? bytes * 3 / 4 : bytes;
+}
+
+int64_t getDescriptorLoadBytes(ttg::MemDescType memDescType) {
+  auto shapePerCTA = ttg::getShapePerCTA(memDescType);
+  int64_t bytes = product(shapePerCTA) *
+                  getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
+  return isFp6Padded(memDescType.getEncoding()) ? bytes * 3 / 4 : bytes;
 }
 
 Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
@@ -43,6 +52,13 @@ Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
     return indices;
   return arith::ExtSIOp::create(
       builder, loc, indicesType.clone(builder.getI32Type()), indices);
+}
+
+bool hasCGABroadcast(ttg::MemDescType memDescType) {
+  auto kBlock = StringAttr::get(memDescType.getContext(), "block");
+  return ttg::toLinearLayoutIgnoringPadding(memDescType)
+             .getFreeVariableMasks()
+             .lookup(kBlock) != 0;
 }
 
 FailureOr<int> getTMASwizzleMode(Location loc, tt::TensorDescInterface ty) {
@@ -66,6 +82,10 @@ FailureOr<int> getTMASwizzleMode(Location loc, tt::TensorDescInterface ty) {
                              "supports 128-byte swizzling, but got "
                           << swizzleBytes;
   }
+
+  if (isFp6Padded(encoding) && swizzleBytes != 0 && swizzleBytes != 128)
+    return emitError(loc)
+           << "fp6 padded TMA operands require 0/128-byte swizzling";
 
   int32_t swizzleMode = 0;
   if (swizzleBytes == 128) {

@@ -20,6 +20,7 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     Fp4ToFpOpToLLVM.cpp
     TargetInfo.cpp
     Allocation.cpp
+    WarpUniformity.cpp
 
     DEPENDS
     TritonNVIDIAGPUConversionPassIncGen
@@ -29,6 +30,7 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     GluonTransforms
     TritonAnalysis
     TritonGPUToLLVM
+    TritonNvidiaGPUIR
     TritonInstrumentIR
     TritonInstrumentToLLVM
     MLIRReconcileUnrealizedCasts

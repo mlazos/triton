@@ -1,0 +1,177 @@
+import argparse
+
+import torch
+
+import triton
+
+from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
+    attention as _attention_ws_pipelined_persistent, )
+from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined import (
+    attention as _attention_ws_pipelined, )
+from triton.language.extra.tlx.tutorials.blackwell_fa_ws_persistent import (
+    attention as _attention_ws_persistent, )
+from triton.language.extra.tlx.tutorials.blackwell_fa_ws import (
+    attention as _attention_ws, )
+from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
+    attention as _attention_clc, )
+
+from triton._internal_testing import is_blackwell
+
+DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+ATTENTION_METHODS = {
+    "ws_pipelined_persistent": _attention_ws_pipelined_persistent,
+    "ws_pipelined": _attention_ws_pipelined,
+    "ws_persistent": _attention_ws_persistent,
+    "ws": _attention_ws,
+    "clc": _attention_clc,
+}
+
+ref_lib = "SDPA"
+"""
+This script is used for benchmarking the performance of TLX tutorial kernels.
+It's recommended to run with `third_party/tlx/denoise.sh third_party/tlx/tutorials/blackwell_fa_perf_test.py`
+
+Facebook: If you are developing in fbsource, use tritonbench instead to collect perf numbers.
+"""
+
+
+def _attention_matmul_flops(batch, h, n_ctx, head_dim, causal):
+    # Causal self-attention uses lower-triangular score positions, including the diagonal.
+    score_elements = n_ctx * (n_ctx + 1) // 2 if causal else n_ctx * n_ctx
+    return 2.0 * batch * h * score_elements * head_dim
+
+
+def create_benchmark(versions, mode="fwd", causal=False):
+    line_vals = [ref_lib.lower()] + versions
+    line_names = [ref_lib] + versions
+
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["N_CTX"],
+            x_vals=[1024, 2048, 4096, 8192],
+            line_arg="provider",
+            line_vals=line_vals,
+            line_names=line_names,
+            ylabel="TFLOPS",
+            plot_name=f"flash-attention-{mode}-performance-fp16-{'causal' if causal else 'noncausal'}",
+            args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": causal},
+        ))
+    def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
+        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
+        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
+        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
+        sm_scale = 1.3
+        quantiles = [0.5, 0.2, 0.8]
+
+        if mode == "bwd":
+            # Run full fwd+bwd each iteration to avoid state issues with retain_graph
+            if provider == ref_lib.lower():
+
+                def fn():
+                    q.grad, k.grad, v.grad = None, None, None
+                    o = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
+                    o.backward(do)
+
+            elif provider in ATTENTION_METHODS:
+                attention = ATTENTION_METHODS[provider]
+                if provider == "ws_pipelined_persistent":
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale, causal)
+                        o.backward(do)
+
+                elif provider == "ws":
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale)
+                        o.backward(do)
+
+                else:
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale, causal)
+                        o.backward(do)
+
+            do = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16)
+        elif provider == ref_lib.lower():
+            fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
+        elif provider in ATTENTION_METHODS:
+            attention = ATTENTION_METHODS[provider]
+            if provider == "ws_pipelined_persistent":
+                fn = lambda: attention(q, k, v, sm_scale, causal)
+            elif provider == "ws":
+                fn = lambda: attention(q, k, v, sm_scale)
+            else:
+                fn = lambda: attention(q, k, v, sm_scale, causal)
+
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            fn,
+            quantiles=quantiles,
+            warmup=500,
+            rep=500,
+        )
+
+        flops_per_matmul = _attention_matmul_flops(BATCH, H, N_CTX, HEAD_DIM, causal)
+        # fwd: 2 matmuls (QK, PV). bwd: 5 matmuls (dQK, dPV, dV, dK, dQ) = 2.5x fwd
+        total_flops = 2 * flops_per_matmul if mode == "fwd" else 5 * flops_per_matmul
+
+        def tflops(ms):
+            return total_flops * 1e-12 / (ms * 1e-3)
+
+        return tflops(ms), tflops(max_ms), tflops(min_ms)
+
+    return benchmark
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Benchmark TLX Blackwell Flash Attention implementations")
+    parser.add_argument(
+        "--version",
+        type=str,
+        nargs="+",
+        choices=list(ATTENTION_METHODS.keys()),
+        help=f"Run only the specified version(s). Choices: {list(ATTENTION_METHODS.keys())}",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="fwd",
+        choices=["fwd", "bwd"],
+        help="Benchmark forward or backward pass (default: fwd)",
+    )
+    parser.add_argument(
+        "--num-ctas",
+        type=int,
+        default=0,
+        choices=[1, 2],
+        help="Filter BWD configs: 0=all (default), 1=1-CTA only, 2=2-CTA only",
+    )
+    parser.add_argument(
+        "--causal",
+        action="store_true",
+        help="Benchmark the causal variant (default: non-causal)",
+    )
+    args = parser.parse_args()
+
+    if args.num_ctas and args.mode == "bwd":
+        from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
+            _attn_bwd_ws,
+            configs_bwd_1cta,
+            configs_bwd_2cta,
+        )
+
+        _attn_bwd_ws.configs = configs_bwd_1cta if args.num_ctas == 1 else configs_bwd_2cta
+        print(f"Filtering BWD configs to {args.num_ctas}-CTA only")
+
+    if is_blackwell():
+        versions = args.version if args.version else list(ATTENTION_METHODS.keys())
+        kind = "causal" if args.causal else "non-causal"
+        print(f"Running {args.mode} {kind} benchmarks for: {versions}")
+        benchmark = create_benchmark(versions, mode=args.mode, causal=args.causal)
+        benchmark.run(print_data=True)
+    else:
+        print("Skipping benchmarks, no Blackwell GPU found.")

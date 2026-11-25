@@ -39,9 +39,9 @@ struct CircularStoreOpConversion
                   OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto dataPack =
-        lowerCircularStore(op, adaptor.getSegment(), adaptor.getCounter(),
-                           adaptor.getDynamicScopeId(), rewriter);
+    auto dataPack = lowerCircularStore(
+        op, adaptor.getSegment(), adaptor.getCounter(),
+        adaptor.getDynamicScopeId(), adaptor.getPredicate(), rewriter);
     uint32_t addrSpace = dataPack.addrSpace;
     if (addrSpace == 1) {
       auto mod = op->getParentOfType<ModuleOp>();

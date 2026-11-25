@@ -1,4 +1,5 @@
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -8,6 +9,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/JSON.h"
 
 #define DEBUG_TYPE "triton-loop-pipeline"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -20,6 +22,31 @@ namespace ttng = mlir::triton::nvidia_gpu;
 
 namespace mlir::triton::gpu {
 namespace {
+
+// Return true when AutoWS will communicate the MMA result through an opndD
+// channel.  That channel already carries MMA completion to the consumer and
+// prevents the accumulator from being reused until the consumer releases it.
+// In that case LowerLoops does not need a second, private completion pipeline
+// for the MMA.
+bool hasAutoWSOutputChannel(Operation *op) {
+  auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
+  if (!attr)
+    return false;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return false;
+  }
+  auto *object = parsed->getAsObject();
+  auto *channels = object ? object->getArray(tt::kAutoWSChannelsKey) : nullptr;
+  if (!channels)
+    return false;
+  const std::string operandDPrefix = (tt::kAutoWSOperandDTag + ",").str();
+  return llvm::any_of(*channels, [&](const llvm::json::Value &channel) {
+    auto value = channel.getAsString();
+    return value && value->starts_with(operandDPrefix);
+  });
+}
 
 //===----------------------------------------------------------------------===//
 // assignLatencies
@@ -93,14 +120,24 @@ bool hasLatenciesAssigned(scf::ForOp forOp) {
   return false;
 }
 
-void assignUserProvidedLatencies(scf::ForOp forOp,
+// Return if we can take the user provided latencies into account and
+// derive the latencies for the rest of the operations. Currently we only
+// support this if the user provides latency=0 to all operations in the
+// loop.
+bool assignUserProvidedLatencies(scf::ForOp forOp,
                                  DenseMap<Operation *, int> &opLatency) {
   auto helper = TritonDialect::getLoaded(forOp)->getLatencyAttrHelper();
+  bool canFuseWithCompiler = true;
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (auto latencyAttr = helper.getAttr(&op)) {
-      opLatency[&op] = latencyAttr.getInt();
+      auto latencyValue = latencyAttr.getInt();
+      if (latencyValue != 0) {
+        canFuseWithCompiler = false;
+      }
+      opLatency[&op] = latencyValue;
     }
   }
+  return canFuseWithCompiler;
 }
 
 class AssignLoadLatencies {
@@ -116,7 +153,7 @@ public:
 
     llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel =
         loadOpsToIndirectionLevel(forOp, pipelineWithoutDot, axisInfoAnalysis,
-                                  numStages);
+                                  numStages, opLatency);
     if (loadOpToIndLevel.empty())
       return;
 
@@ -138,6 +175,8 @@ private:
 
 public:
   static bool canHaveSharedEncoding(tt::LoadOp op) {
+    if (!canPipelineInSharedMemory(op))
+      return false;
     // If used by an user with DotOp encoding, all the uses must be compatible.
     bool incompatible = false;
     getSharedEncIfAllUsersAreDotEnc(op.getResult(), incompatible);
@@ -203,10 +242,87 @@ public:
   }
 };
 
+static void
+collectDescriptorLoads(Value value, scf::ForOp forOp, DenseSet<Value> &visited,
+                       SmallVectorImpl<tt::DescriptorLoadOp> &loads) {
+  if (!visited.insert(value).second)
+    return;
+  Operation *def = value.getDefiningOp();
+  if (!def || !forOp->isAncestor(def))
+    return;
+  if (auto load = dyn_cast<tt::DescriptorLoadOp>(def)) {
+    loads.push_back(load);
+    return;
+  }
+  for (Value operand : getNestedOperands(def))
+    collectDescriptorLoads(operand, forOp, visited, loads);
+}
+
+static LogicalResult
+assignOperandBufferDepths(scf::ForOp forOp, int numStages, bool useMetaWS,
+                          DenseMap<Operation *, int> &opLatency) {
+  auto lhsDepth =
+      forOp->getAttrOfType<IntegerAttr>(tt::kLhsBufferDepthAttrName);
+  auto rhsDepth =
+      forOp->getAttrOfType<IntegerAttr>(tt::kRhsBufferDepthAttrName);
+  if (!lhsDepth && !rhsDepth)
+    return success();
+  if (!lhsDepth || !rhsDepth)
+    return forOp.emitError(
+        "lhs_buffer_depth and rhs_buffer_depth must be specified together");
+  if (!useMetaWS)
+    return forOp.emitError(
+        "operand buffer depths require Meta warp specialization");
+
+  int64_t depths[] = {lhsDepth.getInt(), rhsDepth.getInt()};
+  for (int64_t depth : depths) {
+    if (depth <= 0)
+      return forOp.emitError("operand buffer depths must be positive");
+    if (depth > numStages)
+      return forOp.emitError("operand buffer depth ")
+             << depth << " exceeds num_stages=" << numStages;
+  }
+
+  SmallVector<ttng::MMAv5OpInterface> mmas;
+  for (Operation &op : forOp.getBody()->without_terminator())
+    if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(&op))
+      mmas.push_back(mma);
+  if (mmas.size() != 1)
+    return forOp.emitError("operand buffer depths require exactly one MMA in "
+                           "the annotated loop; found ")
+           << mmas.size();
+
+  SmallVector<tt::DescriptorLoadOp> operandLoads[2];
+  Value operands[] = {mmas.front().getA(), mmas.front().getB()};
+  for (unsigned operand = 0; operand < 2; ++operand) {
+    DenseSet<Value> visited;
+    collectDescriptorLoads(operands[operand], forOp, visited,
+                           operandLoads[operand]);
+    if (operandLoads[operand].size() != 1)
+      return forOp.emitError("could not resolve exactly one descriptor-backed "
+                             "SMEM channel for MMA ")
+             << (operand == 0 ? "lhs" : "rhs") << "; found "
+             << operandLoads[operand].size() << " descriptor loads";
+  }
+  if (operandLoads[0].front() == operandLoads[1].front())
+    return forOp.emitError(
+        "MMA lhs and rhs resolve to the same descriptor-backed SMEM channel");
+
+  auto i32 = IntegerType::get(forOp.getContext(), 32);
+  for (unsigned operand = 0; operand < 2; ++operand) {
+    auto load = operandLoads[operand].front();
+    load->setAttr(tt::kRequestedBufferDepthAttrName,
+                  IntegerAttr::get(i32, depths[operand]));
+    opLatency[load] = depths[operand] - 1;
+  }
+  return success();
+}
+
 class AssignMMALatencies {
 public:
-  AssignMMALatencies(scf::ForOp forOp, DenseMap<Operation *, int> &opLatency)
-      : forOp(forOp), opLatency(opLatency) {};
+  AssignMMALatencies(scf::ForOp forOp, DenseMap<Operation *, int> &opLatency,
+                     bool useMetaWS)
+      : forOp(forOp), opLatency(opLatency), useMetaWS(useMetaWS) {};
 
   void run() {
     DenseMap<Operation *, int> mmaSelfLatency;
@@ -236,40 +352,82 @@ public:
              !ttng::hasLoadsAfterMMA(mma, forOp))) {
           // MMA can be overlapped with itself
           mmaSelfLatency[mma] = 1;
-          if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
-              (ttng::isAccMultibufferingPossible(mma, forOp) &&
-               !getDisallowAccMultiBuffer(forOp))) {
-            // MMA's users can be pushed to the next stage
-            opLatency[&op] = 1;
-          }
-          // HACK: A pipelined MMA's latency should equal the number of buffers
-          // for the accumulator, but when the user is in an `scf.if` in SWP,
-          // the `scf.if` is pushed to the end of the loop rather than peeled
-          // before the MMA op, requiring an extra buffer due to liverange
-          // overlap. WS does not have this problem because the MMA is placed in
+          // WS does not have this problem because the MMA is placed in
           // a different partition than the MMA, so we can correctly set the
           // latency.
           if (isWarpSpecialized(forOp)) {
             if (ttng::hasAccReadModifyWrite(mma, forOp))
               opLatency.erase(&op); // can't pipeline the MMA
-            else
-              opLatency[&op] += 1;
-            // If all inputs to the MMA are warp specialized, set the self
-            // latency to 0 since the MMA won't need to wait on itself.
-            auto cantWarpSpec = [](Operation *op) { return isa<LoadOp>(op); };
-            auto warpSpecHelper = ttng::MMAv5PipelineableOperandsHelper(
-                mma, forOp, [&](Operation *op) {
-                  return isLoadToBePipelined(op) && !cantWarpSpec(op);
-                });
-            if (warpSpecHelper.isPipelineable ||
-                (warpSpecHelper.isOperandsStateDetermined &&
-                 llvm::none_of(warpSpecHelper.unpipelineableOperandDefs,
-                               cantWarpSpec)))
-              mmaSelfLatency[mma] = 0;
           }
-          if (hasLoopCarriedAccumulatorCycle(mma, forOp))
-            opLatency.erase(&op);
+          // Only update the MMA latency if it wasn't set to 0 by the user.
+          // TODO: Support values other than 0.
+          if (!opLatency.count(&op)) {
+            // Check if all users of the MMA results are loop-carried
+            // outputs (yield) or outside the loop body.
+            bool allUsersAreLoopCarried =
+                llvm::all_of(op.getUsers(), [&](Operation *user) {
+                  return isa<scf::YieldOp>(user) || !forOp->isAncestor(user);
+                });
+            if (useMetaWS && allUsersAreLoopCarried) {
+              // All users are loop-carried outputs, so we don't need to
+              // push users to a later stage.
+              opLatency[&op] = 0;
+              // A loop-carried WS accumulator (e.g. bwd dv/dk) is drained after
+              // the loop; a self_latency=1 here only raises the shared loop's
+              // maxStage, dragging the stage-0 load-fed dots into a deeper
+              // (2-part) prologue peel. Zero it to keep the schedule shallow.
+              mmaSelfLatency[mma] = 0;
+              continue;
+            } else if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
+                       (ttng::isAccMultibufferingPossible(mma, forOp) &&
+                        !getDisallowAccMultiBuffer(forOp))) {
+              // MMA's users can be pushed to the next stage
+              opLatency[&op] = 1;
+            }
+            // HACK: A pipelined MMA's latency should equal the number of
+            // buffers for the accumulator, but when the user is in an `scf.if`
+            // in SWP, the `scf.if` is pushed to the end of the loop rather than
+            // peeled before the MMA op, requiring an extra buffer due to
+            // liverange overlap. WS does not have this problem because the MMA
+            // is placed in a different partition than the MMA, so we can
+            // correctly set the latency.
+            if (isWarpSpecialized(forOp)) {
+              if (ttng::hasAccReadModifyWrite(mma, forOp))
+                opLatency.erase(&op); // can't pipeline the MMA
+              else
+                opLatency[&op] += 1;
+              // If all inputs to the MMA are warp specialized, set the self
+              // latency to 0 since the MMA won't need to wait on itself.
+              auto cantWarpSpec = [](Operation *op) { return isa<LoadOp>(op); };
+              auto warpSpecHelper = ttng::MMAv5PipelineableOperandsHelper(
+                  mma, forOp, [&](Operation *op) {
+                    return isLoadToBePipelined(op) && !cantWarpSpec(op);
+                  });
+              if (warpSpecHelper.isPipelineable ||
+                  (warpSpecHelper.isOperandsStateDetermined &&
+                   llvm::none_of(warpSpecHelper.unpipelineableOperandDefs,
+                                 cantWarpSpec)))
+                mmaSelfLatency[mma] = 0;
+            }
+            if (hasLoopCarriedAccumulatorCycle(mma, forOp))
+              opLatency.erase(&op);
+          }
         }
+        // An AutoWS opndD channel already synchronizes MMA completion and
+        // accumulator reuse.  Keeping self_latency=1 would make LowerLoops
+        // add a redundant completion wait one stage after the MMA.  For an
+        // MMA in the last scheduled stage that wait alone deepens the whole
+        // software pipeline and duplicates the compute prologue.  Record zero
+        // explicitly even when the generic MMA-pipelining heuristic declines
+        // the op so LowerLoops cannot infer a private completion pipeline.
+        //
+        // TODO: this states the conclusion (no self latency) rather than the
+        // reason (the accumulator's completion is already owned by a channel).
+        // The durable fix is for LowerLoops to ask who synchronizes the
+        // accumulator instead of inferring it from self_latency, so the
+        // annotation and the WS channel state cannot disagree.
+        if (useMetaWS && hasAutoWSOutputChannel(&op))
+          mmaSelfLatency[mma] = 0;
       }
     }
     serializeSelfLatencies(forOp->getParentOfType<ModuleOp>(), mmaSelfLatency);
@@ -278,6 +436,7 @@ public:
 private:
   scf::ForOp forOp;
   DenseMap<Operation *, int> &opLatency;
+  bool useMetaWS;
 
   bool hasSyncDots(scf::ForOp forOp) {
     for (auto &op : forOp.getBody()->without_terminator()) {
@@ -288,9 +447,6 @@ private:
   }
 
   bool isWarpSpecialized(scf::ForOp forOp) {
-    // Automatic warp specialization is disabled for two-CTA kernels.
-    if (ttng::getModuleTwoCTAs(forOp))
-      return false;
     scf::ForOp current = forOp;
     do {
       if (current->hasAttr(kWarpSpecializeAttrName)) {
@@ -309,7 +465,8 @@ private:
 // requested number of stages assign the latencies in a way that cover all the
 // stages with the sum of latencies in the chain from the first load to the
 // final dot op.
-void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
+LogicalResult assignLatencies(ModuleOp moduleOp, int defaultNumStages,
+                              bool useMetaWS) {
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) {
     // Bail out for loops with num_stage <= 1.
@@ -318,19 +475,26 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
       loops.push_back(forOp);
   });
   if (loops.empty())
-    return;
+    return success();
 
   DenseMap<Operation *, int> opLatency;
   for (auto forOp : loops) {
     if (hasLatenciesAssigned(forOp)) {
-      assignUserProvidedLatencies(forOp, opLatency);
-      continue;
+      bool deriveLatencies = assignUserProvidedLatencies(forOp, opLatency);
+      // FB Change: Support Latency analysis when users set
+      // latency=0 for some operations.
+      if (!deriveLatencies)
+        continue;
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
     AssignLoadLatencies(forOp, numStages, opLatency).run();
-    AssignMMALatencies(forOp, opLatency).run();
+    if (failed(
+            assignOperandBufferDepths(forOp, numStages, useMetaWS, opLatency)))
+      return failure();
+    AssignMMALatencies(forOp, opLatency, useMetaWS).run();
   }
   serializeLatencies(moduleOp, opLatency);
+  return success();
 }
 
 } // namespace
@@ -342,7 +506,8 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
 llvm::MapVector<Operation *, std::pair<int, Operation *>>
 loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           tt::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                          int numStages, bool filterSmall) {
+                          int numStages, DenseMap<Operation *, int> &opLatency,
+                          bool filterSmall) {
   llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel;
   DenseSet<Operation *> seen;
   DenseSet<Operation *> excluded;
@@ -354,6 +519,10 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
         if (isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op)) {
           if (!AssignLoadLatencies::isPipeliningBeneficial(
                   op, finalUser, axisInfoAnalysis, filterSmall))
+            return;
+          // FB Change: Skip the load if the user provided latency is 0.
+          // TODO: Support user provided non-zero latency for loads.
+          if (opLatency.count(op))
             return;
           if (loadOpToIndLevel.contains(op)) {
             int level = loadOpToIndLevel[op].first;
@@ -432,7 +601,10 @@ struct AssignLatencies
     : public impl::TritonGPUAssignLatenciesBase<AssignLatencies> {
   using TritonGPUAssignLatenciesBase::TritonGPUAssignLatenciesBase;
 
-  void runOnOperation() override { assignLatencies(getOperation(), numStages); }
+  void runOnOperation() override {
+    if (failed(assignLatencies(getOperation(), numStages, useMetaWS)))
+      signalPassFailure();
+  }
 };
 
 } // namespace mlir::triton::gpu

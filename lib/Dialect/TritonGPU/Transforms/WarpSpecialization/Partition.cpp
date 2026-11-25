@@ -6,8 +6,11 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -45,7 +48,10 @@ LogicalResult verifyPartitionIdsAttr(Operation *op, StringRef attrName,
 }
 
 LogicalResult verifyPartitionAttrs(Operation *op) {
-  if (op->hasAttr(kWarpSpecializeAttrName)) {
+  bool useMetaWS = triton::isMetaWSEnabled(op);
+  // META_WS_CHANGE: PSM intentionally leaves some nested operations without
+  // partition annotations for later task-id propagation.
+  if (op->hasAttr(kWarpSpecializeAttrName) && !useMetaWS) {
     if (!isa<scf::ForOp, scf::WhileOp>(op)) {
       return op->emitOpError("has unexpected attribute ")
              << kWarpSpecializeAttrName
@@ -89,8 +95,11 @@ LogicalResult verifyPartitionAttrs(Operation *op) {
     }
   }
 
-  if (op->hasAttr(kPartitionAttrName) && op->getNumRegions() != 0) {
-    SetVector<int> expectedIds;
+  // META_WS_CHANGE: Match Meta's pre-port verifier exemptions. PSM does not
+  // guarantee complete nested annotations, and ReduceOp/MapElementwiseOp have
+  // function-like regions whose operations do not need partition annotations.
+  if (op->hasAttr(kPartitionAttrName) && op->getNumRegions() != 0 &&
+      !isa<triton::ReduceOp, triton::MapElementwiseOp>(op) && !useMetaWS) {
     for (Region &region : op->getRegions()) {
       for (Block &block : region.getBlocks()) {
         for (Operation &childOp : block.getOperations()) {
@@ -101,25 +110,15 @@ LogicalResult verifyPartitionAttrs(Operation *op) {
                    << kPartitionAttrName
                    << " which is expected for ops whose parent has partitions";
           }
-          auto ids = getPartitionIds(&childOp);
-          expectedIds.insert(ids.begin(), ids.end());
         }
       }
     }
-
-    auto partitionIds = getPartitionIds(op);
-    for (auto id : expectedIds) {
-      if (!partitionIds.contains(id)) {
-        return op->emitOpError("partition ids in attr ")
-               << kPartitionAttrName
-               << " does not contain partition ids of all child ops";
-      }
-    }
+    // META_WS_CHANGE: Meta's pre-port verifier did not require the parent's
+    // partition set to contain every child partition.
   }
 
   if (auto outputsAttr = op->getAttr(kPartitionOutputsAttrName)) {
-    if (!isa<scf::ForOp, scf::WhileOp, scf::IfOp, triton::ReduceOp,
-             triton::ScanOp>(op))
+    if (!isa<scf::ForOp, scf::WhileOp, scf::IfOp, triton::ReduceOp>(op))
       return op->emitOpError("has unexpected attribute ")
              << kPartitionOutputsAttrName;
 
@@ -174,7 +173,6 @@ void Partition::iterateInputs(LoopLikeOpInterface loop,
   Value inductionVar;
   if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
     inductionVar = forOp.getInductionVar();
-
   for (Operation *op : getOps()) {
     visitNestedOperands(op, [&](OpOperand &operand) {
       // Ignore implicit captures.
@@ -182,16 +180,19 @@ void Partition::iterateInputs(LoopLikeOpInterface loop,
       std::optional<SetVector<int>> partitionIds;
       if (hasPartition(value.getDefiningOp()))
         partitionIds = getPartitionIds(value.getDefiningOp());
-      if (value.getParentRegion()->getParentOp() != loop)
+      // An scf.while has both before and after regions; each can contain
+      // partition inputs. For scf.for this still selects its single body.
+      if (value.getParentRegion()->getParentOp() != loop.getOperation())
         return;
       // Ignore the induction variable.
       if (value == inductionVar)
         return;
-      if ((isa<BlockArgument>(value) || !partitionIds ||
-           !partitionIds->contains(getIndex()))) {
-        // This value originates from a different partition in the same
-        // iteration.
-        assert(value.getParentRegion()->getParentOp() == loop);
+      if (isa<BlockArgument>(value)) {
+        // A loop block argument comes from another iteration or region.
+        callback(operand);
+      } else if (!partitionIds || !partitionIds->contains(getIndex())) {
+        // This value originates from a different partition in this iteration.
+        assert(value.getDefiningOp()->getParentOp() == loop.getOperation());
         callback(operand);
       }
     });
@@ -208,6 +209,13 @@ void Partition::iterateOutputs(
         if ((owner = region->front().findAncestorOpInBlock(*use.getOwner())))
           break;
       if (!owner) {
+        // The user is outside the loop, so it's a post-loop operation.
+        // Use the operation directly.
+        owner = use.getOwner();
+        if (!hasPartition(owner) ||
+            !getPartitionIds(owner).contains(getIndex())) {
+          callback(owner, use);
+        }
         continue;
       }
       std::optional<SetVector<int>> partitionIds;
@@ -215,7 +223,7 @@ void Partition::iterateOutputs(
         partitionIds = getPartitionIds(owner);
       if (isa<scf::YieldOp, scf::ConditionOp>(owner) || !partitionIds ||
           !partitionIds->contains(getIndex())) {
-        // This value is used in a different partition in the same iteration.
+        // This value crosses a loop boundary or another partition.
         callback(owner, use);
       }
     }
@@ -223,10 +231,15 @@ void Partition::iterateOutputs(
 }
 
 void Partition::iterateDefs(
-    scf::ForOp loop, function_ref<void(OpResult, unsigned)> callback) const {
+    LoopLikeOpInterface loop,
+    function_ref<void(OpResult, unsigned)> callback) const {
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation())) {
+    iterateDefs(whileOp, callback);
+    return;
+  }
   iterateInputs(loop, [&](OpOperand &input) {
-    auto [def, distance] = getDefinitionAndDistance(loop, input.get());
-    if (def && def.getParentBlock() == loop.getBody())
+    auto [def, distance] = getLoopDefinitionAndDistance(loop, input.get());
+    if (def && def.getParentBlock() == getLoopBodyBlock(loop))
       callback(def, distance);
   });
 }
@@ -260,10 +273,18 @@ void Partition::iterateUses(
       if ((owner = region->front().findAncestorOpInBlock(*use->getOwner())))
         break;
     if (!owner) {
+      // Keep fbtriton's post-loop consumers visible to callers.
+      callback(output, *use, distance);
       continue;
     }
-    if (auto yield = dyn_cast<scf::YieldOp>(owner)) {
-      auto arg = loop.getRegionIterArgs()[use->getOperandNumber()];
+    if (isa<scf::YieldOp>(owner)) {
+      BlockArgument arg;
+      if (isa<scf::WhileOp>(loop.getOperation()))
+        arg = loop.getRegionIterArgs()[use->getOperandNumber()];
+      else
+        arg = getLoopCarriedBodyArg(loop, use->getOperandNumber());
+      if (!arg)
+        continue;
       for (OpOperand &argUse : arg.getUses())
         uses.emplace_back(output, &argUse, distance + 1);
       continue;
@@ -303,10 +324,61 @@ Partition *PartitionSet::getPartition(Operation *op) {
   return getPartition(id[0]);
 }
 
-FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
-  if (failed(verifyPartitionedLoop(loop)))
-    return failure();
+void PartitionSet::swapPartitions(unsigned idxA, unsigned idxB,
+                                  LoopLikeOpInterface loop) {
+  if (idxA == idxB)
+    return;
 
+  // Swap the partition objects in the vector.
+  std::swap(partitions[idxA], partitions[idxB]);
+
+  // Update the internal indices to match their new positions.
+  partitions[idxA]->setIndex(idxA);
+  partitions[idxB]->setIndex(idxB);
+
+  // Walk all ops in the loop and update their partition annotations.
+  Builder b(loop->getContext());
+  auto remapIds = [&](DenseI32ArrayAttr attr) -> DenseI32ArrayAttr {
+    SmallVector<int32_t> ids(attr.asArrayRef());
+    for (int32_t &id : ids) {
+      if (id == static_cast<int32_t>(idxA))
+        id = static_cast<int32_t>(idxB);
+      else if (id == static_cast<int32_t>(idxB))
+        id = static_cast<int32_t>(idxA);
+    }
+    llvm::sort(ids);
+    return b.getDenseI32ArrayAttr(ids);
+  };
+
+  // Walk the containing function to update annotations both inside and
+  // outside the loop (post-loop ops also carry partition annotations).
+  loop->getParentOfType<FuncOp>().walk([&](Operation *op) {
+    if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName))
+      op->setAttr(kPartitionAttrName, remapIds(attr));
+  });
+}
+
+FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
+  // Validate at this API boundary even when the caller already gated the loop.
+  if (!isa<scf::ForOp, scf::WhileOp>(loop.getOperation()) ||
+      !hasSupportedLoopCarry(loop))
+    return failure();
+  // Meta PSM leaves some scf.while before-region ops unannotated. Upstream
+  // schedules can also carry partition types after serialization, but those
+  // are all empty; Meta PSM assigns semantic types such as "computation".
+  // Still verify scf.for and upstream's scf.while schedules.
+  auto types = loop->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName);
+  bool hasMetaTypes = false;
+  if (types)
+    hasMetaTypes = llvm::any_of(types, [](Attribute attr) {
+      auto type = dyn_cast<StringAttr>(attr);
+      return type && !type.getValue().empty();
+    });
+  bool isMetaWhile =
+      isa<scf::WhileOp>(loop.getOperation()) &&
+      (triton::isMetaWSEnabled(loop.getOperation()) || hasMetaTypes);
+  if (!isMetaWhile && failed(verifyPartitionedLoop(loop)))
+    return failure();
   auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName);
   if (!stages)
     return failure();
@@ -314,6 +386,10 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   auto tag = loop->getAttrOfType<IntegerAttr>(kWarpSpecializeTagAttrName);
   if (!tag)
     return failure();
+
+  if (types && types.size() != stages.size())
+    return mlir::emitError(loop.getLoc(), "partition types attribute '")
+           << kPartitionTypesAttrName << "' must match partition stages size";
 
   PartitionSet result;
   result.tag = tag.getInt();
@@ -324,16 +400,25 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
              << kPartitionStagesAttrName << "' has invalid element " << attr;
     }
 
-    result.partitions.push_back(
-        std::make_unique<Partition>(idx, stage.getInt()));
+    auto partition = std::make_unique<Partition>(idx, stage.getInt());
+    if (types) {
+      auto type = dyn_cast<StringAttr>(types[idx]);
+      if (!type)
+        return mlir::emitError(loop.getLoc(), "partition types attribute '")
+               << kPartitionTypesAttrName << "' has invalid element "
+               << types[idx];
+      partition->setType(type.getValue());
+    }
+    result.partitions.push_back(std::move(partition));
   }
 
   SmallVector<Operation *> annotatedOps;
-  loop->walk([&](Operation *op) {
-    if (hasPartition(op)) {
-      annotatedOps.push_back(op);
-    }
-  });
+  // Include both scf.while regions, not just its scheduled after region.
+  for (Region *region : loop.getLoopRegions())
+    region->walk([&](Operation *op) {
+      if (hasPartition(op))
+        annotatedOps.push_back(op);
+    });
 
   for (auto op : annotatedOps) {
     auto attrs = getPartitionIds(op);
@@ -345,6 +430,20 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   }
 
   return result;
+}
+
+void PartitionSet::serialize(LoopLikeOpInterface loop) const {
+  // In the new PartitionSet system, per-op partition attributes are already set
+  // by setPartition(). We only need to serialize the partition stages array.
+  SmallVector<Attribute> stages;
+  SmallVector<Attribute> types;
+  Builder b(loop->getContext());
+  for (const Partition &partition : getPartitions()) {
+    stages.push_back(b.getI32IntegerAttr(partition.getStage()));
+    types.push_back(b.getStringAttr(partition.getType()));
+  }
+  loop->setAttr(kPartitionStagesAttrName, b.getArrayAttr(stages));
+  loop->setAttr(kPartitionTypesAttrName, b.getArrayAttr(types));
 }
 
 void PartitionSet::dump() const {

@@ -66,9 +66,7 @@ bool supportsI8DotDecomposition(PatternRewriter &rewriter,
                                 IntegerType accElem) {
   auto moduleOp =
       rewriter.getInsertionBlock()->getParentOp()->getParentOfType<ModuleOp>();
-  // The decomposition emits NVIDIA MMA layouts.
-  auto target = moduleOp->getAttrOfType<StringAttr>(ttg::AttrTargetName);
-  if (target && target.getValue().split(':').first != "cuda")
+  if (getAMDArch(moduleOp))
     return false;
   return llvm::is_contained({16, 32, 64}, accElem.getWidth());
 }
@@ -2585,7 +2583,8 @@ struct TMEMLoadPattern : public OpRewritePattern<ttng::TMEMLoadOp> {
       reductionInput = embedToInt(rewriter, loc, reductionInput);
 
       auto reduce =
-          tt::ReduceOp::create(rewriter, loc, ValueRange{reductionInput}, 1);
+          tt::ReduceOp::create(rewriter, loc, ValueRange{reductionInput}, 1,
+                               /*reduction_ordering=*/nullptr);
       Block &block = reduce.getCombineOp().emplaceBlock();
       Type elemTy = getElementTypeOrSelf(reductionInput.getType());
       block.addArguments({elemTy, elemTy}, {loc, loc});
@@ -2700,21 +2699,14 @@ struct TMEMCopyPattern : public OpRewritePattern<ttng::TMEMCopyOp> {
       // Make shared operands visible before the CTAs emulate the TMEM copy.
       ttng::ClusterBarrierOp::create(rewriter, loc);
     }
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      if (Value pred = op.getPred()) {
-        auto ifOp = scf::IfOp::create(rewriter, loc, pred, false);
-        rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
-      }
-      Value srcReg = ttg::LocalLoadOp::create(rewriter, loc, srcRegTy,
-                                              op.getSrc(), Value())
-                         .getResult();
-      if (!storeScratchStrided2D(rewriter, loc, info->ptr, srcReg, srcRegTy,
-                                 /*stride0=*/1,
-                                 info->tensorType.getShape().front(),
-                                 /*ignoreCTA=*/true))
-        return emitFpSanCodegenError(op.getOperation());
-    }
+    Value srcReg =
+        ttg::LocalLoadOp::create(rewriter, loc, srcRegTy, op.getSrc(), Value())
+            .getResult();
+    if (!storeScratchStrided2D(rewriter, loc, info->ptr, srcReg, srcRegTy,
+                               /*stride0=*/1,
+                               info->tensorType.getShape().front(),
+                               /*ignoreCTA=*/true))
+      return emitFpSanCodegenError(op.getOperation());
 
     createGlobalScratchBarrier(rewriter, loc,
                                scratch->usesSharedClusterState());
@@ -3392,6 +3384,16 @@ public:
       return;
     }
 
+    auto srValidation = getOperation().walk([&](tt::FpToFpOp op) {
+      if (op.getRounding() != tt::RoundingMode::RS)
+        return WalkResult::advance();
+      op.emitOpError("stochastic rounding is not supported by FpSanitizer");
+      return WalkResult::interrupt();
+    });
+    if (srValidation.wasInterrupted()) {
+      signalPassFailure();
+      return;
+    }
     bool fpSanErrorEmitted = false;
     ScopedDiagnosticHandler diagnosticHandler(
         &getContext(), [&](Diagnostic &diagnostic) {

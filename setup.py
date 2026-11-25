@@ -270,6 +270,34 @@ class CMakeBuild(build_ext):
             cmake_args += ["-DROCPROFILER_SDK_INCLUDE_DIR=" + rocprofiler_sdk_include_dir]
         return cmake_args
 
+    def get_llvm_syspath(self):
+        # When LLVM_SYSPATH is set, the build uses that prebuilt LLVM directly.
+        # Otherwise build_helpers downloads the default prebuilt LLVM into the
+        # triton cache during the cmake configure step; resolve that path the
+        # same way build_helpers does so callers see the identical directory.
+        llvm_syspath = os.getenv("LLVM_SYSPATH")
+        if llvm_syspath:
+            return llvm_syspath
+        from python.build_helpers import BuildHelperArgs, get_llvm_package_info
+        helper_args = BuildHelperArgs(
+            cache_path=get_triton_cache_path(),
+            offline_build=check_env_flag("TRITON_OFFLINE_BUILD"),
+            llvm_system_suffix=os.getenv("TRITON_LLVM_SYSTEM_SUFFIX"),
+            llvm_syspath=None,
+            json_syspath=None,
+            ptxas_path=None,
+            ptxas_blackwell_path=None,
+            cuobjdump_path=None,
+            nvdisasm_path=None,
+            cudacrt_path=None,
+            cudart_path=None,
+            cupti_include_path=None,
+            cupti_lib_path=None,
+            cupti_lib_blackwell_path=None,
+        )
+        package = get_llvm_package_info(helper_args)
+        return os.path.join(get_triton_cache_path(), "llvm", package.name)
+
     def build_extension(self, ext):
         lit_dir = shutil.which('lit')
         ninja_dir = shutil.which('ninja')
@@ -365,6 +393,7 @@ class CMakeBuild(build_ext):
             "TRITON_CUPTI_LIB_BLACKWELL_PATH",
             "TRITON_ROCPROFILER_SDK_INCLUDE_PATH",
             "TRITON_ROCPROFILER_SDK_LIB_PATH",
+            "TRITON_SLEEF_SOURCE_DIR",
             "TRITON_NVDISASM_PATH",
             "TRITON_AMD_CODEGEN_PATH",
             "TRITON_PTXAS_PATH",
@@ -386,6 +415,22 @@ class CMakeBuild(build_ext):
         cmake_dir = get_cmake_dir()
         subprocess.check_call(["cmake", self.base_dir] + cmake_args, cwd=cmake_dir, env=env)
         update_symlink(Path(self.base_dir) / "compile_commands.json", cmake_dir / "compile_commands.json")
+
+        # Build against the default prebuilt LLVM (compiled on a newer distro) on
+        # a host with an older libstdc++: the prebuilt LLVM build tools
+        # (mlir-tblgen, clang++, opt, ...) that run during the build dynamically
+        # need GLIBCXX_3.4.30 (GCC 12) symbols absent from the host libstdc++.
+        # Build a drop-in libstdc++.so.6 and install it into the LLVM lib dir; the
+        # tools have RUNPATH "$ORIGIN/../lib" so they pick it up with no env, for
+        # any build invocation. See scripts/build-glibcxx-compat.sh. This runs
+        # after the cmake configure above, which is what downloads/extracts the
+        # default prebuilt LLVM, so the lib dir is guaranteed to exist here.
+        if check_env_flag("TRITON_LIBSTDCXX_COMPAT"):
+            compat_dir = os.path.join(self.build_temp, "glibcxx-compat")
+            llvm_lib = os.path.join(self.get_llvm_syspath(), "lib")
+            subprocess.check_call(
+                [os.path.join(self.base_dir, "scripts", "build-glibcxx-compat.sh"), compat_dir, llvm_lib])
+
         subprocess.check_call(["cmake", "--build", "."] + build_args, cwd=cmake_dir)
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
         if check_env_flag("TRITON_EXT_ENABLED"):
@@ -397,7 +442,7 @@ class CMakeBuild(build_ext):
                                   cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+backends = [*BackendInstaller.copy(["nvidia", "amd", "cpu"]), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
@@ -448,6 +493,33 @@ def get_packages():
     if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         yield "triton.profiler"
 
+    yield "triton.language.extra.tlx"
+
+    # The TLX op library. find_packages() does follow the symlink once it
+    # exists, but on a fresh tree add_links() may not have run yet, so
+    # enumerate from the source directory instead of the link target.
+    yield "triton.tlx"
+    for pkg in _tlx_ops_packages():
+        yield pkg
+
+
+def _tlx_ops_dir():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "tlx", "ops"))
+
+
+def _tlx_ops_packages():
+    """Every package under third_party/tlx/ops, as triton.tlx.ops.* names."""
+    root = _tlx_ops_dir()
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        if "__init__.py" not in filenames:
+            continue
+        rel = os.path.relpath(dirpath, root)
+        suffix = "" if rel == "." else "." + rel.replace(os.sep, ".")
+        yield f"triton.tlx.ops{suffix}"
+
 
 def add_link_to_backends(external_only):
     for backend in backends:
@@ -482,10 +554,23 @@ def add_link_to_proton():
     update_symlink(proton_install_dir, proton_dir)
 
 
+def add_link_to_tlx():
+    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "tlx", "language", "tlx"))
+    install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "language", "extra", "tlx")
+    update_symlink(install_dir, src_dir)
+
+    # The op library lands at triton.tlx.ops. python/triton/tlx/__init__.py is
+    # a real committed file, so only `ops` is linked; that keeps the source
+    # name honest (ops/ holds ops) while users get the short public path.
+    ops_install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "tlx", "ops")
+    update_symlink(ops_install_dir, _tlx_ops_dir())
+
+
 def add_links(external_only):
     add_link_to_backends(external_only=external_only)
     if not external_only and check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         add_link_to_proton()
+    add_link_to_tlx()
 
 
 class plugin_bdist_wheel(bdist_wheel):

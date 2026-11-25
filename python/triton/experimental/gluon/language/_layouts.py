@@ -364,9 +364,10 @@ class NVMMASharedLayout(SharedLayout):
         rank (int): Rank of the tensor.
         transposed (bool): Whether the layout is transposed.
         fp4_padded (bool): Whether FP4 padding is used.
-        padding (Optional[str]): "fp4", "b6x16_p32" (packed FP6 load/MMA), or
-            "b6p2x16" (one FP6 code per byte for a compacting store).
         cga_layout (Optional[List[List[int]]]): Bases describing CTA tiling.
+        fp6_padded (bool): Whether TMA pads each 16 packed FP6 values to 16 bytes.
+        padding (Optional[str]): "fp4", "b6x16_p32" for packed FP6 loads/MMA,
+            or "b6p2x16" for compacting FP6 stores.
     """
     swizzle_byte_width: int
     element_bitwidth: int
@@ -374,6 +375,7 @@ class NVMMASharedLayout(SharedLayout):
     transposed: bool = False
     fp4_padded: bool = False
     cga_layout: List[List[int]] = field(default_factory=list)
+    fp6_padded: bool = False
     padding: str | None = None
 
     def __post_init__(self):
@@ -381,6 +383,7 @@ class NVMMASharedLayout(SharedLayout):
         super().__setattr__("element_bitwidth", _unwrap_if_constexpr(self.element_bitwidth))
         super().__setattr__("transposed", _unwrap_if_constexpr(self.transposed))
         super().__setattr__("fp4_padded", _unwrap_if_constexpr(self.fp4_padded))
+        super().__setattr__("fp6_padded", _unwrap_if_constexpr(self.fp6_padded))
 
         # TODO: Make rank optional and check that (rank or cga_layout)
         cga_layout = self.cga_layout or []
@@ -395,16 +398,23 @@ class NVMMASharedLayout(SharedLayout):
 
         padding = _unwrap_if_constexpr(self.padding)
         assert padding in (None, "fp4", "b6x16_p32", "b6p2x16")
+        if self.fp6_padded:
+            assert not self.fp4_padded, "fp4_padded and fp6_padded are mutually exclusive"
+            assert padding in (None, "b6x16_p32")
+            padding = "b6x16_p32"
         if self.fp4_padded:
             assert padding in (None, "fp4")
             padding = "fp4"
         super().__setattr__("padding", padding)
         super().__setattr__("fp4_padded", padding == "fp4")
+        super().__setattr__("fp6_padded", padding == "b6x16_p32")
         if padding is not None:
             assert self.element_bitwidth == 8
         if self.fp4_padded:
             assert self.swizzle_byte_width == 128, "fp4_padded only supports 128 byte swizzling"
             assert self.element_bitwidth == 8, "fp4_padded is only supported for element_bitwidth=8"
+        if padding in ("b6x16_p32", "b6p2x16"):
+            assert self.swizzle_byte_width in (0, 128), "FP6 requires 0/128-byte swizzling"
 
     def _to_ir(self, builder):
         return builder.get_nvmma_shared_layout(
@@ -418,7 +428,7 @@ class NVMMASharedLayout(SharedLayout):
 
     @staticmethod
     @constexpr_function
-    def get_default_for(block_shape, dtype, transposed=False, fp4_padded=False, cga_layout=None, padding=None):
+    def get_default_for(block_shape, dtype, transposed=False, fp4_padded=False, cga_layout=None, fp6_padded=False, padding=None):
         """Returns an NVMMASharedLayout with default swizzling for a given shape.
 
         This picks the largest swizzle pattern compatible with the shape, which
@@ -452,19 +462,19 @@ class NVMMASharedLayout(SharedLayout):
             rank=rank,
             transposed=transposed,
             fp4_padded=fp4_padded,
-            padding=padding,
             cga_layout=cga_layout,
+            fp6_padded=fp6_padded,
+            padding=padding,
         )
 
     def mangle(self) -> str:
         cga_layout = "_".join("~".join(map(str, vec)) for vec in self.cga_layout) if self.cga_layout else ""
         fp6 = f"_{self.padding}" if self.padding in ("b6x16_p32", "b6p2x16") else ""
-        return f"NVMMA{fp6}_{self.swizzle_byte_width}_{self.element_bitwidth}_{self.rank}_{self.transposed}_{self.fp4_padded}_{cga_layout}_NVMMA"
+        return f"NVMMA_{self.swizzle_byte_width}_{self.element_bitwidth}_{self.rank}_{self.transposed}_{self.fp4_padded}_{cga_layout}{fp6}_NVMMA"
 
     def __hash__(self):
-        return hash(
-            (self.swizzle_byte_width, self.element_bitwidth, self.rank, self.transposed, self.fp4_padded, self.padding,
-             tuple(tuple(vec) for vec in self.cga_layout) if self.cga_layout else None))
+        return hash((self.swizzle_byte_width, self.element_bitwidth, self.rank, self.transposed, self.fp4_padded,
+                     self.padding, tuple(tuple(vec) for vec in self.cga_layout) if self.cga_layout else None))
 
 
 @dataclass(frozen=True, eq=True)

@@ -8,6 +8,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace ttg = mlir::triton::gpu;
 
@@ -51,31 +52,20 @@ SmallVector<Value> lowerLocalScGt(Location loc, MemDescType memDescTy,
   return results;
 }
 
-LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx,
-                              const LinearLayout &regLayout,
-                              MemDescType memDescTy, SharedMemoryObject smemObj,
-                              SmallVector<Value> &inVals,
-                              const LLVMTypeConverter *typeConverter,
-                              ConversionPatternRewriter &rewriter,
-                              const TargetInfoBase &targetInfo) {
-  auto kReg = str_attr("register");
-  assert(regLayout.getFreeVariableMasks().lookup(kReg) == 0 &&
+LogicalResult lowerLocalStore(
+    Location loc, MLIRContext *ctx, LinearLayout regLayout,
+    MemDescType memDescTy, SharedMemoryObject smemObj, ArrayRef<Value> inVals,
+    const LLVMTypeConverter *typeConverter, ConversionPatternRewriter &rewriter,
+    const TargetInfoBase &targetInfo, std::optional<Value> clusterCTARank = {},
+    std::optional<Value> barrierPtr = {}) {
+  assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
          "expected register broadcasting to be removed by the caller");
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-
   auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
-  auto cvt = invertAndComposeStore(sharedLayout, regLayout);
-  // Extra high register bits select CTA replicas, so repeat the source values.
-  // reg = {register=[], block=[[1]]}, shmem = {offset=[[1]], block=[[0]]}.
-  // CTA i repeats x[i] to store it at offset i in both CTAs.
-  int numStoreRegs = cvt.getInDimSize(kReg);
-  if (numStoreRegs != regLayout.getInDimSize(kReg))
-    inVals = broadcastAs(inVals, regLayout.resizeInDim(kReg, numStoreRegs));
-
+  auto kBlock = str_attr("block");
+  auto cvt = invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
-                 rewriter, targetInfo,
-                 makeSharedStoreEmitter(targetInfo, b.true_val()));
+                 rewriter, targetInfo, nullptr, clusterCTARank, barrierPtr);
 
   return success();
 }
@@ -147,9 +137,32 @@ struct LocalAllocOpConversion
       auto regLayout =
           toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
       auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
-      if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj,
-                                 inVals, typeConverter, rewriter,
-                                 targetInfo))) {
+      if (!regLayout.isRadix2()) {
+        // A mixed-radix layout's odd digits add rather than XOR, so it doesn't
+        // compose with the shared layout: store each run contiguous there.
+        auto b = TritonLLVMOpBuilder(loc, rewriter);
+        LinearLayout toOffset =
+            toLinearLayoutIgnoringPadding(memDescTy).pseudoinvert();
+        int32_t run = getMixedRadixSharedRun(
+            regLayout, toOffset, llvmElemTy.getIntOrFloatBitWidth());
+        auto masks = regLayout.getFreeVariableMasks();
+        auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+        forEachMixedRadixSharedRun(
+            loc, rewriter, regLayout, toOffset, run,
+            [&](int32_t reg, Value offset, auto indices) {
+              Value value =
+                  run == 1 ? inVals[reg]
+                           : packLLVector(loc, ArrayRef(inVals).slice(reg, run),
+                                          rewriter);
+              targetInfo.storeShared(
+                  rewriter, loc,
+                  b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset), value,
+                  emitCanonicalLayoutOwnerPredicate(loc, rewriter, regLayout,
+                                                    indices, masks));
+            });
+      } else if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj,
+                                        inVals, typeConverter, rewriter,
+                                        targetInfo))) {
         return failure();
       }
     }
@@ -177,11 +190,15 @@ struct LocalDeallocOpConversion
 
 struct LocalLoadOpConversion : public ConvertOpToLLVMPattern<LocalLoadOp> {
 public:
-  LocalLoadOpConversion(LLVMTypeConverter &typeConverter,
-                        const TargetInfoBase &targetInfo,
-                        PatternBenefit benefit = 1)
-      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {
-  }
+  LocalLoadOpConversion(
+      LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
+      PatternBenefit benefit = 1,
+      std::shared_ptr<DistributedCoordinateGroups> coordinateGroups = nullptr)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo),
+        coordinateGroups(
+            coordinateGroups
+                ? std::move(coordinateGroups)
+                : std::make_shared<DistributedCoordinateGroups>()) {}
 
   LogicalResult
   matchAndRewrite(LocalLoadOp op, OpAdaptor adaptor,
@@ -201,12 +218,51 @@ public:
     auto regLayout =
         toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
     auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
+    // A mixed-radix layout's odd digits add rather than XOR, so it doesn't
+    // compose with the shared layout: load each run that is contiguous there.
+    if (!regLayout.isRadix2()) {
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      LinearLayout toOffset = sharedLayout.pseudoinvert();
+      int32_t run = getMixedRadixSharedRun(regLayout, toOffset,
+                                           llvmElemTy.getIntOrFloatBitWidth());
+      auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+      // The verifier allows views on pow2 subslice extents only, so XOR is ADD.
+      Value origin = smemObj.getShmemOffset(loc, rewriter, memDescTy);
+      SmallVector<Value> outVals;
+      forEachMixedRadixSharedRun(
+          loc, rewriter, regLayout, toOffset, run,
+          [&](int32_t, Value offset, auto) {
+            offset = b.xor_(offset, origin);
+            Value ptr = b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset);
+            Value vec = b.load(vec_ty(llvmElemTy, run), ptr);
+            llvm::append_range(outVals, unpackLLVector(loc, vec, rewriter));
+          });
+      rewriter.replaceOp(op, packUniqueTensorElements(
+                                 loc, typeConverter, outVals, rewriter, regTy));
+      return success();
+    }
     auto kBlock = str_attr("block");
     auto cvt = invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
 
+    std::optional<std::pair<Value, Value>> distributedCoordinates;
+    if (auto group = op->getAttrOfType<IntegerAttr>(
+            "tlx.rematerialize_coordinates_group")) {
+      auto kLane = str_attr("lane");
+      auto kWarp = str_attr("warp");
+      auto outDims = to_vector(cvt.getOutDimNames());
+      bool rematerializeLane =
+          cvt.hasInDim(kLane) && !cvt.sublayoutIsZero({kLane}, outDims);
+      bool rematerializeWarp =
+          cvt.hasInDim(kWarp) && !cvt.sublayoutIsZero({kWarp}, outDims);
+      distributedCoordinates = coordinateGroups->getOrCreate(
+          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter,
+          targetInfo);
+    }
+
     auto outVals = lowerLocalLdSt(loc, ctx, cvt, {}, llvmElemTy, memDescTy,
-                                  smemObj, rewriter, targetInfo,
-                                  makeSharedLoadEmitter(targetInfo, op));
+                                  smemObj, rewriter, targetInfo, op,
+                                  /*ctaRank=*/{}, /*barrierPtr=*/{},
+                                  distributedCoordinates);
 
     Value result =
         packUniqueTensorElements(loc, typeConverter, outVals, rewriter, regTy);
@@ -217,6 +273,7 @@ public:
 
 private:
   const TargetInfoBase &targetInfo;
+  std::shared_ptr<DistributedCoordinateGroups> coordinateGroups;
 };
 
 struct LocalStoreOpConversion
@@ -259,70 +316,44 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
-struct ThreadPredicateOpConversion
-    : public ConvertOpToLLVMPattern<ThreadPredicateOp> {
-  ThreadPredicateOpConversion(LLVMTypeConverter &converter,
-                              const TargetInfoBase &targetInfo,
-                              PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(converter, benefit), targetInfo(targetInfo) {}
+struct RemoteShmemStoreOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::RemoteShmemStoreOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::RemoteShmemStoreOp>::ConvertOpToLLVMPattern;
+
+  RemoteShmemStoreOpConversion(const LLVMTypeConverter &converter,
+                               const TargetInfoBase &targetInfo,
+                               PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<triton::gpu::RemoteShmemStoreOp>(converter,
+                                                                benefit),
+        targetInfo(targetInfo) {}
 
   LogicalResult
-  matchAndRewrite(ThreadPredicateOp op, OpAdaptor adaptor,
+  matchAndRewrite(triton::gpu::RemoteShmemStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value predicate =
-        emitThreadPredicate(op.getDomain(), rewriter, op.getLoc(), targetInfo);
-    rewriter.replaceOp(op, predicate);
-    return success();
-  }
-
-private:
-  const TargetInfoBase &targetInfo;
-};
-
-struct ThreadHandoffOpConversion
-    : public ConvertOpToLLVMPattern<ThreadHandoffOp> {
-  ThreadHandoffOpConversion(LLVMTypeConverter &converter,
-                            const TargetInfoBase &targetInfo,
-                            PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(converter, benefit), targetInfo(targetInfo) {}
-
-  LogicalResult
-  matchAndRewrite(ThreadHandoffOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Value result = adaptor.getSrc();
-    auto source = op.getSource();
-    auto destination = op.getDestination();
-    if (source == destination) {
-      rewriter.replaceOp(op, result);
-      return success();
-    }
-
     auto loc = op.getLoc();
-    // Work around https://github.com/llvm/llvm-project/issues/224146:
-    // peeling can split convergent handoffs into owner/non-owner loops.
-    // noduplicate also blocks valid unrolling. Revisit this workaround once
-    // LLVM preserves convergence through peeling.
-    auto boundary = appendOrGetExternFuncOp(
-        rewriter, op, "llvm.sideeffect",
-        LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(op.getContext()),
-                                    {}));
-    auto call = LLVM::CallOp::create(rewriter, loc, boundary, ValueRange{});
-    call.setNoduplicate(true);
-    call.setConvergent(true);
-    if (source.hasSameWarpAndBlock(destination)) {
-      shuffleFromCanonicalLane(loc, MutableArrayRef<Value>(result),
-                               source.getLane(), rewriter, targetInfo);
-    } else {
-      // Publish from lane zero of warp zero in each source CTA.
-      auto publisher = ThreadDomainAttr::get(
-          op.getContext(), lookupThreadsPerWarp(rewriter) - 1,
-          lookupNumWarps(op) - 1, source.getBlock());
-      Value predicate =
-          emitThreadPredicate(publisher, rewriter, loc, targetInfo);
-      result =
-          broadcastScalarResult(op, result, rewriter, predicate, targetInfo);
+    auto *ctx = op.getContext();
+    Value memDescVal = op.getDst();
+    auto typeConverter = getTypeConverter();
+    auto regTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto memDescTy = cast<MemDescType>(memDescVal.getType());
+    auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
+                                                         llvmElemTy, rewriter);
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    Value clusterCTARank = op.getCtaRank();
+
+    if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj, inVals,
+                               typeConverter, rewriter, targetInfo,
+                               clusterCTARank))) {
+      return failure();
     }
-    rewriter.replaceOp(op, result);
+
+    rewriter.eraseOp(op);
+
     return success();
   }
 
@@ -403,6 +434,63 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
+struct AsyncRemoteShmemStoreOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::AsyncRemoteShmemStoreOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::AsyncRemoteShmemStoreOp>::ConvertOpToLLVMPattern;
+
+  AsyncRemoteShmemStoreOpConversion(const LLVMTypeConverter &converter,
+                                    const TargetInfoBase &targetInfo,
+                                    PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<triton::gpu::AsyncRemoteShmemStoreOp>(converter,
+                                                                     benefit),
+        targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::AsyncRemoteShmemStoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getStoreReduce() != DescriptorReduceKind::NONE)
+      return rewriter.notifyMatchFailure(
+          op, "async remote shared-memory reduction requires a supported "
+              "NVIDIA lowering");
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    Value memDescVal = op.getDst();
+    auto typeConverter = getTypeConverter();
+    auto regTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto memDescTy = cast<MemDescType>(memDescVal.getType());
+    auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
+                                                         llvmElemTy, rewriter);
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    Value clusterCTARank = op.getCtaRank();
+
+    auto barrierDesc = op.getBarrier();
+    auto barrierAdaptor = adaptor.getBarrier();
+    auto barrierTy = cast<MemDescType>(barrierDesc.getType());
+    auto barrierLLVMElemTy =
+        typeConverter->convertType(barrierTy.getElementType());
+    auto barrierSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, barrierAdaptor, barrierLLVMElemTy, rewriter);
+    std::optional<Value> barrierPtr = barrierSmemObj.getBase();
+
+    if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj, inVals,
+                               typeConverter, rewriter, targetInfo,
+                               clusterCTARank, barrierPtr))) {
+      return failure();
+    }
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
 struct LocalScatterOpConversion
     : public ConvertOpToLLVMPattern<LocalScatterOp> {
 public:
@@ -442,6 +530,65 @@ public:
     lowerLocalScGt(loc, memDescTy, smemObj, llvmElemTy, regLayout, idxValues,
                    op.getAxis(), values, rewriter, targetInfo);
 
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
+struct AsyncRemoteShmemCopyOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::AsyncRemoteShmemCopyOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::AsyncRemoteShmemCopyOp>::ConvertOpToLLVMPattern;
+
+  AsyncRemoteShmemCopyOpConversion(const LLVMTypeConverter &converter,
+                                   const TargetInfoBase &targetInfo,
+                                   PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<triton::gpu::AsyncRemoteShmemCopyOp>(converter,
+                                                                    benefit),
+        targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::AsyncRemoteShmemCopyOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto typeConverter = getTypeConverter();
+
+    // Get src SMEM pointer including subslice offset.
+    auto srcTy = cast<MemDescType>(op.getSrc().getType());
+    auto llvmElemTy = typeConverter->convertType(srcTy.getElementType());
+    auto srcSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getSrc(), llvmElemTy, rewriter);
+    Value srcPtr = srcSmemObj.getShmemAffineBase(loc, rewriter, srcTy);
+
+    // Get dst SMEM pointer including subslice offset (will be mapa'd).
+    auto dstTy = cast<MemDescType>(op.getDst().getType());
+    auto dstLLVMElemTy = typeConverter->convertType(dstTy.getElementType());
+    auto dstSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getDst(), dstLLVMElemTy, rewriter);
+    Value dstPtr = dstSmemObj.getShmemAffineBase(loc, rewriter, dstTy);
+
+    // Get barrier SMEM base pointer (will be mapa'd to remote CTA).
+    auto barrierTy = cast<MemDescType>(op.getBarrier().getType());
+    auto barrierLLVMElemTy =
+        typeConverter->convertType(barrierTy.getElementType());
+    auto barrierSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getBarrier(), barrierLLVMElemTy, rewriter);
+    Value barrierPtr = barrierSmemObj.getBase();
+
+    // Compute copy size in bytes from the src MemDesc shape and element type.
+    int64_t numElems = 1;
+    for (auto dim : srcTy.getShape())
+      numElems *= dim;
+    Value sizeBytes =
+        b.i32_val(numElems * llvmElemTy.getIntOrFloatBitWidth() / 8);
+
+    targetInfo.copyBulkSharedToRemoteShared(
+        rewriter, loc, srcPtr, dstPtr, barrierPtr, op.getCtaRank(), sizeBytes);
     rewriter.eraseOp(op);
     return success();
   }
@@ -499,18 +646,27 @@ struct AtomicPollOpConversion
       results.assign(ptrs.size(), b.true_val());
     } else if (op->hasAttr("allocation.offset")) {
       // Reuse the existing atomic result transport for physical replicas.
-      if (isa<RankedTensorType>(op.getType())) {
-        for (Value &result : results)
-          result = b.zext(i8_ty, result);
-        results = broadcastTensorResult(op, rewriter, results, threadPred,
-                                        targetInfo);
-        for (Value &result : results)
-          result = b.trunc(i1_ty, result, LLVM::IntegerOverflowFlags::nuw);
+      if (auto tensorTy = dyn_cast<RankedTensorType>(op.getType())) {
+        SmallVector<Value> bytes;
+        for (Value result : results)
+          bytes.push_back(b.zext(i8_ty, result));
+        bytes = broadcastTensorResult(op, tensorTy, rewriter, bytes, i8_ty, b,
+                                      threadPred, targetInfo);
+        for (auto [result, byte] : llvm::zip_equal(results, bytes))
+          result = b.trunc(i1_ty, byte, LLVM::IntegerOverflowFlags::nuw);
         if (numCTAs != 1 && !atomicResultHasCTABroadcast(op))
           rendezvous();
       } else {
-        results.front() = broadcastScalarResult(op, results.front(), rewriter,
-                                                threadPred, targetInfo);
+        Value scratch =
+            LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
+        targetInfo.storeShared(rewriter, loc, scratch, results.front(),
+                               threadPred);
+        rendezvous();
+        results.front() =
+            numCTAs == 1
+                ? b.load(i1_ty, scratch)
+                : targetInfo.loadDShared(rewriter, loc, scratch, b.i32_val(0),
+                                         i1_ty, b.true_val());
       }
     } else {
       rendezvous();
@@ -594,8 +750,10 @@ struct AtomicLoadOpConversion
   matchAndRewrite(triton::AtomicLoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto sem = op.getSem();
-    insertAtomicOrderingBarriers(op, sem, rewriter, targetInfo);
+    insertAtomicOrderingBarriers(op, sem, !atomicResultHasOrderingBarrier(op),
+                                 rewriter, targetInfo);
 
     StringRef syncScope = targetInfo.getAtomicSyncScope(op.getScope());
     auto ptrElements =
@@ -608,8 +766,8 @@ struct AtomicLoadOpConversion
     Type valueElemTy =
         getTypeConverter()->convertType(getElementTypeOrSelf(resultTy));
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
-    Value threadPred =
-        ttg::emitMemoryThreadPredicate(op, freeVarMasks, rewriter, targetInfo);
+    Value threadPred = ttg::emitRedundantThreadPredicate(freeVarMasks, rewriter,
+                                                         loc, targetInfo);
     SmallVector<Value> resultVals;
     resultVals.reserve(ptrElements.size());
 
@@ -630,8 +788,8 @@ struct AtomicLoadOpConversion
     if (sem == MemSemantic::ACQUIRE)
       LLVM::FenceOp::create(rewriter, loc, LLVM::AtomicOrdering::acquire,
                             syncScope);
-    finalizeAtomicResults(op, rewriter, resultVals, threadPred, targetInfo,
-                          getTypeConverter());
+    finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, threadPred,
+                          targetInfo, getTypeConverter());
     return success();
   }
 
@@ -653,7 +811,9 @@ struct AtomicStoreOpConversion
   matchAndRewrite(triton::AtomicStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    insertAtomicOrderingBarriers(op, op.getSem(), rewriter, targetInfo);
+    insertAtomicOrderingBarriers(op, op.getSem(),
+                                 /*emitBarrierAfter=*/true, rewriter,
+                                 targetInfo);
     StringRef syncScope = targetInfo.getAtomicSyncScope(op.getScope());
     auto ptrElements =
         unpackUniqueTensorElements(loc, adaptor.getPtr(), rewriter);
@@ -664,8 +824,8 @@ struct AtomicStoreOpConversion
       maskElements =
           unpackUniqueTensorElements(loc, adaptor.getMask(), rewriter);
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
-    Value threadPred =
-        ttg::emitMemoryThreadPredicate(op, freeVarMasks, rewriter, targetInfo);
+    Value threadPred = ttg::emitRedundantThreadPredicate(freeVarMasks, rewriter,
+                                                         loc, targetInfo);
     if (op.getSem() == MemSemantic::RELEASE)
       LLVM::FenceOp::create(rewriter, loc, LLVM::AtomicOrdering::release,
                             syncScope);
@@ -698,18 +858,24 @@ private:
 void mlir::triton::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
     RewritePatternSet &patterns, ModuleAxisInfoAnalysis &axisInfoAnalysis,
-    PatternBenefit benefit) {
+    PatternBenefit benefit,
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups) {
   patterns.add<GlobalScratchAllocOpConversion>(typeConverter, targetInfo,
                                                benefit);
   patterns.add<LocalAllocOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalDeallocOpConversion>(typeConverter, benefit);
-  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit,
+                                      std::move(coordinateGroups));
   patterns.add<LocalGatherOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalScatterOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<RemoteShmemStoreOpConversion>(typeConverter, targetInfo,
+                                             benefit);
+  patterns.add<AsyncRemoteShmemStoreOpConversion>(typeConverter, targetInfo,
+                                                  benefit);
+  patterns.add<AsyncRemoteShmemCopyOpConversion>(typeConverter, targetInfo,
+                                                 benefit);
   patterns.add<BarrierOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<ThreadPredicateOpConversion, ThreadHandoffOpConversion>(
-      typeConverter, targetInfo, benefit);
   patterns.add<AtomicLoadOpConversion>(typeConverter, targetInfo,
                                        axisInfoAnalysis, benefit);
   patterns.add<AtomicPollOpConversion>(typeConverter, targetInfo, benefit);

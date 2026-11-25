@@ -1,7 +1,6 @@
 import expecttest
 import importlib.util
 import itertools
-import json
 import multiprocessing
 import os
 import re
@@ -12,17 +11,70 @@ import subprocess
 import sys
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from types import SimpleNamespace
 
 import pytest
 import torch
 
 import triton
 import triton.language as tl
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
-from triton._internal_testing import is_hip
+from triton._internal_testing import is_hip, is_cpu
 from triton.runtime.cache import FileCacheManager, RemoteCacheManager
+
+
+def test_ast_source_hash_distinguishes_optional_constexpr_positions():
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(out, FIRST: tl.constexpr = False, SECOND: tl.constexpr = False):
+        tl.store(out, 1 if FIRST else (2 if SECOND else 0))
+
+    def source(constants):
+        return ASTSource(kernel, signature={"out": "*i32"}, constexprs=constants)
+
+    # Both sources supply one True and omit the other argument's default,
+    # but they select different stores. A cache hit must distinguish them.
+    assert source({"FIRST": True}).hash() != source({"SECOND": True}).hash()
+    assert source({(1, ): True}).hash() == source({"FIRST": True}).hash()
+    assert source({"FIRST": True, "SECOND": False}).hash() == source({"SECOND": False, "FIRST": True}).hash()
+    assert source({(1, 0): True}).hash() != source({(1, 1): True}).hash()
+
+
+def test_ast_source_hash_distinguishes_constexprs_that_print_alike():
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(out, A: tl.constexpr, B: tl.constexpr):
+        tl.store(out, 1 if A == "x-y" else 2)
+
+    def source(a, b):
+        return ASTSource(kernel, signature={"out": "*i32"}, constexprs={"A": a, "B": b})
+
+    # Joined with "-", both argument lists read "x-y-z" although they select
+    # different stores (triton-lang/triton#12429).
+    assert source("x-y", "z").hash() != source("x", "y-z").hash()
+
+
+def test_file_cache_manager_writes_utf8_under_ascii_locale(tmp_path):
+    env = os.environ.copy()
+    env.update({
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PYTHONCOERCECLOCALE": "0",
+        "PYTHONUTF8": "0",
+        "TRITON_CACHE_DIR": str(tmp_path),
+    })
+    script = """
+import locale
+from pathlib import Path
+
+from triton.runtime.cache import FileCacheManager
+
+assert locale.getpreferredencoding(False) == "ANSI_X3.4-1968"
+text = "generated launcher " + chr(0x2014)
+path = FileCacheManager("unicode").put(text, "launcher.c", binary=False)
+assert Path(path).read_text(encoding="utf-8") == text
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 @pytest.mark.parametrize("backend, options_type, arch", [
@@ -783,180 +835,6 @@ def test_jit_noinline(device) -> None:
     assert inline_ttir != noinline_ttir
 
 
-class _PreloadClass:
-
-    def __init__(self, offset):
-        self.offset = offset
-
-    class Nested:
-
-        def __init__(self, offset):
-            self.offset = offset
-
-
-@triton.aggregate
-class _PreloadAggregate:
-    offset: tl.constexpr
-
-
-@triton.jit
-def _preload_function():
-    return 17
-
-
-@gluon.jit
-def _preload_gluon_function():
-    return 17
-
-
-def _serialize_constants(constants):
-    from triton.runtime.jit import serialize_specialization_data
-    return serialize_specialization_data("reference_kernel", {}, constants, {}, SimpleNamespace(), "reference-key",
-                                         SimpleNamespace(backend="cuda", arch=90, warp_size=32))
-
-
-def _preload_constants(specialization_data, monkeypatch):
-    jit = importlib.import_module("triton.runtime.jit")
-    target = SimpleNamespace(backend="cuda", arch=90, warp_size=32)
-    backend = SimpleNamespace(parse_options=lambda options: options)
-    kernel = SimpleNamespace(
-        _fn_name="reference_kernel",
-        device_caches={0: (None, None, target, backend, None)},
-        _do_compile=lambda key, signature, device, constexprs, options, attrs, warmup: constexprs,
-    )
-    monkeypatch.setattr(jit, "driver", SimpleNamespace(active=SimpleNamespace(get_current_device=lambda: 0)))
-    return jit.JITFunction.preload(kernel, specialization_data)
-
-
-@pytest.mark.parametrize(
-    "constant",
-    [int, _PreloadClass, _PreloadClass.Nested, _PreloadAggregate, _preload_function, _preload_gluon_function])
-def test_preload_reference_constants(constant, monkeypatch):
-    specialization_data = _serialize_constants({(0, ): constant})
-    constants = _preload_constants(specialization_data, monkeypatch)
-    assert constants[(0, )] is constant
-
-
-def test_preload_dtype_constant(monkeypatch):
-    specialization_data = _serialize_constants({(0, ): tl.float32})
-    assert _preload_constants(specialization_data, monkeypatch)[(0, )] == tl.float32
-
-
-def test_preload_registered_local_function(monkeypatch):
-
-    @triton.jit
-    def local_function():
-        return 17
-
-    specialization_data = _serialize_constants({(0, ): local_function})
-    assert _preload_constants(specialization_data, monkeypatch)[(0, )] is local_function
-
-
-def test_preload_class_import_in_fresh_process(tmp_path, monkeypatch):
-    module_name = "preload_class_module"
-    (tmp_path / f"{module_name}.py").write_text("class Outer:\n    class Inner:\n        pass\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    module = importlib.import_module(module_name)
-    try:
-        specialization_data = _serialize_constants({(0, ): module.Outer.Inner})
-        code = """
-import sys
-import pytest
-from test_cache import _preload_constants
-
-assert 'preload_class_module' not in sys.modules
-with pytest.MonkeyPatch.context() as patch:
-    constants = _preload_constants(sys.stdin.read(), patch)
-import preload_class_module
-assert constants[(0,)] is preload_class_module.Outer.Inner
-"""
-        env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(pathlib.Path(__file__).parent), *sys.path]))
-        subprocess.run([sys.executable, "-c", code], input=specialization_data, text=True, env=env, check=True,
-                       timeout=60)
-    finally:
-        sys.modules.pop(module_name, None)
-
-
-@pytest.mark.parametrize("class_key, message", [
-    ("builtins:MissingClass", "Unable to resolve class"),
-    ("builtins:len", "Expected class"),
-])
-def test_preload_invalid_class_reference(class_key, message, monkeypatch):
-    specialization_data = json.loads(_serialize_constants({(0, ): int}))
-    specialization_data["constant_vals"][0]["class"] = class_key
-    with pytest.raises(RuntimeError, match=message):
-        _preload_constants(json.dumps(specialization_data), monkeypatch)
-
-
-def test_preload_local_class_reference(monkeypatch):
-
-    class Local:
-        pass
-
-    specialization_data = _serialize_constants({(0, ): Local})
-    with pytest.raises(RuntimeError, match="Unable to resolve class.*<locals>.Local"):
-        _preload_constants(specialization_data, monkeypatch)
-
-
-@pytest.mark.parametrize("cls", [_PreloadClass, _PreloadClass.Nested, _PreloadAggregate])
-def test_preload_class_kernel(cls, device, fresh_triton_cache, fresh_knobs):
-
-    @triton.jit
-    def kernel(out, cls: tl.constexpr):
-        tl.store(out, cls(17).offset)
-
-    specializations = []
-
-    def cache_hook(**kwargs):
-        specializations.append(kwargs["compile"]["specialization_data"])
-
-    fresh_knobs.runtime.jit_cache_hook = cache_hook
-    fresh_knobs.runtime.jit_post_compile_hook = cache_hook
-    output = torch.empty((), device=device, dtype=torch.int32)
-    compiled = kernel[(1, )](output, cls)
-    assert output.item() == 17
-    assert len(specializations) == 2
-    assert specializations[0] == specializations[1]
-
-    shutil.rmtree(fresh_triton_cache)
-    kernel.device_caches.clear()
-    preloaded = kernel.preload(specializations[0])
-    assert preloaded.hash == compiled.hash
-    output.zero_()
-    assert kernel[(1, )](output, cls) is preloaded
-    assert output.item() == 17
-    assert len(specializations) == 4
-
-
-def test_preload_gluon_function_kernel(device, fresh_triton_cache, fresh_knobs):
-
-    @gluon.jit
-    def kernel(out, fn: gl.constexpr):
-        gl.store(out, fn())
-
-    specializations = []
-
-    def cache_hook(**kwargs):
-        specializations.append(kwargs["compile"]["specialization_data"])
-
-    fresh_knobs.runtime.jit_cache_hook = cache_hook
-    fresh_knobs.runtime.jit_post_compile_hook = cache_hook
-    output = torch.empty((), device=device, dtype=torch.int32)
-    compiled = kernel[(1, )](output, _preload_gluon_function)
-    assert output.item() == 17
-    assert len(specializations) == 2
-    assert specializations[0] == specializations[1]
-
-    shutil.rmtree(fresh_triton_cache)
-    kernel.device_caches.clear()
-    preloaded = kernel.preload(specializations[0])
-    assert preloaded.hash == compiled.hash
-    output.zero_()
-    assert kernel[(1, )](output, _preload_gluon_function) is preloaded
-    assert output.item() == 17
-    assert len(specializations) == 4
-
-
 def test_preload(device, fresh_triton_cache) -> None:
 
     @triton.jit
@@ -1109,15 +987,12 @@ def test_hooks(device, fresh_triton_cache) -> None:
 
 @pytest.mark.skipif(reason="within_2g is a HIP specific optimization", condition=not is_hip())
 def test_within_2gb(device, fresh_triton_cache) -> None:
-    default_buffer_ops = os.environ.get("AMDGCN_USE_BUFFER_OPS")
-    try:
-        use_buffer_ops_opts = ["1", "0"]
+    with triton.knobs.amd.scope():
+        use_buffer_ops_opts = [True, False]
         # The ranges should only be available when buffer ops are enabled
         pointer_ranges = [[(0, )], []]
         for use_buffer_ops, pointer_range in zip(use_buffer_ops_opts, pointer_ranges):
-            # Set AMDGCN_USE_BUFFER_OPS
-            os.environ["AMDGCN_USE_BUFFER_OPS"] = use_buffer_ops
-            triton.knobs.refresh_knobs()
+            triton.knobs.amd.use_buffer_ops = use_buffer_ops
 
             @triton.jit
             def kernel_add(a):
@@ -1142,12 +1017,25 @@ def test_within_2gb(device, fresh_triton_cache) -> None:
             # Torch tensor <= 2GB
             kernel_add[(1, 0)](torch.empty(2**31 - 1, dtype=torch.int8, device=device))
             assert pointer_range_32 == pointer_range
-    finally:
-        if default_buffer_ops is None:
-            os.environ.pop("AMDGCN_USE_BUFFER_OPS", None)
-        else:
-            os.environ["AMDGCN_USE_BUFFER_OPS"] = default_buffer_ops
-        triton.knobs.refresh_knobs()
+
+        with triton.knobs.runtime.scope():
+            # The C cache must distinguish HIP's storage-size specializations.
+            triton.knobs.runtime.jit_cache_hook = None
+            triton.knobs.amd.use_buffer_ops = True
+
+            @triton.jit(c_cache=True)
+            def kernel_add_with_c_cache(a):
+                tl.load(a)
+
+            launch = kernel_add_with_c_cache[(1, 0)]
+            launch(torch.empty(2**31 - 1, dtype=torch.int8, device=device))
+            assert kernel_add_with_c_cache.c_cache is True
+            device_id = getattr(torch, device).current_device()
+            kernel_cache = kernel_add_with_c_cache.device_caches[device_id][0]
+            assert len(kernel_cache) == 1
+
+            launch(torch.empty(2**31, dtype=torch.int8, device=device))
+            assert len(kernel_cache) == 2
 
 
 def test_function_arguments(device):
@@ -1325,30 +1213,129 @@ def test_higher_order_kernel(device, fresh_triton_cache, capsys):
         val = FUNC()
         tl.store(out_ptr, val)
 
-    output = torch.empty((), device=device, dtype=torch.int32)
-    kernel[(1, )](output, fn_a)
-    assert output.item() == 0
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
 
-    # Test we can update src in-place
-    orig_src = fn_a.src
-    new_src = orig_src.replace("with fn_a", "with fn_a after modification")
-    new_src = new_src.replace("0", "1")
-    fn_a._unsafe_update_src(new_src)
-    kernel[(1, )](output, fn_a)
-    assert output.item() == 1
+        output = torch.empty((), device=device, dtype=torch.int32)
+        kernel[(1, )](output, fn_a)
+        assert output.item() == 0
 
-    # Test that the on disc cache works
-    kernel.device_caches.clear()
-    kernel[(1, )](output, fn_a)
-    assert output.item() == 1
+        # Test we can update src in-place
+        orig_src = fn_a.src
+        new_src = orig_src.replace("with fn_a", "with fn_a after modification")
+        new_src = new_src.replace("0", "1")
+        fn_a._unsafe_update_src(new_src)
+        kernel[(1, )](output, fn_a)
+        assert output.item() == 1
 
-    fn_a._unsafe_update_src(orig_src)
-    kernel[(1, )](output, fn_a)
-    assert output.item() == 0
+        # Test that the on disc cache works
+        kernel.device_caches.clear()
+        kernel[(1, )](output, fn_a)
+        assert output.item() == 1
+
+        fn_a._unsafe_update_src(orig_src)
+        kernel[(1, )](output, fn_a)
+        assert output.item() == 0
 
     expecttest.assert_expected_inline(capsys.readouterr().out, """\
 Compiling with fn_a
 Compiling with fn_a after modification
+""")
+
+
+def test_fast_path_disk_cache_unaffected(device, fresh_triton_cache, capsys):
+    """Verify the fast-path changes do not alter on-disk caching behaviour.
+
+    After wiping all in-memory caches (device_caches.clear()), kernels that
+    were previously compiled must still be served from the on-disk cache
+    without triggering recompilation.
+    """
+
+    @triton.jit
+    def fn_ret0():
+        tl.static_print("compiling fn_ret0")
+        return 0
+
+    @triton.jit
+    def fn_ret1():
+        tl.static_print("compiling fn_ret1")
+        return 1
+
+    @triton.jit
+    def caller(out_ptr, FUNC: tl.constexpr) -> None:
+        tl.store(out_ptr, FUNC())
+
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
+
+        output = torch.empty((), device=device, dtype=torch.int32)
+
+        # First call: compiles and stores on disk.
+        caller[(1, )](output, fn_ret0)
+        assert output.item() == 0
+
+        # Second call with a different constexpr: compiles again.
+        caller[(1, )](output, fn_ret1)
+        assert output.item() == 1
+
+        # Wipe all in-memory caches — only the disk cache remains.
+        caller.device_caches.clear()
+
+        # Both should be served from the on-disk cache (no new compilations).
+        caller[(1, )](output, fn_ret0)
+        assert output.item() == 0
+        caller[(1, )](output, fn_ret1)
+        assert output.item() == 1
+
+    # Exactly two compilations, both from the first round.
+    expecttest.assert_expected_inline(capsys.readouterr().out, """\
+compiling fn_ret0
+compiling fn_ret1
+""")
+
+
+def test_fast_path_source_swap(device, fresh_triton_cache, capsys):
+    """Verify in-memory caching works correctly when swapping between source
+    implementations via ``_unsafe_update_src``.
+
+    Swapping A→B→A must re-use the original compiled kernel from the
+    on-disk cache without triggering a third compilation.
+    """
+
+    @triton.jit
+    def fn():
+        tl.static_print("compiling v0")
+        return 0
+
+    @triton.jit
+    def kernel(out_ptr, FUNC: tl.constexpr) -> None:
+        tl.store(out_ptr, FUNC())
+
+    with (compilation := triton.knobs.compilation).scope():
+        compilation.always_compile = False
+
+        output = torch.empty((), device=device, dtype=torch.int32)
+
+        # v0: first compilation
+        kernel[(1, )](output, fn)
+        assert output.item() == 0
+
+        # Switch to v1
+        orig_src = fn.src
+        v1_src = orig_src.replace("compiling v0", "compiling v1").replace("return 0", "return 1")
+        fn._unsafe_update_src(v1_src)
+        kernel[(1, )](output, fn)
+        assert output.item() == 1
+
+        # Switch back to v0 — should hit the on-disk cache (no recompilation)
+        fn._unsafe_update_src(orig_src)
+        kernel[(1, )](output, fn)
+        assert output.item() == 0
+
+    # Only two compilations: v0 and v1.  The final v0 call is a disk-cache hit.
+    expecttest.assert_expected_inline(capsys.readouterr().out, """\
+compiling v0
+compiling v1
 """)
 
 
@@ -1412,6 +1399,8 @@ def test_preload_higher_order_kernels(device, fresh_triton_cache) -> None:
 
 
 def test_module_load_unload(device, fresh_knobs):
+    if is_cpu():
+        pytest.xfail("Requires CUDA; unclear whether applicable to CPU backend")
 
     @triton.jit
     def kernel(out_ptr, val) -> None:
@@ -1451,3 +1440,77 @@ def test_module_load_unload(device, fresh_knobs):
     assert pre_compile.module is None
     # turn on garbage collector
     gc.enable()
+
+
+def test_module_unload_uses_loading_driver(monkeypatch, fresh_knobs):
+    from types import SimpleNamespace
+    from triton.compiler import compiler
+
+    module = object()
+    function = object()
+    loading_driver_unloads = []
+    current_driver_unloads = []
+
+    loading_driver = SimpleNamespace(
+        get_current_device=lambda: 0,
+        get_current_target=lambda: SimpleNamespace(warp_size=32),
+        launcher_cls=lambda src, metadata: object(),
+        utils=SimpleNamespace(
+            load_binary=lambda *args: (module, function, 0, 0, 1024),
+            unload_module=loading_driver_unloads.append,
+        ),
+    )
+    current_driver = SimpleNamespace(utils=SimpleNamespace(unload_module=current_driver_unloads.append), )
+
+    compiled = object.__new__(compiler.CompiledKernel)
+    compiled.src = object()
+    # fbtriton-only: _build_dispatcher reads metadata.target.
+    compiled.metadata = SimpleNamespace(shared=0, num_warps=1, target=None, warp_size=32)
+    compiled.metadata_group = {}
+    compiled.hash = "hash"
+    compiled.name = "kernel"
+    compiled.kernel = b"binary"
+    compiled.module = None
+    compiled.function = None
+    compiled._run = None
+
+    monkeypatch.setattr(compiler, "_max_shared_mem", lambda device, driver_utils: 1024)
+    monkeypatch.setattr(compiler.driver, "_active", loading_driver)
+
+    compiled._init_handles()
+    compiler.driver.set_active(current_driver)
+    compiled.__del__()
+
+    assert loading_driver_unloads == [module]
+    assert current_driver_unloads == []
+    assert compiled.module is None
+
+
+def test_max_shared_mem_cache_is_driver_specific(monkeypatch):
+    from types import SimpleNamespace
+    from triton.compiler import compiler
+
+    class DriverUtils:
+
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def get_device_properties(self, device):
+            self.calls += 1
+            return {"max_shared_mem": self.value}
+
+    cpu_utils = DriverUtils(0)
+    gpu_utils = DriverUtils(65536)
+    compiler._max_shared_mem.cache_clear()
+
+    monkeypatch.setattr(compiler.driver, "_active", SimpleNamespace(utils=cpu_utils))
+    assert compiler.max_shared_mem(0) == 0
+    compiler.driver.set_active(SimpleNamespace(utils=gpu_utils))
+    assert compiler.max_shared_mem(0) == 65536
+    compiler.driver.set_active(SimpleNamespace(utils=cpu_utils))
+    assert compiler.max_shared_mem(0) == 0
+    assert cpu_utils.calls == 1
+    assert gpu_utils.calls == 1
+
+    compiler._max_shared_mem.cache_clear()

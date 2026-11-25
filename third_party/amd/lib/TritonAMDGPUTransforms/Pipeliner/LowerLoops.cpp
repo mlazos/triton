@@ -4,6 +4,7 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
+#include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Pipeliner/PipelineUtility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -183,13 +184,13 @@ LogicalResult initSchedule(int maxDist, Stages &stages, int numStages,
   // the tt.dot that consumes it, so the LDS read of the next K-tile overlaps
   // the current tile's matrix op. for num_stages<3 there is no room to separate
   // them.
-  // This applies to tt.dot_scaled as well: its operand local_loads are hoisted
-  // the same way, and the scale operands follow whichever stage their own
-  // local_load lands in.
+  // We take a conservative route and only enable LDS prefetch when the dot is
+  // not scaled until more testing is done.
   // waitAtTail (pingpong) requires very specific scheduling, which is
   // incompatible with the prefetch cluster ordering below, so disable prefetch
   // in that case.
-  bool ldsPrefetch = hasTDMLoad && numStages >= 3 && !waitAtTail;
+  bool ldsPrefetch =
+      hasTDMLoad && !hasScaledDot && numStages >= 3 && !waitAtTail;
   if (ldsPrefetch) {
     stages[SCHED_LOCAL_LOAD] = lastStage - 1;
   }
@@ -278,22 +279,13 @@ LogicalResult initSchedule(int maxDist, Stages &stages, int numStages,
     localStoreCluster = 4;
   }
 
-  // TDM copy reordering to improve latency hiding. Only for the stage schedules
-  // LDS prefetch does not already cover (i.e. numStages < 3), since the
-  // prefetch ordering above subsumes it and must not be overwritten here.
-  bool tdmReorder = hasTDMLoad && hasScaledDot && !waitAtTail && !ldsPrefetch;
+  // TDM copy reordering to improve latency hiding.
+  bool tdmReorder = hasTDMLoad && hasScaledDot && !waitAtTail;
   if (tdmReorder) {
     globalLoadCluster = 0; // all TDM copies first
     asyncWaitCluster = 1;  // single wait after the copies
     localLoadCluster = 2;  // local_loads after the wait
     computeCluster = 3;    // dot_scaled last
-    localStoreCluster = 4;
-  }
-
-  // Place synchronous LDS writes after the tail wait so Membar can rendezvous
-  // before issuing them. Preserve same-stage store-to-load ordering.
-  if (waitAtTail && stages[SCHED_LOCAL_STORE] < stages[SCHED_LOCAL_LOAD]) {
-    asyncWaitCluster = 3;
     localStoreCluster = 4;
   }
 
@@ -622,6 +614,18 @@ static void lowerLoop(scf::ForOp forOp,
                                   load, axisInfoAnalysis, targetFeatures,
                                   targetInfo, useAsyncCopy)
                                   .value_or(nullptr);
+        // local_store can't take a mixed-radix layout, so only an async copy
+        // can fill an NPOT stage; otherwise the load stays in registers.
+        auto loadOp = dyn_cast<tt::LoadOp>(load);
+        if (sharedEncoding && loadOp &&
+            ttg::getNpotLayoutUnsupportedReason(
+                OperationName(ttg::LocalStoreOp::getOperationName(),
+                              load->getContext()),
+                load->getResultTypes()) &&
+            !(useAsyncCopy &&
+              canBeConvertedToAsyncLoad(2, loadOp, sharedEncoding,
+                                        axisInfoAnalysis, targetInfo)))
+          sharedEncoding = nullptr;
         loadToInfo[load] = {sharedEncoding, distance, use};
         LDBG("Populate loadInfo with shared encoding: " << sharedEncoding);
       }
@@ -632,6 +636,12 @@ static void lowerLoop(scf::ForOp forOp,
                                                              loadToInfo))) {
     ChainedDotSchedule::updateSchedule(forOp, loadToInfo, schedule,
                                        axisInfoAnalysis, useAsyncCopy);
+    // Record the schedule that was actually materialized. BlockPingpong cannot
+    // infer it from the number of dot-like operations because the single-dot
+    // and two-dot layouts can contain the same operations.
+    if (usePingpong)
+      forOp->setAttr(triton::AMD::AttrTwoDotSchedule,
+                     UnitAttr::get(forOp.getContext()));
   } else {
     SingleDotSchedule::updateSchedule(forOp, loadToInfo, schedule,
                                       axisInfoAnalysis, useAsyncCopy,

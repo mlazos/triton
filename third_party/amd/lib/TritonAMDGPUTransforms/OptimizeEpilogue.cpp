@@ -62,7 +62,8 @@ bool isOneOperandElementwiseOp(Operation *op) {
 // Returns null store op if not suitable.
 static triton::StoreOp
 usePermlaneSwapToOptimizeStore(PatternRewriter &rewriter, Value ptr, Value val,
-                               Value mask, triton::StoreOp oldStoreOp) {
+                               Value mask, triton::StoreOp oldStoreOp,
+                               bool rematerializeCoordinates) {
   auto ptrType = cast<RankedTensorType>(ptr.getType());
   auto valType = cast<RankedTensorType>(val.getType());
 
@@ -80,8 +81,10 @@ usePermlaneSwapToOptimizeStore(PatternRewriter &rewriter, Value ptr, Value val,
                                                       newPtrType, ptr);
 
   auto newValType = valType.cloneWithEncoding(newEncoding);
-  Value newVal = triton::gpu::ConvertLayoutOp::create(rewriter, val.getLoc(),
-                                                      newValType, val);
+  auto newVal = triton::gpu::ConvertLayoutOp::create(rewriter, val.getLoc(),
+                                                     newValType, val);
+  if (rematerializeCoordinates)
+    newVal->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
 
   Value newMask = mask;
   if (mask) {
@@ -95,70 +98,6 @@ usePermlaneSwapToOptimizeStore(PatternRewriter &rewriter, Value ptr, Value val,
       rewriter, oldStoreOp.getLoc(), newPtr, newVal, newMask,
       oldStoreOp.getCachePolicyAttr(), oldStoreOp.getIgnoreCta());
   return newStore;
-}
-
-// Whether issuing the store directly in the layout of `srcType` is worth
-// skipping the relayout into the coalesced layout of `dstType`, the type the
-// original store used.
-//
-// For an MMA source it always is: the relayout is a pure LDS round trip and
-// the MFMA/WMMA layouts store acceptably.
-//
-// For any other distributed source it is profitable when the store stays as
-// wide and as coalesced as it would be in the layout of `dstType`, without
-// needing more store instructions.
-static bool isProfitableBypassSource(RankedTensorType srcType,
-                                     RankedTensorType dstType) {
-  Attribute srcEncoding = srcType.getEncoding();
-  Attribute dstEncoding = dstType.getEncoding();
-  if (!srcEncoding || !dstEncoding)
-    return false;
-
-  // If the source is MMA, it is always profitable. If not (FMA), we check
-  // several things like contiguity, number of stores, etc.
-  if (isa<triton::gpu::MmaEncodingTrait>(srcEncoding))
-    return true;
-
-  if (!isa<triton::gpu::DistributedEncodingTrait>(srcEncoding) ||
-      !isa<triton::gpu::DistributedEncodingTrait>(dstEncoding))
-    return false;
-
-  // A source replicated across more lanes, warps or registers than the
-  // destination (e.g. a slice layout from a reduction) holds more elements
-  // per thread, so it would need more store instructions even with the same
-  // contiguous run.
-  if (triton::gpu::getTotalElemsPerThread(srcType) >
-      triton::gpu::getTotalElemsPerThread(dstType))
-    return false;
-
-  // A differing fastest-varying dimension would make the store run in a
-  // different axis, so the contiguous runs are not comparable.
-  const unsigned contigDim = triton::gpu::getOrder(srcType)[0];
-  if (contigDim != triton::gpu::getOrder(dstType)[0])
-    return false;
-
-  // Since we are considering using the src layout, make sure that
-  // lanes in that layout write to consecutive addresses.
-  if (triton::gpu::getThreadOrder(srcType)[0] != contigDim)
-    return false;
-
-  // Make sure that using the src layout would not increase the store count.
-  // A store is at most 128 bits wide, so we cap the dst run at the number of
-  // elements that fit in it (4 for f32, 8 for f16): a src run of 8 f16 against
-  // a dst run of 16 needs no more stores, since neither can write more than 8
-  // elements at a time, and rejecting it would keep the LDS round trip for a
-  // penalty the hardware does not have.
-  Type elemType = dstType.getElementType();
-  if (!elemType.isIntOrFloat())
-    return false;
-
-  const unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
-  const unsigned maxElems = std::max(128u / elemBitWidth, 1u);
-  const unsigned srcContig =
-      triton::gpu::getContigPerThread(srcType)[contigDim];
-  const unsigned dstContig =
-      triton::gpu::getContigPerThread(dstType)[contigDim];
-  return srcContig >= std::min(dstContig, maxElems);
 }
 
 // convert(val) : xmma -> blocked
@@ -176,9 +115,7 @@ static bool isProfitableBypassSource(RankedTensorType srcType,
 //
 // Store with xmma layout directly
 //
-// xmma layout is either MFMA or WMMA, or another distributed layout (e.g. the
-// blocked layout of an FMA dot) when that keeps the store as wide as the
-// coalesced layout would.
+// xmma layout is either MFMA or WMMA
 class BypassEpilogueSMEM : public mlir::OpRewritePattern<triton::StoreOp> {
 
 public:
@@ -193,8 +130,19 @@ public:
     Value mask = stOp.getMask();
     auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
     auto valType = dyn_cast<RankedTensorType>(val.getType());
-    if (!ptrType || !valType ||
-        !isa<triton::gpu::BlockedEncodingAttr>(ptrType.getEncoding()) ||
+    if (!ptrType || !valType)
+      return mlir::failure();
+    // Respect a user-pinned store layout (PinnedEncodingTrait, e.g. TLX's
+    // #tlx.user_layout): the author chose this store layout deliberately, so do
+    // not rewrite it to the MMA accumulator layout. Mirrors Coalesce /
+    // RemoveLayoutConversions / OptimizeTMemLayouts, which already anchor on
+    // this trait (D112032532).
+    if (isa_and_nonnull<triton::gpu::PinnedEncodingTrait>(
+            valType.getEncoding()) ||
+        isa_and_nonnull<triton::gpu::PinnedEncodingTrait>(
+            ptrType.getEncoding()))
+      return mlir::failure();
+    if (!isa<triton::gpu::BlockedEncodingAttr>(ptrType.getEncoding()) ||
         !isa<triton::gpu::BlockedEncodingAttr>(valType.getEncoding()))
       return mlir::failure();
 
@@ -216,8 +164,11 @@ public:
     auto cvtOp = val.getDefiningOp<triton::gpu::ConvertLayoutOp>();
     if (!cvtOp)
       return mlir::failure();
+    bool rematerializeCoordinates =
+        cvtOp->hasAttr("tlx.rematerialize_coordinates");
 
-    if (!isProfitableBypassSource(cvtOp.getSrc().getType(), valType))
+    auto encoding = cvtOp.getSrc().getType().getEncoding();
+    if (!isa<triton::gpu::MmaEncodingTrait>(encoding))
       return mlir::failure();
 
     if (!cvtOp.getResult().hasOneUse())
@@ -250,8 +201,8 @@ public:
       newMask = triton::gpu::ConvertLayoutOp::create(rewriter, mask.getLoc(),
                                                      newMaskType, mask);
     }
-    triton::StoreOp newStoreOp =
-        usePermlaneSwapToOptimizeStore(rewriter, newPtr, newVal, newMask, stOp);
+    triton::StoreOp newStoreOp = usePermlaneSwapToOptimizeStore(
+        rewriter, newPtr, newVal, newMask, stOp, rematerializeCoordinates);
     if (!newStoreOp) {
       newStoreOp = triton::StoreOp::create(
           rewriter, stOp.getLoc(), newPtr, newVal, newMask,

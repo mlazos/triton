@@ -108,13 +108,12 @@ public:
       if (!dir.empty() && libraryName.find('/') == std::string::npos) {
         auto fullPath = dir + "/" + libraryName;
         *lib = dlopen(fullPath.c_str(), RTLD_LOCAL | RTLD_LAZY);
-      } else {
-        // Only if the default path is not set, we try to load it from the
-        // system.
-        // First reuse the existing handle
+      }
+      if (*lib == nullptr) {
+        // Fall back to system search: first reuse an existing handle,
+        // then try LD_LIBRARY_PATH (or the explicit path in libraryName).
         *lib = dlopen(libraryName.c_str(), RTLD_NOLOAD);
         if (*lib == nullptr) {
-          // If not found, try to load it from LD_LIBRARY_PATH
           *lib = dlopen(libraryName.c_str(), RTLD_LOCAL | RTLD_LAZY);
         }
       }

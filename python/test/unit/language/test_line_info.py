@@ -7,7 +7,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_interpreter
+from triton._internal_testing import is_cuda, is_hopper_or_newer, is_interpreter
 from triton._filecheck import run_filecheck
 
 
@@ -82,12 +82,13 @@ def get_disassembler_command_and_debug_line_format():
     """
     backend = triton.runtime.driver.active.get_current_target().backend
 
-    if backend == "cuda":
+    if triton.runtime.driver.active.get_current_target().is_cuda_backend():
         nvdisasm = triton.knobs.nvidia.nvdisasm.path
         return ("cubin", [nvdisasm, "-g"], "## File", ",")
 
     if backend == "hip":
         import shutil
+
         # Try to find llvm-objdump from the current PATH to disassmble hsaco.
         tool = shutil.which("llvm-objdump")
         if tool is not None:
@@ -99,7 +100,7 @@ def get_disassembler_command_and_debug_line_format():
 
 def extract_file_lines(command, anchor, separator, asm):
     fd, path = tempfile.mkstemp()
-    with open(fd, 'wb') as cubin:
+    with open(fd, "wb") as cubin:
         cubin.write(asm)
     asm = subprocess.check_output(command + [path]).decode("utf-8")
     file_lines = []
@@ -131,39 +132,13 @@ def check_file_lines(file_lines, file_name, lineno, should_contain=True):
     return not should_contain
 
 
-def unwrap_python_function(fn):
-    while not inspect.isfunction(fn) and hasattr(fn, "fn"):
-        fn = fn.fn
-    return fn
-
-
-def source_line_number(fn, snippet):
-    py_fn = unwrap_python_function(fn)
-    lines, start_line = inspect.getsourcelines(py_fn)
-    for offset, line in enumerate(lines):
-        if snippet in line:
-            return start_line + offset
-    raise AssertionError(f"could not find {snippet!r} in source for {py_fn.__name__}")
-
-
-def source_def_line_number(fn):
-    py_fn = unwrap_python_function(fn)
-    return source_line_number(py_fn, f"def {py_fn.__name__}")
-
-
-def substitute_source_line_numbers(template, fn, **snippets):
-    for name, snippet in snippets.items():
-        template = template.replace(f"@{name}@", str(source_line_number(fn, snippet)))
-    return template
-
-
 func_types = ["single", "call", "call_noinline", "autotune", "dot_combine", "cdiv"]
 
 
 @pytest.mark.parametrize("func", func_types)
 def test_line_info(func: str):
     try:
-        obj_kind, command, anchor, separator = get_disassembler_command_and_debug_line_format()
+        obj_kind, command, anchor, separator = (get_disassembler_command_and_debug_line_format())
     except BaseException:
         pytest.skip("disassembler is not available")
 
@@ -184,27 +159,24 @@ def test_line_info(func: str):
 
     file_lines = extract_file_lines(command, anchor, separator, kernel_info.asm[obj_kind])
     if func == "single":
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_single, "x = tl.load")))
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_single, "tl.store")))
+        assert check_file_lines(file_lines, "test_line_info.py", 16)
+        assert check_file_lines(file_lines, "test_line_info.py", 17)
     elif func == "call":
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_call, "x = tl.load")))
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_call, "tl.store")))
+        assert check_file_lines(file_lines, "test_line_info.py", 27)
+        assert check_file_lines(file_lines, "test_line_info.py", 29)
     elif func == "call_noinline":
-        assert (check_file_lines(file_lines, "test_line_info.py",
-                                 source_line_number(kernel_call_noinline, "device_noinline")))
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(device_noinline, "x = tl.load")))
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(device_noinline, "tl.store")))
+        assert check_file_lines(file_lines, "test_line_info.py", 41)
+        assert check_file_lines(file_lines, "test_line_info.py", 34)
+        assert check_file_lines(file_lines, "test_line_info.py", 34)
     elif func == "autotune":
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_autotune, "for i in range"))
-                or check_file_lines(file_lines, "test_line_info.py", source_def_line_number(kernel_autotune)))
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_autotune, "x = tl.load")))
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_autotune, "tl.store")))
+        assert check_file_lines(file_lines, "test_line_info.py", 52)
+        assert check_file_lines(file_lines, "test_line_info.py", 53)
+        assert check_file_lines(file_lines, "test_line_info.py", 54)
     elif func == "dot_combine":
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_dot_combine, "d = tl.dot")))
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_dot_combine, "d = d + c"),
-                                 should_contain=False))
+        assert check_file_lines(file_lines, "test_line_info.py", 64)
+        assert check_file_lines(file_lines, "test_line_info.py", 65, should_contain=False)
     elif func == "cdiv":
-        assert (check_file_lines(file_lines, "test_line_info.py", source_line_number(kernel_cdiv, "tl.device_print")))
+        assert check_file_lines(file_lines, "test_line_info.py", 74)
 
 
 @pytest.mark.interpreter
@@ -214,19 +186,25 @@ def test_line_info_interpreter(func: str):
         pytest.skip("interpreter is not enabled")
 
     kernel = None
+    expected_def_lineno = 0
     if func == "single":
         kernel = kernel_single
+        expected_def_lineno = 15
     elif func == "call":
         kernel = kernel_call
+        expected_def_lineno = 26
     elif func == "call_noinline":
         kernel = kernel_call_noinline
+        expected_def_lineno = 40
     elif func == "autotune":
         kernel = kernel_autotune.fn
+        expected_def_lineno = 51
     elif func == "dot_combine":
         kernel = kernel_dot_combine
+        expected_def_lineno = 61
     elif func == "cdiv":
         kernel = kernel_cdiv
-    expected_def_lineno = source_def_line_number(kernel)
+        expected_def_lineno = 71
     kernel.rewrite()
     assert kernel.rewriter.def_file_lineno == expected_def_lineno
 
@@ -234,7 +212,7 @@ def test_line_info_interpreter(func: str):
 @pytest.mark.parametrize("status", ["0", "1"])
 def test_line_info_env(monkeypatch, status: str):
     try:
-        obj_kind, command, anchor, separator = get_disassembler_command_and_debug_line_format()
+        obj_kind, command, anchor, separator = (get_disassembler_command_and_debug_line_format())
     except BaseException:
         pytest.skip("disassembler is not available")
 
@@ -250,7 +228,7 @@ def test_line_info_env(monkeypatch, status: str):
 @pytest.mark.parametrize("status", ["ttir", ""])
 def test_line_info_ir_source(monkeypatch, status, tmp_path, fresh_triton_cache):
     try:
-        obj_kind, command, anchor, separator = get_disassembler_command_and_debug_line_format()
+        obj_kind, command, anchor, separator = (get_disassembler_command_and_debug_line_format())
     except BaseException:
         pytest.skip("disassembler is not available")
 
@@ -273,24 +251,20 @@ def test_line_info_ir_source(monkeypatch, status, tmp_path, fresh_triton_cache):
     kernel_info = triton.compile(str(temp_file))
     file_lines = extract_file_lines(command, anchor, separator, kernel_info.asm[obj_kind])
     if status == "ttir":
-        assert check_file_lines(file_lines, "/path/test.py", 8, should_contain=False)
-        assert check_file_lines(file_lines, str(temp_file), -1, should_contain=True)
+        assert check_file_lines(file_lines, "<source>/test.py", 8, should_contain=False)
+        assert check_file_lines(file_lines, "<source>/test.ttir", 3)
     else:
-        if obj_kind == "cubin":
-            # Recent ptxas versions can coalesce this minimal load-store
-            # sequence under the store line in SASS, even though the PTX still
-            # carries the load line.
-            assert (check_file_lines(file_lines, "/path/test.py", 8, should_contain=True)
-                    or check_file_lines(file_lines, "/path/test.py", 9, should_contain=True))
-        else:
-            assert check_file_lines(file_lines, "/path/test.py", 8, should_contain=True)
+        # The scalar load may be folded into the store, dropping line 8 debug
+        # info. This already happened on AMD and now also happens on NVIDIA with
+        # newer LLVM, so only verify file-level info is present.
+        assert check_file_lines(file_lines, "<source>/test.py", -1)
 
 
 def test_use_name_loc_as_prefix(fresh_triton_cache):
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":@DEF_LINE@:5)
+        # CHECK: #loc = loc("{{.*}}":266:5)
         # CHECK-LABEL:  tt.func public @kernel_basic(
         # CHECK-SAME:                                %src: !tt.ptr<f32> loc("src"(#loc)), %N: i32 loc("N"(#loc)))
         # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc11)
@@ -336,11 +310,13 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         tl.store(load_src_store_dst, x_plus_1, mask=mask)
 
     h = triton.compile(
-        triton.compiler.ASTSource(fn=kernel_basic, signature={"src": "*fp32", "N": "i32", "BLOCK_SIZE": "constexpr"},
-                                  constexprs={"BLOCK_SIZE": 16}))
+        triton.compiler.ASTSource(
+            fn=kernel_basic,
+            signature={"src": "*fp32", "N": "i32", "BLOCK_SIZE": "constexpr"},
+            constexprs={"BLOCK_SIZE": 16},
+        ))
 
-    check_template = substitute_source_line_numbers(inspect.getsource(kernel_basic.fn), kernel_basic,
-                                                    DEF_LINE="def kernel_basic")
+    check_template = inspect.getsource(kernel_basic.fn)
     run_filecheck("placeholder", h.asm["ttir"], check_template)
 
     if is_hopper_or_newer():
@@ -357,8 +333,11 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
             foo
 
         h = triton.compile(
-            triton.compiler.ASTSource(fn=kernel_tensordesc_param, signature={"foo": "tensordesc<fp16[32,64]>"},
-                                      constexprs={}))
+            triton.compiler.ASTSource(
+                fn=kernel_tensordesc_param,
+                signature={"foo": "tensordesc<fp16[32,64]>"},
+                constexprs={},
+            ))
 
         check_template = inspect.getsource(kernel_tensordesc_param.fn)
         run_filecheck("placeholder", h.asm["ttir"], check_template)
@@ -410,7 +389,11 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         tl.device_print("", arange)
 
     h = triton.compile(
-        triton.compiler.ASTSource(fn=kernel_basic_for_loop_with_block_args, signature={"N": "i32"}, constexprs={}))
+        triton.compiler.ASTSource(
+            fn=kernel_basic_for_loop_with_block_args,
+            signature={"N": "i32"},
+            constexprs={},
+        ))
 
     check_template = inspect.getsource(kernel_basic_for_loop_with_block_args.fn)
     run_filecheck("placeholder", h.asm["ttir"], check_template)
@@ -472,20 +455,22 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         # CHECK: %arange = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
         arange = tl.arange(0, 16)
         ivar = 0
-        # CHECK: %ivar_[[IV0:.+]]:2 = scf.while (%arange_[[AR0:.+]] = %arange, %ivar_[[IV1:.+]] = %ivar) : (tensor<16xi32>, i32) -> (tensor<16xi32>, i32)
-        # CHECK: %[[COND:.*]] = arith.cmpi slt, %ivar_[[IV1]], %N : i32
-        # CHECK: scf.condition(%[[COND]]) %arange_[[AR0]], %ivar_[[IV1]] : tensor<16xi32>, i32
+        # This loop is provably countable (monotone `ivar += 1` induction against
+        # the loop-invariant bound `ivar < N`), so the `triton-uplift-while-to-for`
+        # pass rewrites it into an equivalent `scf.for` — that way it can benefit
+        # from the for-loop optimization pipeline (software pipelining, etc.) that
+        # doesn't run on `scf.while`. Hence the checked IR below is a for loop
+        # carrying `arange`; the name-loc prefixes are preserved through the uplift.
+        # CHECK: %ivar_[[IV0:.+]] = scf.for %ivar_[[IV1:.+]] = %ivar to %N step %c1_i32 iter_args(%arange_[[AR0:.+]] = %arange) -> (tensor<16xi32>) : i32 {
         while ivar < N:
-            # CHECK: ^bb0(%arange_[[AR0]]: tensor<16xi32> loc("arange"(#{{.*}})), %ivar_[[IV1]]: i32
-
             # CHECK: %ivar_[[IV2:.+]] = arith.addi %ivar_[[IV1]], %c1_i32 : i32
             ivar += 1
             # CHECK: %arange_[[AR1:.+]] = tt.splat %ivar_[[IV2]] : i32 -> tensor<16xi32>
             # CHECK: %arange_[[AR2:.+]] = arith.muli %arange_[[AR0]], %arange_[[AR1]] : tensor<16xi32>
-            # CHECK: scf.yield %arange_[[AR2]], %ivar_[[IV2]] : tensor<16xi32>, i32
+            # CHECK: scf.yield %arange_[[AR2]] : tensor<16xi32>
             arange *= ivar
 
-        # CHECK: tt.print ": " {hex = false, isSigned = array<i32: 1>} : %ivar_[[IV0]]#0 : tensor<16xi32>
+        # CHECK: tt.print ": " {hex = false, isSigned = array<i32: 1>} : %ivar_[[IV0]] : tensor<16xi32>
         tl.device_print("", arange)
 
     h = triton.compile(triton.compiler.ASTSource(fn=kernel_basic_while, signature={"N": "i32"}, constexprs={}))
@@ -518,7 +503,7 @@ def test_line_and_column_numbers(fresh_triton_cache):
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":@DEF_LINE@:5)
+        # CHECK: #loc = loc("{{.*}}":505:5)
         # CHECK: #loc9 = loc("src"(#loc))
         # CHECK: #loc10 = loc("N"(#loc))
         # CHECK-LABEL:  tt.func public @kernel_basic(
@@ -541,14 +526,14 @@ def test_line_and_column_numbers(fresh_triton_cache):
         # CHECK:          } loc(#loc)
         # CHECK:         } loc(#loc)
 
-        # CHECK: #loc1 = loc({{.*}}:@X_PLUS_1_LINE@:20)
-        # CHECK: #loc2 = loc({{.*}}:@OFFSET_LINE@:18)
-        # CHECK: #loc3 = loc({{.*}}:@PID_LINE@:15)
-        # CHECK: #loc4 = loc({{.*}}:@OFFSETS_LINE@:28)
-        # CHECK: #loc5 = loc({{.*}}:@OFFSETS_LINE@:19)
-        # CHECK: #loc6 = loc({{.*}}:@LOAD_PTR_LINE@:30)
-        # CHECK: #loc7 = loc({{.*}}:@MASK_LINE@:16)
-        # CHECK: #loc8 = loc({{.*}}:@STORE_LINE@:9)
+        # CHECK: #loc1 = loc({{.*}}:550:20)
+        # CHECK: #loc2 = loc({{.*}}:546:18)
+        # CHECK: #loc3 = loc({{.*}}:545:15)
+        # CHECK: #loc4 = loc({{.*}}:547:28)
+        # CHECK: #loc5 = loc({{.*}}:547:19)
+        # CHECK: #loc6 = loc({{.*}}:548:30)
+        # CHECK: #loc7 = loc({{.*}}:549:16)
+        # CHECK: #loc8 = loc({{.*}}:551:9)
         # CHECK: #loc11 = loc("x_plus_1"(#loc1))
         # CHECK: #loc12 = loc("offset"(#loc2))
         # CHECK: #loc13 = loc("pid"(#loc3))
@@ -569,18 +554,7 @@ def test_line_and_column_numbers(fresh_triton_cache):
         triton.compiler.ASTSource(fn=kernel_basic, signature={"src": "*fp32", "N": "i32", "BLOCK_SIZE": "constexpr"},
                                   constexprs={"BLOCK_SIZE": 16}))
 
-    check_template = substitute_source_line_numbers(
-        inspect.getsource(kernel_basic.fn),
-        kernel_basic,
-        DEF_LINE="def kernel_basic",
-        X_PLUS_1_LINE="x_plus_1 = tl.load",
-        PID_LINE="pid = tl.program_id",
-        OFFSET_LINE="offset = pid",
-        OFFSETS_LINE="offsets = offset",
-        LOAD_PTR_LINE="load_src_store_dst = src",
-        MASK_LINE="mask = offsets",
-        STORE_LINE="tl.store",
-    )
+    check_template = inspect.getsource(kernel_basic.fn)
     run_filecheck("placeholder", h.asm["ttir"], check_template)
 
 
@@ -588,13 +562,13 @@ def test_while_block_arg_carries_init_handle_loc(fresh_triton_cache):
 
     @triton.jit
     def kernel_while_block_arg_loc(N):
+        # CHECK-DAG: #[[INIT_IVAR_LOC:loc[0-9]+]] = loc("ivar"(#{{loc[0-9]+}}))
         # CHECK-LABEL: tt.func public @kernel_while_block_arg_loc
-        # CHECK: %ivar = arith.constant 0 : i32 loc(#[[INIT_IVAR_LOC:loc[0-9]+]])
         # CHECK: %arange = tt.make_range {{.*}} loc(#[[INIT_ARANGE_LOC:loc[0-9]+]])
         arange = tl.arange(0, 16)
         ivar = 0
-        # CHECK: scf.while (%arange_{{.+}} = %arange, %ivar_{{.+}} = %ivar)
-        while ivar < N:
+        # CHECK: scf.while (%arange_{{.+}} = %arange, %ivar_{{.+}} = %{{.+}})
+        while ivar < N and N > 0:
             # CHECK: ^bb0(%arange_{{.+}}: tensor<16xi32> loc("arange"(#[[INIT_ARANGE_LOC]])), %ivar_{{.+}}: i32 loc("ivar"(#[[INIT_IVAR_LOC]])))
             ivar += 1
             arange *= ivar
@@ -608,3 +582,51 @@ def test_while_block_arg_carries_init_handle_loc(fresh_triton_cache):
 @pytest.fixture(autouse=True)
 def with_line_info(fresh_knobs):
     fresh_knobs.compilation.disable_line_info = False
+
+
+@pytest.mark.parametrize("preserve", ["0", "1"])
+def test_ptx_source_paths(monkeypatch, preserve: str, fresh_triton_cache):
+    if is_interpreter() or not is_cuda():
+        pytest.skip("PTX source path virtualization is NVIDIA-only")
+
+    monkeypatch.setenv("TRITON_PRESERVE_PTX_SOURCE_PATHS", preserve)
+    kernel_single.device_caches.clear()
+    kernel_info = kernel_single.warmup(torch.float32, torch.float32, BLOCK=128, grid=(1, ))
+    file_directives = [line for line in kernel_info.asm["ptx"].splitlines() if line.lstrip().startswith(".file")]
+    expected = f'"{__file__}"' if preserve == "1" else '"<source>/test_line_info.py", 0, 0'
+    assert any(expected in line for line in file_directives), file_directives
+    kernel_single.device_caches.clear()
+
+
+@triton.jit
+def kernel_multiline_inline_asm(X, Y, BLOCK: tl.constexpr):
+    x = tl.load(X + tl.arange(0, BLOCK))
+    y = tl.inline_asm_elementwise("{\n.reg .b32 t;\nadd.u32 t, $1, 1;\nadd.u32 $0, t, 1;\n}", "=r,r", [x],
+                                  dtype=tl.int32, is_pure=True, pack=1)
+    tl.store(Y + tl.arange(0, BLOCK), y)
+
+
+def test_inline_asm_line_info(fresh_triton_cache):
+    if is_interpreter() or not is_cuda():
+        pytest.skip("inline asm line info is NVIDIA-only")
+
+    # NVPTX attributes the instructions of a multi-line inline asm to
+    # `call line + line index in the asm string`. Every asm instruction must
+    # instead map to the line of the inline asm call.
+    kernel_info = kernel_multiline_inline_asm.warmup(torch.int32, torch.int32, BLOCK=128, grid=(1, ))
+    src_lines, start = inspect.getsourcelines(kernel_multiline_inline_asm.fn)
+    asm_line = start + next(i for i, line in enumerate(src_lines) if "tl.inline_asm_elementwise(" in line)
+    in_asm = False
+    loc_line = None
+    add_lines = []
+    for line in kernel_info.asm["ptx"].splitlines():
+        line = line.strip()
+        if line.startswith("// begin inline asm"):
+            in_asm = True
+        elif line.startswith("// end inline asm"):
+            in_asm = False
+        elif line.startswith(".loc"):
+            loc_line = int(line.split()[2])
+        elif in_asm and line.startswith("add.u32"):
+            add_lines.append(loc_line)
+    assert add_lines == [asm_line, asm_line]

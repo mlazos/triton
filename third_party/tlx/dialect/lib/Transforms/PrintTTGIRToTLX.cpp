@@ -1,0 +1,4497 @@
+//===----------------------------------------------------------------------===//
+// TLX Print TTGIR to TLX Pass
+//===----------------------------------------------------------------------===//
+//
+// This pass converts Triton GPU IR (TTGIR) to a simplified TLX-style
+// representation for debugging and understanding the correspondence between
+// high-level TLX Python API and low-level GPU IR.
+//
+// Key Features:
+// - Converts TTGIR operations to their TLX equivalents (e.g., ttng.wait_barrier
+//   -> tlx.barrier_wait)
+// - Removes layouts, types, and attributes for readability
+// - Uses Python-like syntax for control flow:
+//   * scf.for -> for var in range(start, end, step):
+//   * scf.if -> if condition: / else:
+//   * ttg.warp_specialize -> with tlx.async_tasks(): / with tlx.async_task():
+// - Smart local_alloc handling:
+//   * Barrier allocations -> tlx.alloc_barriers(count)
+//   * Buffer allocations -> tlx.local_alloc((shape), dtype, count)
+// - Variable name simplification:
+//   * Uses NameLoc metadata from the Python frontend to recover original
+//     variable names (e.g., %0 -> "Q" if assigned as `Q = tl.load(...)`)
+//   * Falls back to removing % prefix and prefixing numeric names with "var_"
+// - Argument substitution:
+//   * warp_specialize partition args -> original operands
+//   * scf.for outputs -> corresponding iter_args
+// - Implicit control flow:
+//   * scf.yield inside if -> assignment to if's output variable
+//   * scf.yield inside for -> skipped (iter_args updated via block args)
+//   * ttg.warp_yield, ttg.warp_return -> skipped (implicit in with blocks)
+//
+// Example output:
+//   func _attn_fwd_persist(arg0, arg1, arg2, arg3) {
+//     c0_i32 = 0
+//     c1_i32 = 1
+//     var_0 = tlx.alloc_barriers(1)
+//     var_92 = tlx.local_alloc((128, 128), bf16, 3)
+//     with tlx.async_tasks():
+//       with tlx.async_task("default"):
+//         var_97 = get_program_id()
+//         if var_103:
+//           var_108 = add(var_101, c1_i32)
+//           var_104 = var_108
+//         else:
+//           var_104 = var_101
+//         arg9 = var_97
+//         for arg8 in range(c0_i32, var_104, c1_i32):
+//           tlx.barrier_wait(var_120, var_122, true)
+//           tlx.tc_gen5_mma(...)
+//       with tlx.async_task():
+//         ... partition code ...
+//   }
+//
+// Usage:
+//   triton-opt --tlx-print-ttgir-to-tlx input.mlir
+// Or via environment variable:
+//   TRITON_DUMP_TTGIR_TO_TLX=1 python your_kernel.py
+//
+//===----------------------------------------------------------------------===//
+
+#include "IR/Dialect.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/IR/AsmState.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Pass/Pass.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/SaveAndRestore.h"
+#include "llvm/Support/raw_ostream.h"
+
+#define DEBUG_TYPE "tlx-print-ttgir-to-tlx"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+using namespace mlir;
+namespace tt = ::mlir::triton;
+namespace ttg = ::mlir::triton::gpu;
+namespace ttng = ::mlir::triton::nvidia_gpu;
+
+namespace mlir {
+namespace triton {
+namespace tlx {
+
+#define GEN_PASS_DEF_TLXPRINTTTGIRTOTLX
+#include "tlx/dialect/include/Transforms/Passes.h.inc"
+
+namespace {
+
+struct TTGIRToTLXMapping {
+  StringRef ttgirOpName;
+  StringRef tlxOpName;
+  StringRef description;
+};
+
+static const TTGIRToTLXMapping opMappings[] = {
+    // Barrier operations - init_barrier is handled specially
+    {"ttng.barrier_expect", "tlx.barrier_expect_bytes",
+     "Set expected bytes for barrier transaction tracking"},
+    {"ttng.wait_barrier", "tlx.barrier_wait",
+     "Wait for barrier phase completion"},
+    {"ttng.arrive_barrier", "tlx.barrier_arrive", "Signal arrival at barrier"},
+    {"ttng.named_barrier_wait", "tlx.named_barrier_wait",
+     "Wait on named hardware barrier"},
+    {"ttng.named_barrier_arrive", "tlx.named_barrier_arrive",
+     "Arrive at named hardware barrier"},
+    {"ttng.wait_barrier_named", "tlx.named_barrier_wait",
+     "Wait on named hardware barrier"},
+    {"ttng.arrive_barrier_named", "tlx.named_barrier_arrive",
+     "Arrive at named hardware barrier"},
+
+    // Takes (mask, pred) in both spellings, so the generic operand order holds.
+    {"ttng.vote_ballot_sync", "tlx.vote_ballot_sync", "Warp-level vote ballot"},
+
+    // Memory allocation operations - local_alloc is handled specially
+    // ttng.tmem_alloc: handled specially in printSimplifiedOp
+
+    // Memory load/store operations
+    {"ttg.local_load", "tlx.local_load",
+     "Load from shared memory to registers"},
+    {"ttg.local_gather", "tlx.local_gather",
+     "Gather elements from shared memory to registers"},
+    {"ttg.local_scatter", "tlx.local_scatter",
+     "Scatter elements from registers to shared memory"},
+    {"ttng.tmem_load", "tlx.local_load",
+     "Load from tensor memory to registers (Blackwell)"},
+    {"ttg.local_store", "tlx.local_store", "Store registers to shared memory"},
+    {"ttng.tmem_store", "tlx.local_store",
+     "Store registers to tensor memory (Blackwell)"},
+    {"ttng.tmem_copy", "tlx.tmem_copy",
+     "Copy from shared memory to tensor memory (Blackwell)"},
+
+    // Memory descriptor operations
+    {"ttg.memdesc_subview", "tlx.local_view", "Get subview of a buffer"},
+    {"ttg.memdesc_trans", "tlx.local_trans", "Transpose buffer dimensions"},
+    {"ttg.memdesc_reinterpret", "tlx.local_reinterpret",
+     "Reinterpret buffer dtype/shape"},
+    {"ttng.tmem_subslice", "tlx.subslice", "TMEM subslice (Blackwell)"},
+    {"ttg.memdesc_index", "tlx.local_view", "Index into memdesc"},
+    {"ttg.memdesc_subslice", "tlx.subslice", "Slice a memory descriptor"},
+
+    // Async copy operations (cp.async)
+    {"ttg.async_load", "tlx.async_load",
+     "Async load from global to shared memory"},
+    {"ttg.async_copy_global_to_local", "tlx.async_load",
+     "Async bulk copy from global to shared memory"},
+    {"ttg.async_commit_group", "tlx.async_load_commit_group",
+     "Commit async load group"},
+    {"ttg.async_wait", "tlx.async_load_wait_group",
+     "Wait for async load completion"},
+
+    // Async store (non-TMA bulk copy)
+    {"ttng.async_store", "tlx.async_store",
+     "Async store from shared to global memory"},
+
+    // TMA operations
+    {"ttng.async_tma_copy_global_to_local", "tlx.async_descriptor_load",
+     "TMA load from global to shared memory"},
+    {"ttng.async_tma_gather", "tlx.async_descriptor_gather",
+     "TMA gather from global to shared memory"},
+    {"ttng.async_tma_copy_local_to_global", "tlx.async_descriptor_store",
+     "TMA store from shared to global memory"},
+    {"ttng.tma_store_wait", "tlx.async_descriptor_store_wait",
+     "Wait for TMA stores to complete"},
+    {"ttng.async_tma_store_wait", "tlx.async_descriptor_store_wait",
+     "Wait for TMA stores to complete"},
+    {"ttng.async_tma_store_token_wait", "tlx.async_descriptor_store_wait",
+     "Wait for a token-tracked TMA store"},
+    {"tt.make_tensor_descriptor", "tlx.make_tensor_descriptor",
+     "Create TMA descriptor on device"},
+    {"ttng.tensormap_create", "tlx.make_tensor_descriptor",
+     "Create TMA descriptor on device (Blackwell)"},
+    {"tt.reinterpret_tensor_descriptor", "tlx.reinterpret_tensor_descriptor",
+     "Reinterpret TMA descriptor with new shape"},
+    {"ttng.reinterpret_tensor_descriptor", "tlx.reinterpret_tensor_descriptor",
+     "Reinterpret TMA descriptor (Blackwell)"},
+    {"ttg.global_scratch_alloc", "tlx.allocate_tensor_descriptor",
+     "Allocate global scratch for TMA descriptors"},
+    {"ttng.tensormap_fenceproxy_acquire",
+     "tl.extra.cuda.experimental_tensormap_fenceproxy_acquire",
+     "Fence proxy acquire for TMA descriptor"},
+
+    // MMA operations
+    {"ttng.warp_group_dot", "tlx.async_dot",
+     "Warp-group MMA (Hopper wgmma.mma_async)"},
+    {"ttng.warp_group_dot_wait", "tlx.async_dot_wait",
+     "Wait for async dot completion"},
+    {"ttng.tc_gen5_mma", "tlx.async_dot",
+     "Tensor Core Gen5 MMA (Blackwell tcgen05.mma)"},
+    {"ttng.tc_gen5_mma_scaled", "tlx.async_dot_scaled",
+     "Scaled FP8 MMA (Blackwell)"},
+    {"ttng.tc_gen5_commit", "tlx.tcgen05_commit",
+     "Commit tcgen05 operations to barrier (Blackwell)"},
+
+    // Fence operations
+    {"ttng.fence", "tlx.fence(\"gpu\"|\"sys\")",
+     "GPU or system scope memory fence"},
+    {"ttng.fence_async_shared", "tlx.fence(\"async_shared\")",
+     "Memory fence for shared memory ordering"},
+
+    // Remote memory operations
+    {"ttng.map_to_remote_buffer", "tlx.remote_view",
+     "Map buffer to remote CTA in cluster"},
+    {"ttng.remote_store", "tlx.remote_shmem_store",
+     "Store to remote CTA's shared memory"},
+    {"ttng.async_remote_store", "tlx.async_remote_shmem_store",
+     "Async store to remote CTA's shared memory"},
+    {"ttg.async_remote_shmem_copy", "tlx.async_remote_shmem_copy",
+     "Async copy to a remote CTA's shared memory"},
+
+    // Warp specialization
+    {"ttg.warp_specialize", "tlx.warp_specialize",
+     "Warp specialization region"},
+    {"ttg.warp_return", "tlx.warp_return",
+     "Return from warp specialization region"},
+
+    // Control flow
+    {"scf.for", "for", "For loop"},
+    {"scf.if", "if", "If statement"},
+    {"scf.yield", "yield", "Yield values"},
+    {"scf.while", "while", "While loop"},
+
+    // Arith operations
+    // Binary arith ops (add, sub, mul, div, rem, xor, and, or) are handled
+    // as infix operators (a + b, a * b, etc.) in printSimplifiedOp.
+    {"arith.constant", "const", "Constant value"},
+    {"arith.select", "tl.where", "Select operation"},
+    {"arith.maxf", "tl.maximum", "Float max"},
+    {"arith.maxnumf", "tl.maximum", "Float max (NaN-quieting)"},
+    {"arith.minf", "tl.minimum", "Float min"},
+    {"arith.minnumf", "tl.minimum", "Float min (NaN-quieting)"},
+    // Elementwise binary min/max. NOTE: tl.min/tl.max are reductions, so
+    // they are not used here. Use tl.minimum/maximum similar to float above.
+    {"arith.maxsi", "tl.maximum", "Signed integer max"},
+    {"arith.maxui", "tl.maximum", "Unsigned integer max"},
+    {"arith.minsi", "tl.minimum", "Signed integer min"},
+    {"arith.minui", "tl.minimum", "Unsigned integer min"},
+    // Ceiling division: tl.cdiv(a, b) == (a + b - 1) // b.
+    {"arith.ceildivsi", "tl.cdiv", "Signed integer ceil-division"},
+    {"arith.ceildivui", "tl.cdiv", "Unsigned integer ceil-division"},
+
+    // Triton operations
+    {"tt.splat", "tl.splat", "Splat scalar to tensor"},
+    {"tt.broadcast", "tl.broadcast", "Broadcast tensor"},
+    {"tt.expand_dims", "tl.expand_dims", "Expand dimensions"},
+    {"tt.reduce", "tl.reduce", "Reduce operation"},
+    {"tt.dot", "tl.dot", "Matrix multiply"},
+    {"tt.load", "tl.load", "Load from global memory"},
+    {"tt.store", "tl.store", "Store to global memory"},
+    // tt.addptr: handled as infix + in buildInfixOpMap
+    {"tt.make_range", "tl.arange", "Make range"},
+    {"tt.trans", "tl.trans", "Transpose"},
+    {"tt.reshape", "tl.reshape", "Reshape tensor"},
+    {"tt.cat", "tl.cat", "Concatenate"},
+    {"tt.join", "tl.join", "Join tensors"},
+    {"tt.split", "tl.split", "Split tensor"},
+    {"tt.get_program_id", "tl.program_id", "Get program ID"},
+    {"tt.get_num_programs", "tl.num_programs", "Get number of programs"},
+    {"tt.map_elementwise", "tl.map_elementwise", "Map elementwise operation"},
+    {"tt.return", "return", "Return from function"},
+    {"tt.elementwise_inline_asm", "tl.inline_asm_elementwise",
+     "Elementwise inline assembly"},
+
+    // Math dialect operations
+    {"math.exp", "tl.math.exp", "Natural exponential"},
+    {"math.exp2", "tl.math.exp2", "Base-2 exponential"},
+    {"math.log", "tl.math.log", "Natural logarithm"},
+    {"math.log2", "tl.math.log2", "Base-2 logarithm"},
+    {"math.sin", "tl.math.sin", "Sine"},
+    {"math.cos", "tl.math.cos", "Cosine"},
+    {"math.sqrt", "tl.math.sqrt", "Square root"},
+    {"math.rsqrt", "tl.math.rsqrt", "Reciprocal square root"},
+    {"math.erf", "tl.math.erf", "Error function"},
+    {"math.floor", "tl.math.floor", "Floor"},
+    {"math.ceil", "tl.math.ceil", "Ceiling"},
+    {"math.fabs", "tl.math.abs", "Float absolute value"},
+    {"math.iabs", "tl.math.abs", "Integer absolute value"},
+    {"math.fma", "tl.math.fma", "Fused multiply-add"},
+    {"tt.precise_sqrt", "tl.math.sqrt_rn", "IEEE-rounded square root"},
+
+    // GPU operations
+    // Reachable only if gpu.barrier is taken off the skip list, and
+    // tlx.workgroup_barrier is AMD-only -- gate it on isAMDTarget if so, the
+    // way the ttg.barrier handler does.
+    {"gpu.barrier", "tlx.workgroup_barrier", "Workgroup-wide barrier"},
+    {"nvg.cluster_id", "tlx.cluster_cta_rank", "CTA rank in cluster"},
+};
+
+// Infix operator mapping for binary arith ops
+llvm::StringMap<StringRef> buildInfixOpMap() {
+  llvm::StringMap<StringRef> map;
+  map["arith.addi"] = "+";
+  map["arith.addf"] = "+";
+  map["arith.subi"] = "-";
+  map["arith.subf"] = "-";
+  map["arith.muli"] = "*";
+  map["arith.mulf"] = "*";
+  map["arith.divsi"] = "//";
+  map["arith.divui"] = "//";
+  map["arith.divf"] = "/";
+  map["arith.remsi"] = "%";
+  map["arith.remui"] = "%";
+  map["arith.xori"] = "^";
+  map["arith.andi"] = "&";
+  map["arith.ori"] = "|";
+  map["arith.shli"] = "<<";
+  map["arith.shrsi"] = ">>";
+  map["arith.shrui"] = ">>";
+  map["tt.addptr"] = "+";
+  return map;
+}
+
+// Get comparison operator string for arith.cmpi predicates
+StringRef getCmpIOperator(int64_t predicate) {
+  switch (predicate) {
+  case 0:
+    return "=="; // eq
+  case 1:
+    return "!="; // ne
+  case 2:
+    return "<"; // slt
+  case 3:
+    return "<="; // sle
+  case 4:
+    return ">"; // sgt
+  case 5:
+    return ">="; // sge
+  case 6:
+    return "<"; // ult
+  case 7:
+    return "<="; // ule
+  case 8:
+    return ">"; // ugt
+  case 9:
+    return ">="; // uge
+  default:
+    return "??";
+  }
+}
+
+// Get comparison operator string for arith.cmpf predicates
+StringRef getCmpFOperator(int64_t predicate) {
+  switch (predicate) {
+  case 0:
+    return "False"; // false
+  case 1:
+    return "=="; // oeq
+  case 2:
+    return ">"; // ogt
+  case 3:
+    return ">="; // oge
+  case 4:
+    return "<"; // olt
+  case 5:
+    return "<="; // ole
+  case 6:
+    return "!="; // one
+  case 8:
+    return "=="; // ueq
+  case 9:
+    return ">"; // ugt
+  case 10:
+    return ">="; // uge
+  case 11:
+    return "<"; // ult
+  case 12:
+    return "<="; // ule
+  case 13:
+    return "!="; // une
+  case 15:
+    return "True"; // true
+  default:
+    return "??";
+  }
+}
+
+// True if `v` is a constant-true i1. Such a predicate is the default, so it is
+// elided rather than emitted.
+bool isConstantTrue(Value v) {
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getName().getStringRef() != "arith.constant")
+    return false;
+  if (auto intAttr = def->getAttrOfType<IntegerAttr>("value"))
+    return intAttr.getValue().isOne();
+  return false;
+}
+
+// Split a memdesc shape into the `num` and `shape` arguments of
+// tlx.local_alloc by rank: only a rank above 2 is multi-buffering. Used where
+// there is only a type to go on (aliases, TMEM); analyzeLocalAlloc applies it
+// to the base of an alias too, or the two would describe different buffer
+// counts over the same storage.
+static void splitAllocShape(ArrayRef<int64_t> shape, int64_t &count,
+                            SmallVectorImpl<int64_t> &tileShape) {
+  if (shape.size() > 2) {
+    count = shape[0];
+    tileShape.assign(shape.begin() + 1, shape.end());
+    return;
+  }
+  count = 1;
+  tileShape.assign(shape.begin(), shape.end());
+}
+
+// Build a lookup map for fast operation name lookup
+llvm::StringMap<StringRef> buildOpNameMap() {
+  llvm::StringMap<StringRef> map;
+  for (const auto &mapping : opMappings) {
+    map[mapping.ttgirOpName] = mapping.tlxOpName;
+  }
+  return map;
+}
+
+// Make an MLIR name usable as a Python identifier. MLIR admits characters
+// Python does not -- the dots in block-pointer-derived names like
+// `V_block_ptr.offsets.1`, and `.` or `$` in function symbols.
+static std::string sanitizePyIdentifier(StringRef raw) {
+  std::string name = raw.str();
+  for (char &c : name)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+      c = '_';
+  if (!name.empty() && std::isdigit(name.front()))
+    name = "var_" + name;
+  return name;
+}
+
+// Format a raw SSA name from printAsOperand into a clean variable name.
+static std::string formatSSAName(StringRef raw) {
+  std::string name = raw.str();
+  size_t colonPos = name.find(':');
+  if (colonPos != std::string::npos)
+    name = name.substr(0, colonPos);
+  while (!name.empty() && name.back() == ' ')
+    name.pop_back();
+  if (!name.empty() && name[0] == '%')
+    name = name.substr(1);
+  return sanitizePyIdentifier(name);
+}
+
+// Thread-local pointer to the value name cache built once per module.
+static DenseMap<Value, std::string> *valueNameCacheStorage = nullptr;
+static DenseMap<Value, std::string> *getValueNameCachePtr() {
+  return valueNameCacheStorage;
+}
+
+// Build a cache mapping each Value to its formatted SSA name.
+// Uses AsmState to perform SSA numbering once for the entire module.
+static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
+  DenseMap<Value, std::string> cache;
+  AsmState asmState(rootOp, OpPrintingFlags().printNameLocAsPrefix(true));
+
+  // Sanitization is many-to-one -- `a.b` and `a_b` both become `a_b` -- and two
+  // values sharing a name in one emitted function would shadow each other,
+  // which is valid Python but a different program. Deduplicate within a
+  // function, not across the module: separate functions get separate Python
+  // scopes, and each legitimately has its own `arg0`.
+  auto nameScope = [&](Operation *scope) {
+    llvm::StringMap<unsigned> used;
+    auto claim = [&](StringRef raw) {
+      std::string name = formatSSAName(raw);
+      auto [it, inserted] = used.try_emplace(name, 0);
+      if (inserted)
+        return name;
+      // Copy the counter out rather than holding `it` across the loop: the
+      // insertions below can grow the map, and StringMap iterators point into
+      // a bucket table that growth reallocates.
+      unsigned suffix = it->second;
+      std::string candidate;
+      do {
+        candidate = name + "_" + std::to_string(++suffix);
+      } while (!used.try_emplace(candidate, 0).second);
+      used[name] = suffix;
+      return candidate;
+    };
+    scope->walk([&](Operation *op) {
+      for (Value result : op->getResults()) {
+        std::string buf;
+        llvm::raw_string_ostream os(buf);
+        result.printAsOperand(os, asmState);
+        os.flush();
+        cache[result] = claim(buf);
+      }
+      for (Region &region : op->getRegions()) {
+        for (Block &block : region) {
+          for (BlockArgument arg : block.getArguments()) {
+            std::string buf;
+            llvm::raw_string_ostream os(buf);
+            arg.printAsOperand(os, asmState);
+            os.flush();
+            cache[arg] = claim(buf);
+          }
+        }
+      }
+    });
+  };
+
+  bool sawFunc = false;
+  rootOp->walk([&](tt::FuncOp f) {
+    sawFunc = true;
+    nameScope(f);
+  });
+  if (!sawFunc)
+    nameScope(rootOp);
+  return cache;
+}
+
+std::string getElementTypeName(Type type);
+static void printPythonStringLiteral(StringRef s, llvm::raw_ostream &os);
+
+// Casts that change a value's element type. These are user-visible in TLX --
+// the kernel wrote `x.to(dtype)` -- unlike the width/index casts below.
+static const llvm::StringSet<> elementTypeCastOps = {
+    "arith.extf",   "arith.truncf", "arith.sitofp",
+    "arith.uitofp", "arith.fptosi", "arith.fptoui",
+};
+
+// Several TLX primitives lower to ROCDL and so are only usable on CDNA; the
+// target lives on the module as `ttg.target`, e.g. "hip:gfx950".
+static bool isAMDTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return false;
+  auto target = mod->getAttrOfType<StringAttr>("ttg.target");
+  return target && target.getValue().starts_with("hip");
+}
+
+// Element types getElementTypeName can spell as a TLX dtype. Anything else it
+// renders as raw MLIR, which is not usable in emitted Python.
+static bool isNameableElementType(Type type) {
+  return type.isF32() || type.isF16() || type.isBF16() || type.isF64() ||
+         type.isInteger(1) || type.isInteger(8) || type.isInteger(16) ||
+         type.isInteger(32) || type.isInteger(64) ||
+         isa<Float8E4M3FNType, Float8E4M3FNUZType, Float8E5M2Type,
+             Float8E5M2FNUZType>(type);
+}
+
+// Element type of a tensor, or the type itself for a scalar.
+static Type getElementType(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type))
+    return tensorType.getElementType();
+  return type;
+}
+
+// Whether an emitted expression names a value `.to(...)` can be called on.
+// The keyword literals lex as identifiers but are not tensors, so they take
+// the tl.cast path with the other inlined constants.
+static bool isPythonIdentifier(StringRef s) {
+  if (s.empty() || isdigit(static_cast<unsigned char>(s[0])))
+    return false;
+  if (s == "True" || s == "False" || s == "None")
+    return false;
+  return llvm::all_of(s, [](char c) {
+    return isalnum(static_cast<unsigned char>(c)) || c == '_';
+  });
+}
+
+// Whether getValueName spells an element-type cast or erases it: erased when
+// TLX cannot name the dtype, or the operand is `None`. Shared with the
+// resolver.
+static bool spellsElementTypeCast(Operation *castOp, StringRef operandName) {
+  return castOp && castOp->getNumOperands() > 0 &&
+         castOp->getNumResults() > 0 &&
+         elementTypeCastOps.contains(castOp->getName().getStringRef()) &&
+         isNameableElementType(
+             getElementType(castOp->getResult(0).getType())) &&
+         operandName != "None";
+}
+
+// tt.extern_elementwise dispatches on a {(arg dtypes): (symbol, ret dtype)}
+// dict. Emitting that literal inside the kernel does not work -- the Triton
+// frontend traces container literals and the tuple key comes back as a list --
+// so each one is hoisted to a module-scope wrapper, named here.
+static thread_local DenseMap<Operation *, std::string> *externSigNames =
+    nullptr;
+
+// Names already given to a module-scope def in the current print. Sanitizing is
+// many-to-one, so two tt.func symbols can collapse to one identifier and their
+// per-function counters both start at 0; the later Python def would silently
+// shadow the earlier. Reset per module in runOnOperation.
+static thread_local llvm::StringSet<> moduleScopeDefNames;
+
+static std::string uniqueModuleScopeName(StringRef base) {
+  std::string name = base.str();
+  unsigned n = 0;
+  while (!moduleScopeDefNames.insert(name).second)
+    name = base.str() + "_" + std::to_string(++n);
+  return name;
+}
+
+// Whether an extern_elementwise has a signature we can spell as TLX dtypes.
+static bool canNameExternSignature(Operation *op) {
+  if (op->getNumResults() != 1 || !op->getAttrOfType<StringAttr>("symbol"))
+    return false;
+  if (!isNameableElementType(getElementType(op->getResult(0).getType())))
+    return false;
+  return llvm::all_of(op->getOperands(), [](Value v) {
+    return isNameableElementType(getElementType(v.getType()));
+  });
+}
+
+// tlx.warp_predicate takes its region as a separate @triton.jit function, so
+// each ttg.warp_predicate gets a module-scope body emitted for it, named here.
+static thread_local DenseMap<Operation *, std::string> *warpPredicateBodyNames =
+    nullptr;
+
+// Values a region uses but does not define, which the body function has to
+// receive as arguments.
+static void collectRegionCaptures(Region &region,
+                                  SmallVectorImpl<Value> &captures) {
+  llvm::SetVector<Value> seen;
+  region.walk([&](Operation *op) {
+    for (Value v : op->getOperands()) {
+      Region *defining = v.getParentRegion();
+      if (!defining || region.isAncestor(defining))
+        continue;
+      seen.insert(v);
+    }
+  });
+  captures.assign(seen.begin(), seen.end());
+}
+
+// Get simplified name for a value (just the SSA name)
+// If argSubstitutionMap is provided, substitute block args with their mapped
+// values
+std::string
+getValueName(Value v,
+             const DenseMap<Value, Value> *argSubstitutionMap = nullptr,
+             bool inlineConstants = true) {
+  // Check if this value should be substituted
+  if (argSubstitutionMap) {
+    auto it = argSubstitutionMap->find(v);
+    if (it != argSubstitutionMap->end()) {
+      // Recursively get the name of the substituted value (without
+      // substitution)
+      return getValueName(it->second, nullptr, inlineConstants);
+    }
+  }
+
+  // Pass through convert_layout and type casts: use the input operand's name
+  if (Operation *defOp = v.getDefiningOp()) {
+    // The TMA store/reduce handlers print no result, so their token has no
+    // Python binding. tlx.async_descriptor_store_wait orders by count instead.
+    if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(defOp))
+      return "None";
+
+    // Handle ub.poison (undefined values) — emit proper Python default
+    if (defOp->getName().getStringRef() == "ub.poison") {
+      Type type = v.getType();
+      if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+        // Tensor poison: emit tl.full with appropriate init value
+        // Use float('-inf') for float types (common for max-reduce init)
+        std::string shape;
+        llvm::raw_string_ostream shapeOs(shape);
+        shapeOs << "[";
+        for (int64_t i = 0; i < tensorType.getRank(); ++i) {
+          if (i > 0)
+            shapeOs << ", ";
+          shapeOs << tensorType.getShape()[i];
+        }
+        shapeOs << "]";
+        if (tensorType.getElementType().isF32() ||
+            tensorType.getElementType().isBF16() ||
+            tensorType.getElementType().isF16())
+          return "tl.full(" + shape + ", float('-inf'), tl.float32)";
+        return "tl.zeros(" + shape + ", tl.int32)";
+      }
+      if (type.isF32() || type.isBF16() || type.isF16())
+        return "float('-inf')";
+      if (type.isInteger(32))
+        return "0";
+      return "None";
+    }
+
+    // An element-type cast is user-visible -- the kernel wrote `x.to(dtype)` --
+    // so unlike the layout-only casts below it is re-emitted, inline at each
+    // use.
+    if (elementTypeCastOps.contains(defOp->getName().getStringRef()) &&
+        defOp->getNumOperands() > 0) {
+      std::string operand = getValueName(defOp->getOperand(0),
+                                         argSubstitutionMap, inlineConstants);
+      if (spellsElementTypeCast(defOp, operand)) {
+        std::string dtype = getElementTypeName(getElementType(v.getType()));
+        // `.to` is a method on a tensor, so it only works when the operand
+        // names one: an inlined constant reaches here as a Python literal and
+        // `(0).to(tl.float32)` raises AttributeError at kernel compile time.
+        if (!isPythonIdentifier(operand))
+          return "tl.cast(" + operand + ", " + dtype + ")";
+        return operand + ".to(" + dtype + ")";
+      }
+      // Otherwise the cast is erased: fall through to the transparent list.
+    }
+
+    // Layout- and shape-only ops, plus the width/index casts Triton leaves
+    // implicit. The float element-type casts are still listed: the block above
+    // intercepts them whenever their dtype is nameable, so reaching one here
+    // means it is not, and erasing it beats emitting an uncompilable dtype.
+    // amdg.in_thread_transpose is a CDNA variant of ttg.convert_layout that the
+    // AMD backend inserts itself; recompiling the generated TLX re-creates it.
+    static const llvm::StringSet<> transparentOps = {
+        "ttg.convert_layout",
+        "arith.extui",
+        "arith.extsi",
+        "arith.extf",
+        "arith.trunci",
+        "arith.truncf",
+        "arith.sitofp",
+        "arith.uitofp",
+        "arith.fptosi",
+        "arith.fptoui",
+        "arith.bitcast",
+        "arith.index_cast",
+        "arith.index_castui",
+        "tt.splat",
+        "tt.broadcast",
+        "ttng.user_named_barrier_id",
+        "ttng.compiler_named_barrier_id",
+        "amdg.in_thread_transpose",
+    };
+    if (transparentOps.contains(defOp->getName().getStringRef()) &&
+        defOp->getNumOperands() > 0) {
+      return getValueName(defOp->getOperand(0), argSubstitutionMap,
+                          inlineConstants);
+    }
+  }
+
+  // Inline constants: if this value is defined by arith.constant, return the
+  // literal value
+  if (inlineConstants) {
+    if (Operation *defOp = v.getDefiningOp()) {
+      if (defOp->getName().getStringRef() == "arith.constant") {
+        if (auto valueAttr = defOp->getAttr("value")) {
+          std::string result;
+          llvm::raw_string_ostream os(result);
+          if (auto intAttr = dyn_cast<IntegerAttr>(valueAttr)) {
+            if (intAttr.getType().isInteger(1)) {
+              os << (intAttr.getValue().getBoolValue() ? "True" : "False");
+            } else {
+              os << intAttr.getValue();
+            }
+          } else if (auto floatAttr = dyn_cast<FloatAttr>(valueAttr)) {
+            auto apFloat = floatAttr.getValue();
+            if (apFloat.isInfinity()) {
+              if (apFloat.isNegative())
+                os << "-float(\"inf\")";
+              else
+                os << "float(\"inf\")";
+            } else {
+              SmallString<16> str;
+              apFloat.toString(str);
+              os << str;
+            }
+          } else {
+            // Fall through to normal name handling for unsupported constant
+            // types
+            goto normal_name;
+          }
+          os.flush();
+          return result;
+        }
+      }
+    }
+  }
+
+normal_name:
+  // Look up from pre-built cache to avoid O(N) SSA renumbering per call.
+  if (auto *cache = getValueNameCachePtr()) {
+    auto it = cache->find(v);
+    if (it != cache->end())
+      return it->second;
+  }
+
+  std::string name;
+  llvm::raw_string_ostream os(name);
+  // Use printNameLocAsPrefix to recover Python variable names from NameLoc
+  // metadata. The Triton frontend wraps value locations with NameLoc during
+  // code generation (e.g., `x = tl.load(ptr)` → NameLoc("x")), and this flag
+  // tells the MLIR printer to use those names as SSA name prefixes.
+  v.printAsOperand(os, OpPrintingFlags().printNameLocAsPrefix(true));
+  os.flush();
+  // Remove type info if present (after ':')
+  size_t colonPos = name.find(':');
+  if (colonPos != std::string::npos) {
+    name = name.substr(0, colonPos);
+  }
+  if (!name.empty())
+    return name;
+  return "unknown";
+}
+
+// Print a constant value
+void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+    // Special handling for i1 (boolean) type
+    if (intAttr.getType().isInteger(1)) {
+      os << (intAttr.getValue().getBoolValue() ? "True" : "False");
+    } else {
+      os << intAttr.getValue();
+    }
+  } else if (auto floatAttr = dyn_cast<FloatAttr>(attr)) {
+    auto apFloat = floatAttr.getValue();
+    if (apFloat.isInfinity()) {
+      if (apFloat.isNegative())
+        os << "-float('inf')";
+      else
+        os << "float('inf')";
+    } else {
+      SmallString<16> str;
+      apFloat.toString(str);
+      os << str;
+    }
+  } else if (auto denseAttr = dyn_cast<DenseElementsAttr>(attr)) {
+    // For dense tensors, print as tl.full() for splats
+    if (denseAttr.isSplat()) {
+      auto tensorType = denseAttr.getType();
+      os << "tl.full([";
+      for (int64_t i = 0; i < tensorType.getRank(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << tensorType.getShape()[i];
+      }
+      os << "], ";
+      // Print the splat value
+      auto splatAttr = denseAttr.getSplatValue<Attribute>();
+      if (auto floatVal = dyn_cast<FloatAttr>(splatAttr)) {
+        auto apFloat = floatVal.getValue();
+        if (apFloat.isInfinity() && apFloat.isNegative())
+          os << "float('-inf')";
+        else if (apFloat.isInfinity())
+          os << "float('inf')";
+        else {
+          SmallString<16> str;
+          apFloat.toString(str);
+          os << str;
+        }
+      } else {
+        printConstantValue(splatAttr, os);
+      }
+      os << ", " << getElementTypeName(tensorType.getElementType()) << ")";
+    } else {
+      os << "dense<...>";
+    }
+  } else if (auto boolAttr = dyn_cast<BoolAttr>(attr)) {
+    os << (boolAttr.getValue() ? "True" : "False");
+  } else {
+    // Fallback for other types
+    os << "const";
+  }
+}
+
+// Get element type name as a simple string
+std::string getElementTypeName(Type type) {
+  // Mirrors the builder types in python/src/ir.cc (get_fp8e4nv_ty etc).
+  if (isa<Float8E4M3FNType>(type))
+    return "tl.float8e4nv";
+  if (isa<Float8E4M3FNUZType>(type))
+    return "tl.float8e4b8";
+  if (isa<Float8E5M2Type>(type))
+    return "tl.float8e5";
+  if (isa<Float8E5M2FNUZType>(type))
+    return "tl.float8e5b16";
+  if (type.isF32())
+    return "tl.float32";
+  if (type.isF16())
+    return "tl.float16";
+  if (type.isBF16())
+    return "tl.bfloat16";
+  if (type.isF64())
+    return "tl.float64";
+  if (type.isInteger(1))
+    return "tl.int1";
+  if (type.isInteger(8))
+    return "tl.int8";
+  if (type.isInteger(16))
+    return "tl.int16";
+  if (type.isInteger(32))
+    return "tl.int32";
+  if (type.isInteger(64))
+    return "tl.int64";
+  // Fallback
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  type.print(os);
+  return str;
+}
+
+// Struct to hold analysis info about local_alloc operations
+struct LocalAllocInfo {
+  bool isBarrierAlloc = false;
+  int barrierCount = 0;
+  // Arrive count of the barrier (init_barrier's `count`); default 1.
+  int arriveCount = 1;
+  // Set when the slots disagree on arrive count, which has no TLX spelling.
+  bool conflictingArriveCounts = false;
+  // For regular allocs: shape (excluding first dim which is count),
+  // element type, count
+  SmallVector<int64_t> shape;
+  Type elementType;
+  int64_t bufferCount = 1;
+  // Used directly rather than through memdesc_index, so it is emitted as a
+  // view of slot 0 and every use sees the buffer's own shape.
+  bool singleBuffer = false;
+  // The base of a memdesc_reinterpret alias with rank <= 2: it keeps the rank
+  // rule, so it is emitted as a bare one-slot allocation (the alias's
+  // `reuse=` needs the allocation, not a view) and each op that uses it as a
+  // tile takes slot 0 itself (viewOfBareSlot).
+  bool bareSlot = false;
+};
+
+// Spell a buffer operand as the tile an op expects: a bare one-slot base
+// (LocalAllocInfo::bareSlot) carries a leading slot dim that a direct
+// local_store, TMA load or TMA store must not see.
+static std::string
+viewOfBareSlot(Value v, std::string name,
+               const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+               const DenseMap<Value, Value> *argSubstitutionMap) {
+  if (argSubstitutionMap) {
+    auto it = argSubstitutionMap->find(v);
+    if (it != argSubstitutionMap->end())
+      v = it->second;
+  }
+  if (Operation *def = v.getDefiningOp()) {
+    auto it = allocInfoMap.find(def);
+    if (it != allocInfoMap.end() && it->second.bareSlot)
+      return "tlx.local_view(" + name + ", 0)";
+  }
+  return name;
+}
+
+// Whether a buffer is indexed by memdesc_index, directly or after being
+// captured into warp-specialize partitions.
+static bool isIndexedBuffer(Value buffer) {
+  for (OpOperand &use : buffer.getUses()) {
+    Operation *user = use.getOwner();
+    if (isa<ttg::MemDescIndexOp>(user))
+      return true;
+    if (auto partitions = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
+      for (Region &region : partitions->getRegions())
+        if (!region.empty() &&
+            isIndexedBuffer(region.getArgument(use.getOperandNumber())))
+          return true;
+    }
+  }
+  return false;
+}
+
+// Analyze if a local_alloc is used for barriers
+// Returns true if it's a barrier alloc, and counts the number of barriers
+LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
+  LocalAllocInfo info;
+
+  if (localAllocOp->getNumResults() == 0)
+    return info;
+
+  Value allocResult = localAllocOp->getResult(0);
+
+  // Get the memdesc type to extract shape info
+  if (auto memDescType = dyn_cast<ttg::MemDescType>(allocResult.getType())) {
+    ArrayRef<int64_t> shape = memDescType.getShape();
+    info.elementType = memDescType.getElementType();
+
+    // Check if any use chain leads to init_barrier
+    // Pattern: local_alloc -> memdesc_index -> init_barrier
+    bool foundInitBarrier = false;
+    int initBarrierCount = 0;
+
+    // One allocation emits one alloc call, so its slots must agree on the
+    // arrive count; there is no TLX spelling for a per-slot count.
+    auto recordArriveCount = [&](Operation *initOp) {
+      auto cAttr = initOp->getAttrOfType<IntegerAttr>("count");
+      if (!cAttr)
+        return;
+      if (foundInitBarrier && cAttr.getInt() != info.arriveCount) {
+        localAllocOp->emitError("barrier slots with differing arrive counts do "
+                                "not round-trip to TLX");
+        info.conflictingArriveCounts = true;
+      }
+      info.arriveCount = cAttr.getInt();
+    };
+
+    for (Operation *user : allocResult.getUsers()) {
+      StringRef userName = user->getName().getStringRef();
+      // Single-slot barrier, used directly with no memdesc_index.
+      if (userName == "ttng.init_barrier") {
+        recordArriveCount(user);
+        foundInitBarrier = true;
+        initBarrierCount++;
+        continue;
+      }
+      if (userName == "ttg.memdesc_index") {
+        // Check if memdesc_index result is used by init_barrier
+        for (Value result : user->getResults()) {
+          for (Operation *indexUser : result.getUsers()) {
+            if (indexUser->getName().getStringRef() == "ttng.init_barrier") {
+              recordArriveCount(indexUser);
+              foundInitBarrier = true;
+              initBarrierCount++;
+            }
+          }
+        }
+      }
+    }
+
+    if (foundInitBarrier && info.elementType.isInteger(64)) {
+      // This is a barrier allocation
+      info.isBarrierAlloc = true;
+      // Barrier count is from the first dimension of the shape
+      // For !ttg.memdesc<3x1xi64>, we have 3 barriers
+      if (!shape.empty()) {
+        info.barrierCount = shape[0];
+        // If shape is like <1x1xi64>, it's 1 barrier
+        // If shape is like <3x1xi64>, it's 3 barriers
+      }
+    } else {
+      // Regular buffer allocation. It is multi-buffered exactly when it is
+      // indexed: the leading dim is then the buffer count, whatever the rank,
+      // so <1x4096xf32> is one 1-D slot. An allocation used directly is a
+      // single buffer of its full shape, which TLX spells as slot 0 of a
+      // one-slot allocation. A memdesc_reinterpret alias splits its shape by
+      // rank (splitAllocShape), so its base keeps that rule to agree with it.
+      info.isBarrierAlloc = false;
+      bool aliased = llvm::any_of(allocResult.getUsers(), [](Operation *user) {
+        return isa<ttg::MemDescReinterpretOp>(user);
+      });
+      if (aliased) {
+        splitAllocShape(shape, info.bufferCount, info.shape);
+        info.bareSlot = shape.size() <= 2;
+      } else if (isIndexedBuffer(allocResult) && shape.size() >= 2) {
+        info.bufferCount = shape[0];
+        info.shape.assign(shape.begin() + 1, shape.end());
+      } else {
+        info.bufferCount = 1;
+        info.shape.assign(shape.begin(), shape.end());
+        info.singleBuffer = true;
+      }
+    }
+  }
+
+  return info;
+}
+
+// Check if an operation should be skipped because it's folded into
+// a barrier alloc or not meaningful in TLX output
+bool shouldSkipOp(
+    Operation *op,
+    const DenseMap<Operation *, LocalAllocInfo> & /*allocInfoMap*/,
+    llvm::DenseSet<Operation *> &skippedOps) {
+  StringRef opName = op->getName().getStringRef();
+
+  // Operations to skip in TLX output:
+  // - ttng.init_barrier: folded into alloc_barriers
+  // - ttg.warp_return/warp_yield: implicit in with block structure
+  // - ttg.warp_specialize.partitions: not meaningful in TLX format
+  // - gpu.barrier: not needed in TLX
+  // - arith.constant: values are inlined at use sites
+  // - ttg.convert_layout: internal layout conversion
+  // - arith cast ops: type coercions transparent in Python
+  // - tt.return: function terminator
+  // - tt.reduce.return: internal to reduce operation
+  static const llvm::StringSet<> opsToSkip = {
+      "ttng.init_barrier",
+      "ttg.warp_return",
+      "ttg.warp_yield",
+      "ttg.warp_specialize.partitions",
+      "gpu.barrier",
+      // SMEM/TMEM lifetime-scoped in TLX, so explicit ttg.local_dealloc
+      "ttg.local_dealloc",
+      "arith.constant",
+      "ttg.convert_layout",
+      "tt.return",
+      "tt.reduce.return",
+      "tt.scan.return",
+      "arith.extui",
+      "arith.extsi",
+      "arith.extf",
+      "arith.trunci",
+      "arith.truncf",
+      "arith.sitofp",
+      "arith.uitofp",
+      "arith.fptosi",
+      "arith.fptoui",
+      "arith.bitcast",
+      "arith.index_cast",
+      "arith.index_castui",
+      "ttng.user_named_barrier_id",
+      "ttng.compiler_named_barrier_id",
+      "ttng.inval_barrier",
+      "tt.splat",
+      "tt.broadcast",
+      "tt.map_elementwise.return",
+      // Undefined values: getValueName inlines a default at each use.
+      "ub.poison",
+      "ttng.tcgen5_global_alloc",
+      "amdg.in_thread_transpose",
+  };
+  // A remote barrier view that only feeds arrives or two-CTA TMA loads is
+  // folded into them; see barrierArriveTarget.
+  if (isa<ttng::MapToRemoteBufferOp>(op) && !op->use_empty() &&
+      llvm::all_of(op->getUsers(), [&](Operation *user) {
+        if (auto load = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(user)) {
+          auto twoCTA = load->getAttrOfType<BoolAttr>("two_cta");
+          return load.getBarrier() == op->getResult(0) && twoCTA &&
+                 twoCTA.getValue();
+        }
+        return isa<ttng::ArriveBarrierOp>(user) &&
+               user->getOperand(0) == op->getResult(0);
+      }))
+    return true;
+  // Emit ttg.memdesc_index as tlx.local_view when a real consumer needs the
+  // view (MMA, wait, local_store, loop iter-arg, ...). Skip it when it has no
+  // users, or when every user is a barrier-lifecycle op (init_barrier /
+  // inval_barrier) that folds into the alloc_barriers() for the barrier alloc.
+  if (opName == "ttg.memdesc_index") {
+    bool hasUser = false, allBarrierLifecycle = true;
+    for (Value result : op->getResults()) {
+      for (Operation *user : result.getUsers()) {
+        hasUser = true;
+        StringRef userName = user->getName().getStringRef();
+        if (userName != "ttng.init_barrier" && userName != "ttng.inval_barrier")
+          allBarrierLifecycle = false;
+      }
+    }
+    if (!hasUser || allBarrierLifecycle)
+      return true;
+    return skippedOps.count(op) > 0;
+  }
+  if (opsToSkip.contains(opName)) {
+    // Don't skip arith.constant with DenseElementsAttr (tensor splat constants)
+    // — they need to be printed as explicit tl.full() assignments
+    if (opName == "arith.constant") {
+      if (auto valueAttr = op->getAttr("value")) {
+        if (isa<DenseElementsAttr>(valueAttr))
+          return false; // Don't skip — needs explicit assignment
+      }
+    }
+    return true;
+  }
+
+  return skippedOps.count(op) > 0;
+}
+
+static const llvm::StringSet<> castOpsSet = {
+    "arith.extui",  "arith.extsi",   "arith.trunci",     "arith.extf",
+    "arith.truncf", "arith.bitcast", "arith.sitofp",     "arith.uitofp",
+    "arith.fptosi", "arith.fptoui",  "arith.index_cast", "arith.index_castui",
+};
+
+static Value resolveThroughCasts(Value v) {
+  while (auto *op = v.getDefiningOp()) {
+    if (castOpsSet.contains(op->getName().getStringRef()) &&
+        op->getNumOperands() > 0)
+      v = op->getOperand(0);
+    else
+      break;
+  }
+  return v;
+}
+
+// As above, but stops at an element-type cast. The store paths use this to
+// decide whether to append a dtype cast: getValueName already spells those
+// casts, so walking past one reports the pre-cast dtype and the store appends
+// a second, redundant `.to(...)`.
+static Value resolveThroughNonElementCasts(Value v) {
+  while (auto *op = v.getDefiningOp()) {
+    StringRef name = op->getName().getStringRef();
+    if (!castOpsSet.contains(name) || op->getNumOperands() == 0)
+      break;
+    // Stop where getValueName spells the cast; walking past one it erased would
+    // report a dtype the emitted name does not carry.
+    if (spellsElementTypeCast(op, getValueName(op->getOperand(0))))
+      break;
+    v = op->getOperand(0);
+  }
+  return v;
+}
+
+// An scf loop's region arguments are bound in the emitted Python, by the
+// iter_args init line and the body's parallel copies; captures are not.
+static bool isLoopCarriedBlockArg(Value v) {
+  auto blockArg = dyn_cast<BlockArgument>(v);
+  if (!blockArg)
+    return false;
+  Operation *parent = blockArg.getOwner()->getParentOp();
+  if (!parent)
+    return false;
+  StringRef parentName = parent->getName().getStringRef();
+  return parentName == "scf.for" || parentName == "scf.while";
+}
+
+// Forward declarations
+void printRegion(Region &region, llvm::raw_ostream &os,
+                 const llvm::StringMap<StringRef> &opNameMap,
+                 const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                 llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                 DenseMap<Value, Value> *argSubstitutionMap = nullptr,
+                 ArrayRef<Value> yieldTargets = {});
+
+struct ForLoopInfo {
+  unsigned iterArgIdx; // header block arg index of the iterator
+  std::string start;   // init value expression
+  std::string end;     // bound expression
+  std::string step;    // step expression
+  Operation *stepOp;   // addi op to add to skippedOps
+};
+
+void printCFRegion(Region &region, llvm::raw_ostream &os,
+                   const llvm::StringMap<StringRef> &opNameMap,
+                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                   llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                   DenseMap<Value, Value> *argSubstitutionMap = nullptr);
+
+void printCFBlocks(Block *startBlock, Block *stopBlock, llvm::raw_ostream &os,
+                   const llvm::StringMap<StringRef> &opNameMap,
+                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                   llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                   DenseMap<Value, Value> *argSubstitutionMap,
+                   llvm::SmallDenseSet<Block *, 16> &visitedBlocks,
+                   const DenseMap<Block *, ForLoopInfo> &forLoopHeaders);
+
+// Print scf.for in Python range syntax
+void printForOp(Operation *op, llvm::raw_ostream &os,
+                const llvm::StringMap<StringRef> &opNameMap,
+                const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                DenseMap<Value, Value> *argSubstitutionMap = nullptr);
+
+// Print scf.if with yield-to-assignment conversion
+void printIfOp(Operation *op, llvm::raw_ostream &os,
+               const llvm::StringMap<StringRef> &opNameMap,
+               const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+               llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+               DenseMap<Value, Value> *argSubstitutionMap = nullptr);
+
+// Print scf.while with explicit condition and loop-carried assignments.
+void printWhileOp(Operation *op, llvm::raw_ostream &os,
+                  const llvm::StringMap<StringRef> &opNameMap,
+                  const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                  llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                  DenseMap<Value, Value> *argSubstitutionMap = nullptr);
+
+void printBlockOps(Block &block, llvm::raw_ostream &os,
+                   const llvm::StringMap<StringRef> &opNameMap,
+                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                   llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                   DenseMap<Value, Value> *argSubstitutionMap);
+
+void printSimplifiedOp(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap, unsigned indent,
+    const DenseMap<Value, Value> *argSubstitutionMap);
+
+// Print scf.for in Python range syntax
+void printForOp(Operation *op, llvm::raw_ostream &os,
+                const llvm::StringMap<StringRef> &opNameMap,
+                const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                DenseMap<Value, Value> *argSubstitutionMap) {
+  // Get the for loop bounds: lower, upper, step are first 3 operands
+  // scf.for %iv = %lb to %ub step %step iter_args(%arg = %init)
+  Value lowerBound = op->getOperand(0);
+  Value upperBound = op->getOperand(1);
+  Value step = op->getOperand(2);
+
+  // Get the induction variable from the region
+  Region &bodyRegion = op->getRegion(0);
+  Block &entryBlock = bodyRegion.front();
+
+  // The induction variable is the first block argument
+  Value inductionVar = entryBlock.getArgument(0);
+
+  // Get iter_args - they start from operand 3
+  unsigned numIterArgs = op->getNumOperands() - 3;
+
+  // Map for loop results to iter_args
+  // %107:3 = scf.for ... iter_args(%arg9, %arg10, %arg11)
+  // means %107#0 -> %arg9, %107#1 -> %arg10, etc.
+  if (argSubstitutionMap) {
+    for (unsigned i = 0; i < op->getNumResults() && i < numIterArgs; ++i) {
+      Value forResult = op->getResult(i);
+      Value iterArg = entryBlock.getArgument(1 + i);
+      (*argSubstitutionMap)[forResult] = iterArg;
+    }
+  }
+
+  // Print iter_args initialization first
+  for (unsigned i = 0; i < numIterArgs; ++i) {
+    Value initValue = op->getOperand(3 + i);
+    Value iterArg = entryBlock.getArgument(1 + i);
+
+    for (unsigned j = 0; j < indent; ++j)
+      os << "  ";
+    os << getValueName(iterArg, argSubstitutionMap) << " = ";
+
+    // Resolve init value through the FULL substitution chain
+    Value resolved = initValue;
+    if (argSubstitutionMap) {
+      auto mapIt = argSubstitutionMap->find(resolved);
+      if (mapIt != argSubstitutionMap->end())
+        resolved = mapIt->second;
+    }
+    // Check if the resolved value is a warp specialize captured block
+    // argument with tensor/float type — these are undefined in Python scope
+    // and need proper initialization (e.g., from ub.poison in the TTIR).
+    // Detect by checking: no defining op + is BlockArgument + is tensor/f32
+    bool needsInit = false;
+    if (!resolved.getDefiningOp() && isa<BlockArgument>(resolved) &&
+        !isLoopCarriedBlockArg(resolved)) {
+      Type type = resolved.getType();
+      if (isa<RankedTensorType>(type) || type.isF32())
+        needsInit = true;
+    }
+    // Also check if defining op is ub.poison
+    if (auto defOp = resolved.getDefiningOp()) {
+      if (defOp->getName().getStringRef() == "ub.poison")
+        needsInit = true;
+    }
+
+    if (needsInit) {
+      Type type = resolved.getType();
+      if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+        os << "tl.full([";
+        for (int64_t d = 0; d < tensorType.getRank(); ++d) {
+          if (d > 0)
+            os << ", ";
+          os << tensorType.getShape()[d];
+        }
+        os << "], float('-inf'), tl.float32)";
+      } else if (type.isF32()) {
+        os << "float('-inf')";
+      } else {
+        os << "0";
+      }
+    } else {
+      os << getValueName(initValue, argSubstitutionMap);
+    }
+    os << "\n";
+  }
+
+  // Print the for loop header
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  std::string ivName = getValueName(inductionVar, argSubstitutionMap);
+  os << "for " << ivName << " in range("
+     << getValueName(lowerBound, argSubstitutionMap) << ", "
+     << getValueName(upperBound, argSubstitutionMap) << ", "
+     << getValueName(step, argSubstitutionMap) << "):\n";
+
+  // Print the body, passing iter_args as yield targets so scf.yield prints
+  // assignments updating the iter_args at the end of each iteration.
+  SmallVector<Value> yieldTargets;
+  for (unsigned i = 0; i < numIterArgs; ++i)
+    yieldTargets.push_back(entryBlock.getArgument(1 + i));
+  std::string bodyStr;
+  llvm::raw_string_ostream bodyOs(bodyStr);
+  printRegion(bodyRegion, bodyOs, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap, yieldTargets);
+  bodyOs.flush();
+  if (bodyStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << bodyStr;
+  }
+}
+
+// Print scf.if with yield-to-assignment conversion
+void printIfOp(Operation *op, llvm::raw_ostream &os,
+               const llvm::StringMap<StringRef> &opNameMap,
+               const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+               llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+               DenseMap<Value, Value> *argSubstitutionMap) {
+  // Get the condition operand
+  Value condition = op->getOperand(0);
+
+  // Map if's results to yield targets for subsequent use
+  // (Like for loop, usages of if results after the if should refer to the
+  // result) But for if, we keep the original result names
+
+  // Get the if's results - these become the yield targets
+  SmallVector<Value> ifResults;
+  for (Value result : op->getResults()) {
+    ifResults.push_back(result);
+  }
+
+  // Print "if condition:"
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "if " << getValueName(condition, argSubstitutionMap) << ":\n";
+
+  std::string thenStr;
+  llvm::raw_string_ostream thenOs(thenStr);
+  if (op->getNumRegions() > 0) {
+    printRegion(op->getRegion(0), thenOs, opNameMap, allocInfoMap, skippedOps,
+                indent + 1, argSubstitutionMap, ifResults);
+  }
+  thenOs.flush();
+  if (thenStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << thenStr;
+  }
+
+  // Print else region if it exists and is non-empty
+  if (op->getNumRegions() > 1 && !op->getRegion(1).empty()) {
+    std::string elseStr;
+    llvm::raw_string_ostream elseOs(elseStr);
+    printRegion(op->getRegion(1), elseOs, opNameMap, allocInfoMap, skippedOps,
+                indent + 1, argSubstitutionMap, ifResults);
+    elseOs.flush();
+    if (!elseStr.empty()) {
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << "else:\n";
+      os << elseStr;
+    }
+  }
+}
+
+// AMD's WarpPipeliner tags the region with a string stage label. A tag of any
+// other type is not one of ours: gating on the type here rather than on
+// hasAttr sends it to the generic path, which still surfaces the region body.
+// Shared by both traversals -- they drifted once already, which is how the
+// CF printer ended up re-emitting hoisted bodies.
+static bool isWarpPipelineStage(Operation *op) {
+  return op->getName().getStringRef() == "scf.execute_region" &&
+         op->getAttrOfType<StringAttr>("triton.warp_pipeline.stage");
+}
+
+// AMD's WarpPipeliner materializes each `with tlx.warp_pipeline_stage(...)`
+// block as an scf.execute_region tagged with the stage label and priority.
+void printWarpPipelineStage(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+    DenseMap<Value, Value> *argSubstitutionMap) {
+  // isWarpPipelineStage gates the dispatch on the attribute's type, so this
+  // is non-null.
+  auto stage = op->getAttrOfType<StringAttr>("triton.warp_pipeline.stage");
+
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "with tlx.warp_pipeline_stage(";
+  printPythonStringLiteral(stage.getValue(), os);
+  // The frontend defaults priority to -1 when the kwarg is omitted; the
+  // pipeliner only attaches the attribute when one was actually given.
+  if (auto priority =
+          op->getAttrOfType<IntegerAttr>("triton.warp_pipeline.priority"))
+    os << ", priority=" << priority.getInt();
+  os << "):\n";
+
+  SmallVector<Value> stageResults(op->getResults());
+  std::string bodyStr;
+  llvm::raw_string_ostream bodyOs(bodyStr);
+  printRegion(op->getRegion(0), bodyOs, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap, stageResults);
+  bodyOs.flush();
+  if (bodyStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << bodyStr;
+  }
+}
+
+// Print scf.while as a Python loop while preserving both SCF regions:
+// the before region computes the condition and the after region is the body.
+void printWhileOp(Operation *op, llvm::raw_ostream &os,
+                  const llvm::StringMap<StringRef> &opNameMap,
+                  const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                  llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                  DenseMap<Value, Value> *argSubstitutionMap) {
+  auto whileOp = cast<scf::WhileOp>(op);
+  Block &before = whileOp.getBefore().front();
+  Block &after = whileOp.getAfter().front();
+  auto conditionOp = whileOp.getConditionOp();
+
+  // Initialize the values carried into the before region.
+  for (auto [arg, init] : llvm::zip(before.getArguments(), op->getOperands())) {
+    for (unsigned i = 0; i < indent; ++i)
+      os << "  ";
+    os << getValueName(arg, argSubstitutionMap) << " = "
+       << getValueName(init, argSubstitutionMap) << "\n";
+  }
+
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "while True:\n";
+
+  // The before region executes at the start of every iteration. Its terminator
+  // is rendered below as the loop exit rather than as a generic operation.
+  skippedOps.insert(conditionOp);
+  printRegion(whileOp.getBefore(), os, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap);
+
+  for (unsigned i = 0; i < indent + 1; ++i)
+    os << "  ";
+  os << "if not "
+     << getValueName(conditionOp.getCondition(), argSubstitutionMap) << ":\n";
+  for (auto [result, forwarded] :
+       llvm::zip(op->getResults(), conditionOp.getArgs())) {
+    for (unsigned i = 0; i < indent + 2; ++i)
+      os << "  ";
+    os << getValueName(result, argSubstitutionMap) << " = "
+       << getValueName(forwarded, argSubstitutionMap) << "\n";
+  }
+  for (unsigned i = 0; i < indent + 2; ++i)
+    os << "  ";
+  os << "break\n";
+
+  // scf.condition forwards values into the after-region arguments. Substitute
+  // them while printing the body instead of emitting misleading no-op
+  // assignments when MLIR gives corresponding region arguments the same name.
+  DenseMap<Value, Value> whileSubstitutions;
+  if (argSubstitutionMap)
+    whileSubstitutions = *argSubstitutionMap;
+  for (auto [arg, forwarded] :
+       llvm::zip(after.getArguments(), conditionOp.getArgs()))
+    whileSubstitutions[arg] = forwarded;
+
+  // scf.yield carries the next values back to the before-region arguments.
+  SmallVector<Value> yieldTargets(before.getArguments());
+  printRegion(whileOp.getAfter(), os, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, &whileSubstitutions, yieldTargets);
+}
+
+// Helper to check if a region has meaningful operations (not just skipped ops)
+bool regionHasMeaningfulOps(
+    Region &region, const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps) {
+  for (Block &block : region) {
+    for (Operation &op : block) {
+      // Skip operations that would be filtered out
+      if (shouldSkipOp(&op, allocInfoMap, skippedOps))
+        continue;
+      // Skip scf.yield as it's handled specially
+      if (op.getName().getStringRef() == "scf.yield")
+        continue;
+      // Found a meaningful operation
+      return true;
+    }
+  }
+  return false;
+}
+
+// Print an async_task body, or `pass` if it turns out to be empty.
+// A partition can hold nothing the printer emits -- the "default" partition of
+// a warp_specialize often holds only ops that are skipped -- and Python needs a
+// body, so an empty one has to be spelled rather than omitted.
+static void
+printTaskBody(Region &region, llvm::raw_ostream &os,
+              const llvm::StringMap<StringRef> &opNameMap,
+              const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+              llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+              DenseMap<Value, Value> *argSubstitutionMap) {
+  std::string body;
+  llvm::raw_string_ostream bodyOs(body);
+  printRegion(region, bodyOs, opNameMap, allocInfoMap, skippedOps, indent,
+              argSubstitutionMap);
+  bodyOs.flush();
+
+  // A comment does not count: the printer emits standalone `# unsupported: ...`
+  // markers, and a block holding only those is as unparseable as an empty one.
+  bool hasStatement = false;
+  for (StringRef line : llvm::split(StringRef(body), '\n')) {
+    StringRef trimmed = line.ltrim();
+    if (trimmed.empty() || trimmed.starts_with("#"))
+      continue;
+    hasStatement = true;
+    break;
+  }
+
+  os << body;
+  if (hasStatement)
+    return;
+  // Keep any markers that were emitted and give the block something to run.
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "pass\n";
+}
+
+// Print warp_specialize operation in TLX async_tasks format
+// The barrier argument(s) of tlx.barrier_arrive. TLX maps a barrier to a
+// peer CTA itself and rejects a remote_view, so a remote barrier is spelled
+// as its local view plus the rank.
+static std::string
+barrierArriveTarget(Value barrier,
+                    const DenseMap<Value, Value> *argSubstitutionMap) {
+  if (auto remote = barrier.getDefiningOp<ttng::MapToRemoteBufferOp>())
+    return getValueName(remote.getSrc(), argSubstitutionMap) +
+           ", remote_cta_rank=" +
+           getValueName(remote.getCtaRank(), argSubstitutionMap);
+  return getValueName(barrier, argSubstitutionMap);
+}
+
+void printLocComment(Operation *op, llvm::raw_ostream &os);
+
+// `tlx.local_alloc(..., reuse=base)` viewing `base` as `dstType`.
+static void printReuseAlloc(ttg::MemDescType dstType, StringRef base,
+                            llvm::raw_ostream &os) {
+  int64_t count = 1;
+  SmallVector<int64_t> actualShape;
+  splitAllocShape(dstType.getShape(), count, actualShape);
+  os << "tlx.local_alloc((";
+  for (size_t i = 0; i < actualShape.size(); ++i) {
+    if (i > 0)
+      os << ", ";
+    os << actualShape[i];
+  }
+  if (actualShape.size() == 1)
+    os << ","; // trailing comma for single-element tuple
+  os << "), " << getElementTypeName(dstType.getElementType()) << ", " << count;
+  // This op is legal on shared memory too, so name the storage kind from the
+  // memory space rather than assuming tensor memory.
+  if (isa_and_nonnull<ttng::TensorMemorySpaceAttr>(dstType.getMemorySpace()))
+    os << ", tlx.storage_kind.tmem";
+  os << ", reuse=" << base << ")";
+}
+
+static bool isRetypingReinterpret(Operation *op) {
+  if (op->getName().getStringRef() != "ttg.memdesc_reinterpret")
+    return false;
+  auto srcType = dyn_cast<ttg::MemDescType>(op->getOperand(0).getType());
+  auto dstType = dyn_cast<ttg::MemDescType>(op->getResult(0).getType());
+  return srcType && dstType &&
+         (srcType.getElementType() != dstType.getElementType() ||
+          srcType.getShape() != dstType.getShape());
+}
+
+// Whether the source lowers this warp_specialize with direct warp-ID dispatch,
+// where each worker runs its partition once and exits, instead of parking the
+// workers in a dispatch loop until the kernel ends. The module records it as
+// ttg.single-warp-specialize: TLX's exclusive=True sets it in Fixup, and
+// AllocateWarpGroups, which runs before this printer in the compiler, sets it
+// for a single AutoWS warp_specialize. That condition is repeated here for
+// TTGIR printed before AllocateWarpGroups, such as a dumped .ttgir file.
+static bool usesSingleWarpSpecialize(Operation *wsOp) {
+  auto mod = wsOp->getParentOfType<ModuleOp>();
+  if (ttg::hasSingleWarpSpecialize(mod))
+    return true;
+  unsigned numWsOps = 0;
+  mod.walk([&](ttg::WarpSpecializeOp) { ++numWsOps; });
+  if (numWsOps != 1)
+    return false;
+  // kWarpSpecializeTagAttrName, which AutoWS puts on the loops it specializes.
+  return wsOp
+      ->walk([](Operation *inner) {
+        return inner->hasAttr("ttg.warp_specialize.tag")
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+// Retyping reinterprets inside a partition, hoisted to just before
+// tlx.async_tasks(): `reuse=` must name a top-level allocation, and inside a
+// partition the allocation is only a capture. Maps each op to the hoisted name.
+static thread_local DenseMap<Operation *, std::string> *hoistedReinterprets =
+    nullptr;
+
+// The most registers setmaxnreg can give a task, and the most tlx.async_task
+// accepts.
+constexpr int32_t kMaxTaskRegisters = 256;
+
+void printWarpSpecialize(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps, unsigned indent) {
+  DenseMap<Operation *, std::string> hoisted;
+  llvm::SaveAndRestore<DenseMap<Operation *, std::string> *> hoistedScope(
+      hoistedReinterprets, &hoisted);
+  // One hoisted alias per name, shared by every partition. The name spells
+  // everything the alias line prints: allocation, element type and shape, and
+  // the storage kind follows from the allocation, since memdesc_reinterpret
+  // cannot change memory space. Views differing only in encoding share a line.
+  llvm::StringSet<> emitted;
+  op->walk([&](Operation *inner) {
+    if (!isRetypingReinterpret(inner))
+      return;
+    auto arg = dyn_cast<BlockArgument>(inner->getOperand(0));
+    if (!arg)
+      return;
+    auto partitions = dyn_cast<ttg::WarpSpecializePartitionsOp>(
+        arg.getOwner()->getParentOp());
+    if (!partitions || arg.getArgNumber() >= partitions->getNumOperands())
+      return;
+    Value base = partitions->getOperand(arg.getArgNumber());
+    if (!isa_and_nonnull<ttg::LocalAllocOp, ttng::TMEMAllocOp>(
+            base.getDefiningOp()))
+      return;
+    auto dstType = cast<ttg::MemDescType>(inner->getResult(0).getType());
+    std::string baseName = getValueName(base);
+    std::string elem;
+    llvm::raw_string_ostream elemOs(elem);
+    elemOs << dstType.getElementType();
+    std::string name = baseName + "_as_" + elem;
+    for (int64_t d : dstType.getShape())
+      name += "_" + std::to_string(d);
+    if (emitted.insert(name).second) {
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << name << " = ";
+      printReuseAlloc(dstType, baseName, os);
+      printLocComment(inner, os);
+    }
+    hoisted[inner] = name;
+  });
+
+  // Print "with tlx.async_tasks():"
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "with tlx.async_tasks(";
+  if (usesSingleWarpSpecialize(op))
+    os << "exclusive=True";
+  os << "):\n";
+
+  // Get the operands passed to warp_specialize
+  SmallVector<Value> wsOperands;
+  for (Value operand : op->getOperands()) {
+    wsOperands.push_back(operand);
+  }
+
+  // AllocateWarpGroups runs before this printer and resolves the requested
+  // counts, where -1 asks for an even share of what the other tasks leave,
+  // into actualRegisters (default region first). Print those final counts;
+  // the frontend takes registers for all non-default tasks or none, so a
+  // request that still holds -1 prints none. Lowering clamps every count to
+  // kMaxTaskRegisters, so a default share above it is what the default task
+  // gets without asking and stays unprinted, and a partition's is clamped.
+  std::optional<int32_t> defaultRegs;
+  std::optional<ArrayRef<int32_t>> partRegs;
+  if (auto actual = op->getAttrOfType<DenseI32ArrayAttr>("actualRegisters");
+      actual && !actual.empty()) {
+    if (actual[0] <= kMaxTaskRegisters)
+      defaultRegs = actual[0];
+    partRegs = actual.asArrayRef().drop_front();
+  } else if (auto requested =
+                 op->getAttrOfType<DenseI32ArrayAttr>("requestedRegisters");
+             requested && !llvm::is_contained(requested.asArrayRef(), -1)) {
+    partRegs = requested.asArrayRef();
+    if (auto def = op->getAttrOfType<IntegerAttr>("defaultRequestedRegisters"))
+      defaultRegs = def.getInt();
+  }
+
+  unsigned regionIdx = 0;
+  for (Region &region : op->getRegions()) {
+    if (regionIdx == 0) {
+      // First region is the default clause
+      // Build substitution map: region block args -> warp_specialize operands
+      DenseMap<Value, Value> argSubstitutionMap;
+      if (!region.empty()) {
+        Block &entryBlock = region.front();
+        for (unsigned i = 0;
+             i < entryBlock.getNumArguments() && i < wsOperands.size(); ++i) {
+          argSubstitutionMap[entryBlock.getArgument(i)] = wsOperands[i];
+        }
+      }
+
+      // Print indentation and "with tlx.async_task("default"):"
+      for (unsigned i = 0; i < indent + 1; ++i)
+        os << "  ";
+      os << "with tlx.async_task(\"default\"";
+      if (defaultRegs)
+        os << ", registers=" << *defaultRegs;
+      os << "):\n";
+
+      // Print region contents with extra indentation and substitution map
+      printTaskBody(region, os, opNameMap, allocInfoMap, skippedOps, indent + 2,
+                    &argSubstitutionMap);
+    } else {
+      // Subsequent regions contain ttg.warp_specialize.partitions
+      // which has multiple regions (one per partition)
+      for (Block &block : region) {
+        for (Operation &innerOp : block) {
+          if (innerOp.getName().getStringRef() ==
+              "ttg.warp_specialize.partitions") {
+            // Each region in warp_specialize.partitions is a partition
+            unsigned partitionIdx = 0;
+            ArrayRef<int32_t> partNumWarps;
+            if (auto nwAttr =
+                    op->getAttrOfType<DenseI32ArrayAttr>("partitionNumWarps"))
+              partNumWarps = nwAttr.asArrayRef();
+            for (Region &partitionRegion : innerOp.getRegions()) {
+              // Skip empty partitions (only contain skipped ops)
+              if (!regionHasMeaningfulOps(partitionRegion, allocInfoMap,
+                                          skippedOps)) {
+                partitionIdx++;
+                continue;
+              }
+
+              // Build substitution map for this partition
+              DenseMap<Value, Value> argSubstitutionMap;
+              if (!partitionRegion.empty()) {
+                Block &entryBlock = partitionRegion.front();
+                for (unsigned i = 0; i < entryBlock.getNumArguments() &&
+                                     i < innerOp.getNumOperands();
+                     ++i) {
+                  argSubstitutionMap[entryBlock.getArgument(i)] =
+                      innerOp.getOperand(i);
+                }
+              }
+
+              // Print "with tlx.async_task(num_warps=N, registers=R):"
+              for (unsigned i = 0; i < indent + 1; ++i)
+                os << "  ";
+              os << "with tlx.async_task(";
+              if (partitionIdx < partNumWarps.size())
+                os << "num_warps=" << partNumWarps[partitionIdx];
+              else
+                os << "num_warps=1";
+              if (partRegs && partitionIdx < partRegs->size())
+                os << ", registers="
+                   << std::min((*partRegs)[partitionIdx], kMaxTaskRegisters);
+              os << "):\n";
+
+              // Print partition contents
+              printTaskBody(partitionRegion, os, opNameMap, allocInfoMap,
+                            skippedOps, indent + 2, &argSubstitutionMap);
+              partitionIdx++;
+            }
+          }
+        }
+      }
+    }
+    regionIdx++;
+  }
+}
+
+// Extract source location string (basename:line) from an MLIR Location.
+// Recursively unwraps NameLoc, CallSiteLoc, FusedLoc to find the underlying
+// FileLineColLoc.
+std::string getLocString(Location loc) {
+  if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+    StringRef filename = fileLoc.getFilename().getValue();
+    size_t lastSlash = filename.rfind('/');
+    if (lastSlash != StringRef::npos)
+      filename = filename.substr(lastSlash + 1);
+    return (filename + ":" + Twine(fileLoc.getLine())).str();
+  }
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    return getLocString(nameLoc.getChildLoc());
+  }
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    std::string result = getLocString(callSiteLoc.getCallee());
+    if (!result.empty())
+      return result;
+    return getLocString(callSiteLoc.getCaller());
+  }
+  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    for (Location subLoc : fusedLoc.getLocations()) {
+      std::string result = getLocString(subLoc);
+      if (!result.empty())
+        return result;
+    }
+  }
+  return "";
+}
+
+// Print "  # filename:line\n" comment suffix for an operation, or just "\n"
+// if location is unknown.
+void printLocComment(Operation *op, llvm::raw_ostream &os) {
+  StringRef opName = op->getName().getStringRef();
+  // memdesc_index is a compiler-generated lowering op whose inherited
+  // MLIR location does not correspond to user-written Python code.
+  if (opName != "ttg.memdesc_index") {
+    std::string loc = getLocString(op->getLoc());
+    if (!loc.empty())
+      os << "  # " << loc;
+  }
+  os << "\n";
+}
+
+// Emit `s` as a double-quoted Python string literal. Assertion messages carry
+// source text, so they can contain quotes, backslashes and newlines.
+static void printPythonStringLiteral(StringRef s, llvm::raw_ostream &os) {
+  os << '"';
+  for (char c : s) {
+    switch (c) {
+    case '"':
+      os << "\\\"";
+      break;
+    case '\\':
+      os << "\\\\";
+      break;
+    case '\n':
+      os << "\\n";
+      break;
+    case '\r':
+      os << "\\r";
+      break;
+    case '\t':
+      os << "\\t";
+      break;
+    default:
+      // Bytes >= 0x80 are left alone: they are UTF-8 continuation bytes, and
+      // escaping them individually would turn one character into several.
+      unsigned char b = static_cast<unsigned char>(c);
+      if (b < 0x20 || b == 0x7f)
+        os << llvm::format("\\x%02x", b);
+      else
+        os << c;
+    }
+  }
+  os << '"';
+}
+
+// Resolve an operand of an AttrSizedOperandSegments op by declared position.
+// Absent optional groups have size 0, so positional reads shift.
+static Value getSegmentOperand(Operation *op, unsigned segmentIdx) {
+  auto segments = op->getAttrOfType<DenseI32ArrayAttr>("operandSegmentSizes");
+  if (!segments)
+    return nullptr;
+  ArrayRef<int32_t> sizes = segments.asArrayRef();
+  if (segmentIdx >= sizes.size() || sizes[segmentIdx] == 0)
+    return nullptr;
+  unsigned start = 0;
+  for (unsigned i = 0; i < segmentIdx; ++i)
+    start += sizes[i];
+  return start < op->getNumOperands() ? op->getOperand(start) : nullptr;
+}
+
+// Parameters of a warp_predicate body. The region has no block arguments: it
+// names the inits and its other captures directly, and tlx.warp_predicate
+// calls body(*inits, *args), so the inits lead. A capture whose name is not an
+// identifier is an inlined literal and needs none. `params` is optional -- the
+// call site emits only captures -- but both sites share this selection, so
+// their arities cannot drift.
+static void getWarpPredicateBodyArgs(Operation *wp,
+                                     SmallVectorImpl<std::string> *params,
+                                     SmallVectorImpl<Value> &captures) {
+  llvm::StringSet<> taken;
+  unsigned synthesized = 0;
+  for (Value init : wp->getOperands().drop_front()) {
+    // Inits are passed positionally, so one whose name is an inlined literal
+    // (`0`, `float('-inf')`) or that repeats an earlier name still needs a
+    // parameter -- just not that name, which Python would reject. Renaming is
+    // safe precisely because such a value is never referred to by name inside
+    // the body: every use of it renders as the literal.
+    std::string name = getValueName(init);
+    if (!isPythonIdentifier(name) || !taken.insert(name).second) {
+      do {
+        name = "_wp_init_" + std::to_string(synthesized++);
+      } while (!taken.insert(name).second);
+    }
+    if (params)
+      params->push_back(name);
+  }
+  SmallVector<Value> raw;
+  collectRegionCaptures(wp->getRegion(0), raw);
+  for (Value c : raw) {
+    std::string name = getValueName(c);
+    if (!isPythonIdentifier(name) || !taken.insert(name).second)
+      continue;
+    if (params)
+      params->push_back(name);
+    captures.push_back(c);
+  }
+}
+
+// Print operation in simplified TLX format
+void printSimplifiedOp(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap, unsigned indent,
+    const DenseMap<Value, Value> *argSubstitutionMap = nullptr) {
+  StringRef opName = op->getName().getStringRef();
+
+  // Print indentation
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+
+  // Special handling for arith.constant - print the value directly
+  if (opName == "arith.constant") {
+    if (op->getNumResults() > 0) {
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    }
+    if (auto valueAttr = op->getAttr("value")) {
+      printConstantValue(valueAttr, os);
+    } else {
+      os << "const";
+    }
+    printLocComment(op, os);
+    return;
+  }
+
+  // Special handling for tt.reshape - print target shape
+  if (opName == "tt.reshape" && op->getNumResults() > 0) {
+    if (auto resultType =
+            dyn_cast<RankedTensorType>(op->getResult(0).getType())) {
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << "tl.reshape(";
+      os << getValueName(op->getOperand(0), argSubstitutionMap) << ", [";
+      ArrayRef<int64_t> shape = resultType.getShape();
+      for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << shape[i];
+      }
+      os << "])";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // Special handling for binary infix operators (a + b, a * b, etc.)
+  {
+    static llvm::StringMap<StringRef> infixOpMap = buildInfixOpMap();
+    auto infixIt = infixOpMap.find(opName);
+    if (infixIt != infixOpMap.end() && op->getNumOperands() == 2 &&
+        op->getNumResults() > 0) {
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+         << getValueName(op->getOperand(0), argSubstitutionMap) << " "
+         << infixIt->second << " "
+         << getValueName(op->getOperand(1), argSubstitutionMap);
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // Special handling for unary negation
+  if (opName == "arith.negf" && op->getNumOperands() == 1 &&
+      op->getNumResults() > 0) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = -"
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    printLocComment(op, os);
+    return;
+  }
+
+  // Special handling for cmpi/cmpf - print as infix comparison
+  if ((opName == "arith.cmpi" || opName == "arith.cmpf") &&
+      op->getNumOperands() == 2 && op->getNumResults() > 0) {
+    if (auto predAttr = op->getAttrOfType<IntegerAttr>("predicate")) {
+      int64_t pred = predAttr.getInt();
+      StringRef cmpOp = (opName == "arith.cmpi") ? getCmpIOperator(pred)
+                                                 : getCmpFOperator(pred);
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+         << getValueName(op->getOperand(0), argSubstitutionMap) << " " << cmpOp
+         << " " << getValueName(op->getOperand(1), argSubstitutionMap);
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // Special handling for local_alloc
+  if (opName == "ttg.local_alloc") {
+    // A ui128 buffer is a CLC response allocation; that element type has no
+    // TLX spelling, so emit the dedicated allocator.
+    if (auto memDescType =
+            dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
+      if (memDescType.getElementType().isUnsignedInteger(128)) {
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+        int64_t num = 1;
+        for (int64_t dim : memDescType.getShape())
+          num *= dim;
+        os << "tlx._alloc_clc_responses(" << num << ")";
+        printLocComment(op, os);
+        return;
+      }
+    }
+    auto it = allocInfoMap.find(op);
+    if (it != allocInfoMap.end()) {
+      const LocalAllocInfo &info = it->second;
+      if (info.isBarrierAlloc && info.conflictingArriveCounts) {
+        // Any single count here would be wrong for the other slots.
+        os << "# unsupported: barrier slots with differing arrive counts";
+        printLocComment(op, os);
+        return;
+      }
+      if (info.isBarrierAlloc) {
+        // Print as result = tlx.alloc_barriers(count)
+        if (op->getNumResults() > 0) {
+          os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+        }
+        // An arrive count that is a positive multiple of the warp size is a
+        // warp barrier: every thread arrives, rather than one leader per warp.
+        ModuleOp mod = op->getParentOfType<ModuleOp>();
+        int warpSize = mod ? ttg::TritonGPUDialect::getThreadsPerWarp(mod) : 32;
+        if (info.arriveCount >= warpSize && info.arriveCount % warpSize == 0) {
+          os << "tlx.alloc_warp_barrier(" << info.barrierCount << ", "
+             << (info.arriveCount / warpSize) << ")";
+        } else if (info.arriveCount != 1) {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ", "
+             << info.arriveCount << ")";
+        } else {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        }
+        printLocComment(op, os);
+        return;
+      } else {
+        // Print as tlx.local_alloc((shape), dtype, count)
+        if (op->getNumResults() > 0) {
+          os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+        }
+        if (info.singleBuffer)
+          os << "tlx.local_view(";
+        os << "tlx.local_alloc((";
+        for (size_t i = 0; i < info.shape.size(); ++i) {
+          if (i > 0)
+            os << ", ";
+          os << info.shape[i];
+        }
+        if (info.shape.size() == 1)
+          os << ","; // trailing comma for single-element tuple
+        os << "), " << getElementTypeName(info.elementType) << ", "
+           << info.bufferCount << ")";
+        if (info.singleBuffer)
+          os << ", 0)";
+        printLocComment(op, os);
+        return;
+      }
+    }
+  }
+
+  // === Special-case handlers for ops needing custom printing ===
+
+  // ttng.tmem_subslice: `offset` is an attribute the generic printer drops, and
+  // `size` is not an operand at all -- it is the extent of the sliced dimension
+  // in the result type.
+  if (opName == "ttng.tmem_subslice") {
+    // Asserted rather than tested: falling through would re-emit the very
+    // one-argument call this handler exists to replace, so a silent default
+    // would restore the aliasing bug without a diagnostic.
+    assert(op->getNumOperands() > 0 && op->getNumResults() > 0 &&
+           "tmem_subslice takes one memdesc and yields one");
+    auto resType = cast<ttg::MemDescType>(op->getResult(0).getType());
+    ArrayRef<int64_t> resShape = resType.getShape();
+    auto offAttr = op->getAttrOfType<IntegerAttr>("offset");
+    assert(!resShape.empty() && offAttr &&
+           "tmem_subslice requires a ranked result and an offset");
+    os << getValueName(op->getResult(0), argSubstitutionMap)
+       << " = tlx.subslice("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << offAttr.getInt() << ", " << resShape.back() << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.elementwise_inline_asm carries the asm text, constraints, purity and
+  // packing as attributes, so the generic printer emits only the operands and
+  // the call is missing four of its six arguments.
+  if (opName == "tt.elementwise_inline_asm") {
+    unsigned nres = op->getNumResults();
+    for (unsigned i = 0; i < nres; ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getResult(i), argSubstitutionMap);
+    if (nres > 0)
+      os << " = ";
+    os << "tl.inline_asm_elementwise(";
+    auto asmAttr = op->getAttrOfType<StringAttr>("asm_string");
+    printPythonStringLiteral(asmAttr ? asmAttr.getValue() : "", os);
+    os << ", ";
+    auto consAttr = op->getAttrOfType<StringAttr>("constraints");
+    printPythonStringLiteral(consAttr ? consAttr.getValue() : "", os);
+    // `args` is a sequence parameter, not varargs.
+    os << ", [";
+    for (unsigned i = 0; i < op->getNumOperands(); ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getOperand(i), argSubstitutionMap);
+    os << "], ";
+    // dtype is the result element type, and a list of them when the asm returns
+    // more than one value.
+    auto elemName = [&](Type t) {
+      if (auto rt = dyn_cast<RankedTensorType>(t))
+        return getElementTypeName(rt.getElementType());
+      return getElementTypeName(t);
+    };
+    if (nres == 1) {
+      os << elemName(op->getResult(0).getType());
+    } else {
+      os << "[";
+      for (unsigned i = 0; i < nres; ++i)
+        os << (i ? ", " : "") << elemName(op->getResult(i).getType());
+      os << "]";
+    }
+    // Default to impure when the attribute is missing: marking side-effecting
+    // asm pure would let the recompiled kernel hoist or delete it.
+    auto pureAttr = op->getAttrOfType<BoolAttr>("pure");
+    auto packAttr = op->getAttrOfType<IntegerAttr>("packed_element");
+    os << ", " << ((pureAttr && pureAttr.getValue()) ? "True" : "False") << ", "
+       << (packAttr ? packAttr.getInt() : 1) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // `assert` is a Python keyword, so the generic `tt.assert(cond)` spelling is
+  // a syntax error rather than an undefined name, and it drops the message.
+  if (opName == "tt.assert") {
+    os << "tl.device_assert("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (auto msgAttr = op->getAttrOfType<StringAttr>("message")) {
+      os << ", ";
+      printPythonStringLiteral(msgAttr.getValue(), os);
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.get_program_id: emit tl.program_id(axis=N)
+  if (opName == "tt.get_program_id") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int axis = 0;
+    if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
+      axis = axisAttr.getInt();
+    os << "tl.program_id(axis=" << axis << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.get_num_programs: emit tl.num_programs(axis=N)
+  if (opName == "tt.get_num_programs") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int axis = 0;
+    if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
+      axis = axisAttr.getInt();
+    os << "tl.num_programs(axis=" << axis << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.make_range: emit tl.arange(start, end)
+  if (opName == "tt.make_range") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int64_t start = 0, end = 0;
+    if (auto startAttr = op->getAttrOfType<IntegerAttr>("start"))
+      start = startAttr.getInt();
+    if (auto endAttr = op->getAttrOfType<IntegerAttr>("end"))
+      end = endAttr.getInt();
+    os << "tl.arange(" << start << ", " << end << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.expand_dims: emit tl.expand_dims(src, axis=N)
+  if (opName == "tt.expand_dims") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int axis = 0;
+    if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
+      axis = axisAttr.getInt();
+    os << "tl.expand_dims("
+       << getValueName(op->getOperand(0), argSubstitutionMap)
+       << ", axis=" << axis << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttg.local_store: swap arg order (MLIR has src,dst; Python needs dst,src)
+  // Also add .to(dtype) cast when the resolved source value's element type
+  // differs from destination (transparent cast ops may resolve names to
+  // pre-cast values while MLIR types show post-cast types)
+  if (opName == "ttg.local_store") {
+    Value src = op->getOperand(0);
+    Value dst = op->getOperand(1);
+    std::string srcName = getValueName(src, argSubstitutionMap);
+    std::string dstName =
+        viewOfBareSlot(dst, getValueName(dst, argSubstitutionMap), allocInfoMap,
+                       argSubstitutionMap);
+
+    // Check if transparent ops resolve the source name to a different-dtype
+    // value. Resolve through casts to find the actual Python-level type.
+    Value resolvedSrc = resolveThroughNonElementCasts(src);
+    Type dstElemType;
+    Type resolvedSrcElemType;
+    if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType()))
+      dstElemType = dstMemType.getElementType();
+    if (auto resolvedType = dyn_cast<RankedTensorType>(resolvedSrc.getType()))
+      resolvedSrcElemType = resolvedType.getElementType();
+
+    os << "tlx.local_store(" << dstName << ", " << srcName;
+    // dstElemType is always nameable: local_store requires src and dst element
+    // types to match, and TT_Float is exactly what isNameableElementType
+    // covers.
+    if (dstElemType && resolvedSrcElemType &&
+        resolvedSrcElemType != dstElemType) {
+      os << ".to(" << getElementTypeName(dstElemType) << ")";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.tmem_store: emit local_store(dst, src), drop pred/dep
+  // Also add .to(dtype) cast when resolved element types differ
+  if (opName == "ttng.tmem_store") {
+    Value dst = op->getOperand(0);
+    Value src = op->getOperand(1);
+    std::string srcName = getValueName(src, argSubstitutionMap);
+
+    Value resolvedSrc = resolveThroughNonElementCasts(src);
+    Type dstElemType;
+    Type resolvedSrcElemType;
+    if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType()))
+      dstElemType = dstMemType.getElementType();
+    if (auto resolvedType = dyn_cast<RankedTensorType>(resolvedSrc.getType()))
+      resolvedSrcElemType = resolvedType.getElementType();
+
+    os << "tlx.local_store(" << getValueName(dst, argSubstitutionMap) << ", "
+       << srcName;
+    // dstElemType is always nameable here, as in ttg.local_store above.
+    if (dstElemType && resolvedSrcElemType &&
+        resolvedSrcElemType != dstElemType) {
+      os << ".to(" << getElementTypeName(dstElemType) << ")";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.barrier_expect: emit barrier_expect_bytes(bar, SIZE)
+  if (opName == "ttng.barrier_expect") {
+    os << "tlx.barrier_expect_bytes("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (auto sizeAttr = op->getAttrOfType<IntegerAttr>("size"))
+      os << ", " << sizeAttr.getInt();
+    // A two-CTA TMA load signals the leader's barrier for both CTAs, so only
+    // the leader expects the bytes; dropping the predicate makes the peer
+    // expect bytes that never arrive.
+    Value pred = cast<ttng::BarrierExpectOp>(op).getPred();
+    if (!isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.wait_barrier: emit barrier_wait(bar, phase[, pred=...]).
+  if (opName == "ttng.wait_barrier" && op->getNumOperands() >= 2) {
+    os << "tlx.barrier_wait("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap);
+    // After (alloc, phase) come an optional i1 predicate and variadic memdesc
+    // dependency buffers. Only the predicate changes whether the wait executes,
+    // so emit that and skip the deps.
+    Value pred;
+    for (unsigned i = 2; i < op->getNumOperands(); ++i) {
+      Value v = op->getOperand(i);
+      if (!isa<ttg::MemDescType>(v.getType())) {
+        pred = v;
+        break;
+      }
+    }
+    if (pred && !isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.async_tma_gather: reorder args for Python API
+  // TTGIR operands: desc, x_offsets, y_offset, barrier, result, pred
+  // Python API: async_descriptor_gather(desc, result, x_offsets, y_offset,
+  //                                     barrier)
+  if (opName == "ttng.async_tma_gather") {
+    Value desc = op->getOperand(0);
+    Value xOffsets = op->getOperand(1);
+    Value yOffset = op->getOperand(2);
+    Value barrier = op->getOperand(3);
+    Value result = op->getOperand(4);
+    Value pred = op->getOperand(5);
+    os << "tlx.async_descriptor_gather("
+       << getValueName(desc, argSubstitutionMap) << ", "
+       << getValueName(result, argSubstitutionMap) << ", "
+       << getValueName(xOffsets, argSubstitutionMap) << ", "
+       << getValueName(yOffset, argSubstitutionMap) << ", "
+       << getValueName(barrier, argSubstitutionMap);
+    if (!isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    if (op->hasAttr("multicast"))
+      os << ", multicast=True";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.async_tma_copy_global_to_local: reorder args for Python API
+  // TTGIR operands: desc, coords..., result_buf, barrier, pred
+  // Python API: async_descriptor_load(desc, result_buf, [coords], barrier)
+  if (opName == "ttng.async_tma_copy_global_to_local") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    Value desc = op->getOperand(0);
+    SmallVector<Value> coords;
+    Value barrier, result, pred;
+    for (unsigned i = 1; i < op->getNumOperands(); ++i) {
+      Value v = op->getOperand(i);
+      if (auto memType = dyn_cast<ttg::MemDescType>(v.getType())) {
+        // Distinguish barrier (1xi64) from result buffer by element type
+        if (memType.getElementType().isInteger(64))
+          barrier = v;
+        else
+          result = v;
+      } else if (v.getType().isInteger(1)) {
+        pred = v;
+      } else {
+        coords.push_back(v);
+      }
+    }
+    os << "tlx.async_descriptor_load(" << getValueName(desc, argSubstitutionMap)
+       << ", "
+       << viewOfBareSlot(result, getValueName(result, argSubstitutionMap),
+                         allocInfoMap, argSubstitutionMap)
+       << ", [";
+    for (size_t i = 0; i < coords.size(); ++i) {
+      if (i > 0)
+        os << ", ";
+      os << getValueName(coords[i], argSubstitutionMap);
+    }
+    auto twoCTA = op->getAttrOfType<BoolAttr>("two_cta");
+    bool isTwoCTA = twoCTA && twoCTA.getValue();
+    // With two_ctas TLX maps the barrier to the leader CTA itself, and a
+    // remote_view of a remote_view is rejected.
+    if (isTwoCTA)
+      if (auto remote = barrier.getDefiningOp<ttng::MapToRemoteBufferOp>())
+        barrier = remote.getSrc();
+    os << "], " << getValueName(barrier, argSubstitutionMap);
+    if (pred && !isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    if (isTwoCTA)
+      os << ", two_ctas=True";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.async_tma_copy_local_to_global: reorder args for Python API
+  if (opName == "ttng.async_tma_copy_local_to_global") {
+    Value desc = op->getOperand(0);
+    SmallVector<Value> coords;
+    Value src;
+    for (unsigned i = 1; i < op->getNumOperands(); ++i) {
+      Value v = op->getOperand(i);
+      if (isa<ttg::MemDescType>(v.getType()))
+        src = v;
+      else
+        coords.push_back(v);
+    }
+    std::string srcName =
+        viewOfBareSlot(src, getValueName(src, argSubstitutionMap), allocInfoMap,
+                       argSubstitutionMap);
+    os << "tlx.async_descriptor_store("
+       << getValueName(desc, argSubstitutionMap) << ", " << srcName << ", [";
+    for (size_t i = 0; i < coords.size(); ++i) {
+      if (i > 0)
+        os << ", ";
+      os << getValueName(coords[i], argSubstitutionMap);
+    }
+    os << "])";
+    printLocComment(op, os);
+    return;
+  }
+
+  // Device-side TMA descriptors: global_scratch_alloc + tensormap_create +
+  // reinterpret_tensor_descriptor are what tl.make_tensor_descriptor lowers
+  // to, and map back onto the TLX descriptor-pointer API.
+  if (auto alloc = dyn_cast<ttg::GlobalScratchAllocOp>(op)) {
+    if (alloc.getAlignment() == 128 && alloc.getNbytes() % 128 == 0) {
+      os << getValueName(alloc.getResult(), argSubstitutionMap)
+         << " = tlx.allocate_tensor_descriptor(num=" << alloc.getNbytes() / 128
+         << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  if (auto create = dyn_cast<ttng::TensormapCreateOp>(op)) {
+    // tensormap dims are innermost-first, strides in bytes without the unit
+    // innermost one; the TLX API takes the tensor's own order and units.
+    unsigned rank = create.getRank();
+    auto ptrTy = cast<tt::PointerType>(create.getGlobalAddress().getType());
+    unsigned elemBits = ptrTy.getPointeeType().getIntOrFloatBitWidth();
+    // Byte strides only convert back to element strides for whole-byte
+    // elements; packed sub-byte data is addressed through an i8 pointer.
+    if (elemBits % 8 != 0) {
+      op->emitError("tensormap_create over a sub-byte element type does not "
+                    "round-trip to TLX");
+      os << "# unsupported: tensormap_create over " << ptrTy.getPointeeType();
+      printLocComment(op, os);
+      return;
+    }
+    unsigned elemBytes = elemBits / 8;
+    // The box is clipped to the swizzle width, so prefer the block shape the
+    // reinterpreted descriptor carries. Without one (the pointer reaches its
+    // reinterpret through another value), the box still round-trips:
+    // make_tensor_descriptor clips a block to the same box and swizzle, so
+    // the tensormap it writes is the same.
+    SmallVector<int64_t> blockShape;
+    for (Operation *user : create.getDescPtr().getUsers())
+      if (auto reinterpret = dyn_cast<ttng::ReinterpretTensorDescOp>(user))
+        blockShape = llvm::to_vector(
+            reinterpret.getResult().getType().getBlockType().getShape());
+    os << "tlx.make_tensor_descriptor("
+       << getValueName(create.getDescPtr(), argSubstitutionMap) << ", "
+       << getValueName(create.getGlobalAddress(), argSubstitutionMap)
+       << ", shape=[";
+    for (unsigned i = 0; i < rank; ++i) {
+      if (i > 0)
+        os << ", ";
+      os << getValueName(create.getGlobalDim()[rank - 1 - i],
+                         argSubstitutionMap);
+    }
+    os << "], strides=[";
+    for (unsigned i = 0; i + 1 < rank; ++i) {
+      Value stride = create.getGlobalStride()[rank - 2 - i];
+      APInt bytes;
+      if (matchPattern(stride, m_ConstantInt(&bytes)))
+        os << bytes.getSExtValue() / elemBytes;
+      else
+        os << "(" << getValueName(stride, argSubstitutionMap) << " // "
+           << elemBytes << ")";
+      os << ", ";
+    }
+    os << "1], block_shape=[";
+    for (unsigned i = 0; i < rank; ++i) {
+      if (i > 0)
+        os << ", ";
+      if (blockShape.size() == rank)
+        os << blockShape[i];
+      else
+        os << getValueName(create.getBoxDim()[rank - 1 - i],
+                           argSubstitutionMap);
+    }
+    os << "]";
+    if (create.getFillMode() == 1)
+      os << ", padding_option=\"nan\"";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (auto reinterpret = dyn_cast<ttng::ReinterpretTensorDescOp>(op)) {
+    if (reinterpret.getRawDesc().getDefiningOp<ttg::GlobalScratchAllocOp>()) {
+      RankedTensorType blockTy =
+          reinterpret.getResult().getType().getBlockType();
+      os << getValueName(reinterpret.getResult(), argSubstitutionMap)
+         << " = tlx.reinterpret_tensor_descriptor("
+         << getValueName(reinterpret.getRawDesc(), argSubstitutionMap)
+         << ", block_shape=[";
+      llvm::interleaveComma(blockTy.getShape(), os);
+      os << "], dtype=" << getElementTypeName(blockTy.getElementType()) << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // ttng.async_tma_reduce: the TLX API represents a TMA reduction as an
+  // async descriptor store with store_reduce set.
+  if (opName == "ttng.async_tma_reduce" && op->getNumOperands() >= 3) {
+    Value desc = op->getOperand(0);
+    Value src = op->getOperand(op->getNumOperands() - 1);
+    os << "tlx.async_descriptor_store("
+       << getValueName(desc, argSubstitutionMap) << ", "
+       << getValueName(src, argSubstitutionMap) << ", [";
+    for (unsigned i = 1; i + 1 < op->getNumOperands(); ++i) {
+      if (i > 1)
+        os << ", ";
+      os << getValueName(op->getOperand(i), argSubstitutionMap);
+    }
+    StringRef kind = "unknown";
+    if (auto reduce = dyn_cast<ttng::AsyncTMAReduceOp>(op))
+      kind = tt::stringifyDescriptorReduceKind(reduce.getKind());
+    os << "], store_reduce=\"" << kind << "\")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // Token waits are the lowered form of TLX descriptor-store waits.
+  if (opName == "ttng.async_tma_store_token_wait") {
+    int pendings = 0;
+    if (auto planned = op->getAttrOfType<IntegerAttr>(
+            triton::nvidia_gpu::kPlannedPendingCount))
+      pendings = planned.getInt();
+    os << "tlx.async_descriptor_store_wait(" << pendings << ")";
+    printLocComment(op, os);
+    // Warp specialization folds the consumer release into the wait; dropping
+    // it leaves the producer waiting on the staging buffer forever.
+    auto wait = cast<ttng::TMAStoreTokenWaitOp>(op);
+    for (auto [barrier, pred] :
+         llvm::zip(wait.getBarriers(), wait.getBarrierPreds())) {
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << "tlx.barrier_arrive("
+         << barrierArriveTarget(barrier, argSubstitutionMap);
+      if (!isConstantTrue(pred))
+        os << ", pred=" << getValueName(pred, argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+    }
+    return;
+  }
+
+  if (opName == "ttg.memdesc_subslice" && op->getNumResults() == 1) {
+    auto dstType = dyn_cast<ttg::MemDescType>(op->getResult(0).getType());
+    auto offsets = op->getAttrOfType<DenseI32ArrayAttr>("offsets");
+    os << getValueName(op->getResult(0), argSubstitutionMap)
+       << " = tlx.local_slice("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", [";
+    if (offsets) {
+      llvm::interleaveComma(offsets.asArrayRef(), os);
+    }
+    os << "], [";
+    if (dstType)
+      llvm::interleaveComma(dstType.getShape(), os);
+    os << "])";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (opName == "ttg.async_remote_shmem_copy" && op->getNumOperands() == 4) {
+    os << "tlx.async_remote_shmem_copy("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(2), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(3), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tma_store_wait: emit with pendings attribute
+  if (opName == "ttng.tma_store_wait" ||
+      opName == "ttng.async_tma_store_wait") {
+    int pendings = 0;
+    if (auto pendingsAttr = op->getAttrOfType<IntegerAttr>("pendings"))
+      pendings = pendingsAttr.getInt();
+    os << "tlx.async_descriptor_store_wait(" << pendings;
+    if (op->hasAttr("read_only"))
+      os << ", read_only=True";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.tc_gen5_mma: emit async_dot with named kwargs
+  if (opName == "ttng.tc_gen5_mma") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    os << "tlx.async_dot("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(2), argSubstitutionMap);
+    if (auto segSizes =
+            op->getAttrOfType<DenseI32ArrayAttr>("operandSegmentSizes")) {
+      ArrayRef<int32_t> sizes = segSizes.asArrayRef();
+      int idx = 3 + sizes[3]; // skip a,b,d,acc_dep
+      os << ", use_acc="
+         << getValueName(op->getOperand(idx), argSubstitutionMap);
+      // The predicate operand follows useD, and guards whether the dot runs
+      // at all.
+      Value mmaPred = op->getOperand(idx + 1);
+      idx += 2; // skip useD, pred
+      if (!isConstantTrue(mmaPred))
+        os << ", pred=" << getValueName(mmaPred, argSubstitutionMap);
+      int numBarriers = sizes[6];
+      if (numBarriers > 0) {
+        os << ", mBarriers=[";
+        for (int i = 0; i < numBarriers; ++i) {
+          if (i > 0)
+            os << ", ";
+          os << getValueName(op->getOperand(idx + i), argSubstitutionMap);
+        }
+        os << "]";
+      }
+      if (op->hasAttr("two_ctas"))
+        os << ", two_ctas=True";
+      if (op->hasAttr("is_async"))
+        os << ", force_async=True";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.warp_group_dot: Hopper wgmma. tlx.async_dot always builds the async
+  // form, so a synchronous dot is wrapped in a wait for zero pending groups,
+  // which is what its lowering does anyway.
+  if (auto dot = dyn_cast<ttng::WarpGroupDotOp>(op)) {
+    os << getValueName(dot.getResult(), argSubstitutionMap) << " = ";
+    if (!dot.getIsAsync())
+      os << "tlx.async_dot_wait(0, ";
+    os << "tlx.async_dot(" << getValueName(dot.getA(), argSubstitutionMap)
+       << ", " << getValueName(dot.getB(), argSubstitutionMap) << ", "
+       << getValueName(dot.getC(), argSubstitutionMap);
+    // The precision only means something for fp32 operands; for narrower
+    // types the attribute holds the enum's zero value whatever the source said.
+    if (getElementTypeOrSelf(dot.getA().getType()).isF32())
+      os << ", input_precision=\""
+         << triton::stringifyInputPrecision(dot.getInputPrecision()) << "\"";
+    os << ")";
+    if (!dot.getIsAsync())
+      os << ")";
+    if (dot.getUseC() && !isConstantTrue(dot.getUseC()))
+      os << "  # UNSUPPORTED: useC operand on ttng.warp_group_dot";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.warp_group_dot_wait carries the outstanding-group count as an
+  // attribute and waits on every input at once, including the operand buffers
+  // still being read and dots from earlier iterations.
+  if (auto wait = dyn_cast<ttng::WarpGroupDotWaitOp>(op)) {
+    if (op->getNumResults() == 1) {
+      os << getValueName(op->getResult(0), argSubstitutionMap);
+    } else {
+      os << "(";
+      for (unsigned i = 0; i < op->getNumResults(); ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getResult(i), argSubstitutionMap);
+      os << ")";
+    }
+    os << " = tlx.async_dot_wait(" << wait.getPendings() << ", ";
+    if (op->getNumOperands() == 1) {
+      os << getValueName(op->getOperand(0), argSubstitutionMap);
+    } else {
+      os << "(";
+      for (unsigned i = 0; i < op->getNumOperands(); ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getOperand(i), argSubstitutionMap);
+      os << ")";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.tc_gen5_commit: emit tcgen05_commit(barrier)
+  if (opName == "ttng.tc_gen5_commit") {
+    os << "tlx.tcgen05_commit("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (op->getNumOperands() > 1)
+      os << ", two_ctas=True";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.fence: emit tlx.fence("scope")
+  if (opName == "ttng.fence") {
+    if (auto scopeAttr = op->getAttrOfType<StringAttr>("scope"))
+      os << "tlx.fence(\"" << scopeAttr.getValue() << "\")";
+    else
+      os << "tlx.fence(\"gpu\")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.fence_async_shared: emit tlx.fence("async_shared")
+  if (opName == "ttng.fence_async_shared") {
+    os << "tlx.fence(\"async_shared\")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttg.memdesc_reinterpret: emit local_alloc with reuse= when dtype or shape
+  // differs
+  if (opName == "ttg.memdesc_reinterpret" && op->getNumResults() > 0) {
+    auto srcType = dyn_cast<ttg::MemDescType>(op->getOperand(0).getType());
+    auto dstType = dyn_cast<ttg::MemDescType>(op->getResult(0).getType());
+    if (srcType && dstType) {
+      bool dtypeDiffers = srcType.getElementType() != dstType.getElementType();
+      bool shapeDiffers = srcType.getShape() != dstType.getShape();
+      if (dtypeDiffers || shapeDiffers) {
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+        auto hoistedIt = hoistedReinterprets
+                             ? hoistedReinterprets->find(op)
+                             : DenseMap<Operation *, std::string>::iterator();
+        if (hoistedReinterprets && hoistedIt != hoistedReinterprets->end())
+          os << hoistedIt->second;
+        else
+          printReuseAlloc(
+              dstType, getValueName(op->getOperand(0), argSubstitutionMap), os);
+      } else {
+        // Same dtype and shape: emit as alias
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+           << getValueName(op->getOperand(0), argSubstitutionMap);
+      }
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // ttng.tmem_alloc: emit tlx.local_alloc with tmem storage
+  if (opName == "ttng.tmem_alloc") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    if (auto memDescType =
+            dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
+      Type elemType = memDescType.getElementType();
+      int64_t count = 1;
+      SmallVector<int64_t> actualShape;
+      splitAllocShape(memDescType.getShape(), count, actualShape);
+      os << "tlx.local_alloc((";
+      for (size_t i = 0; i < actualShape.size(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << actualShape[i];
+      }
+      if (actualShape.size() == 1)
+        os << ","; // trailing comma for single-element tuple
+      os << "), " << getElementTypeName(elemType) << ", " << count
+         << ", tlx.storage_kind.tmem)";
+    } else {
+      os << "ttng.tmem_alloc()";
+    }
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.arrive_barrier: `count` is an attribute and `pred` an optional
+  // operand, but the generic mapping printed both positionally.
+  if (opName == "ttng.arrive_barrier") {
+    // A multicast arrive has no TLX spelling; leave a marker instead of an
+    // arrive that would look local but mean something else.
+    auto multicastCTA = op->getAttrOfType<IntegerAttr>("multicastCTA");
+    if (multicastCTA && multicastCTA.getInt() != 0) {
+      op->emitError("multicast arrive_barrier does not round-trip to TLX");
+      os << "# unsupported: multicast arrive_barrier (multicastCTA="
+         << multicastCTA.getInt() << ")";
+      printLocComment(op, os);
+      return;
+    }
+    // count is required on this op, but tolerate its absence on hand-written
+    // IR rather than crash; 1 is the value the op defaults to anyway.
+    auto countAttr = op->getAttrOfType<IntegerAttr>("count");
+    int64_t count = countAttr ? countAttr.getInt() : 1;
+    bool perWarp = op->hasAttr("per_warp");
+    if (perWarp) {
+      // The op counts the whole task; TLX counts each warp.
+      std::optional<int> numWarps = ttg::maybeLookupNumWarps(op);
+      if (!numWarps || count % *numWarps != 0) {
+        op->emitError("per_warp arrive_barrier whose count does not split "
+                      "across its warps does not round-trip to TLX");
+        os << "# unsupported: per_warp arrive_barrier (count=" << count << ")";
+        printLocComment(op, os);
+        return;
+      }
+      count /= *numWarps;
+    }
+    os << "tlx.barrier_arrive("
+       << barrierArriveTarget(op->getOperand(0), argSubstitutionMap);
+    if (count != 1)
+      os << ", " << count;
+    if (op->getNumOperands() >= 2 && !isConstantTrue(op->getOperand(1)))
+      os << ", pred=" << getValueName(op->getOperand(1), argSubstitutionMap);
+    if (perWarp)
+      os << ", per_warp=True";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.async_clc_try_cancel(mbar, response): TLX takes (response, barrier).
+  if (opName == "ttng.async_clc_try_cancel") {
+    os << "tlx._clc_issue("
+       << getValueName(op->getOperand(1), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.clc_query_cancel(response): decodes the stolen tile's 3D CTA id,
+  // or (-1, -1, -1) when no work was claimed.
+  if (opName == "ttng.clc_query_cancel") {
+    unsigned nres = op->getNumResults();
+    for (unsigned i = 0; i < nres; ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getResult(i), argSubstitutionMap);
+    if (nres > 0)
+      os << " = ";
+    os << "tlx._clc_query("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // AMD buffer ops address global memory as base pointer + offset tensor,
+  // which Triton spells `ptr + offsets`. `stride` is a codegen hint.
+  if (opName == "amdg.buffer_load" || opName == "amdg.buffer_store" ||
+      opName == "amdg.buffer_load_to_local") {
+    // Declared operand order differs per op; see TritonAMDGPUOps.td.
+    Value value, dest, ptr, offsets, mask, other;
+    if (opName == "amdg.buffer_load") {
+      ptr = getSegmentOperand(op, 0);
+      offsets = getSegmentOperand(op, 1);
+      mask = getSegmentOperand(op, 3);
+      other = getSegmentOperand(op, 4);
+    } else if (opName == "amdg.buffer_store") {
+      value = getSegmentOperand(op, 0);
+      ptr = getSegmentOperand(op, 1);
+      offsets = getSegmentOperand(op, 2);
+      mask = getSegmentOperand(op, 4);
+    } else {
+      dest = getSegmentOperand(op, 0);
+      ptr = getSegmentOperand(op, 1);
+      offsets = getSegmentOperand(op, 2);
+      mask = getSegmentOperand(op, 3);
+      other = getSegmentOperand(op, 4);
+    }
+
+    // Guard every non-optional segment, not just ptr/offsets: getValueName
+    // dereferences the Value, so a missing one would crash rather than print.
+    if (!ptr || !offsets || (opName == "amdg.buffer_store" && !value) ||
+        (opName == "amdg.buffer_load_to_local" && !dest)) {
+      op->emitError("buffer op is missing a required operand and does not "
+                    "round-trip to TLX");
+      os << "# unsupported: " << opName << " (malformed operands)";
+      printLocComment(op, os);
+      return;
+    }
+
+    std::string addr = getValueName(ptr, argSubstitutionMap) + " + " +
+                       getValueName(offsets, argSubstitutionMap);
+
+    if (opName == "amdg.buffer_store") {
+      os << "tl.store(" << addr << ", "
+         << getValueName(value, argSubstitutionMap);
+    } else if (opName == "amdg.buffer_load") {
+      if (op->getNumResults() > 0)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << "tl.load(" << addr;
+    } else {
+      // buffer_load_to_local returns an async token, like tlx.async_load.
+      if (op->getNumResults() > 0)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << "tlx.async_load(" << addr << ", "
+         << getValueName(dest, argSubstitutionMap);
+    }
+    if (mask)
+      os << ", mask=" << getValueName(mask, argSubstitutionMap);
+    if (other)
+      os << ", other=" << getValueName(other, argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // Both take their tokens as a list, and async_wait carries its outstanding-
+  // group count in the `num` attribute rather than as an operand.
+  if (opName == "ttg.async_commit_group" || opName == "ttg.async_wait") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    bool isWait = opName == "ttg.async_wait";
+    os << (isWait ? "tlx.async_load_wait_group("
+                  : "tlx.async_load_commit_group(");
+    if (isWait) {
+      auto num = op->getAttrOfType<IntegerAttr>("num");
+      os << (num ? num.getInt() : 0);
+      // The tokens list is optional; omit it entirely when there are none.
+      if (op->getNumOperands() > 0)
+        os << ", ";
+    }
+    if (!isWait || op->getNumOperands() > 0) {
+      os << "[";
+      for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << getValueName(op->getOperand(i), argSubstitutionMap);
+      }
+      os << "]";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // llvm.intr.assume is a tl.assume from the source kernel.
+  if (opName == "llvm.intr.assume" && op->getNumOperands() == 1) {
+    os << "tl.assume(" << getValueName(op->getOperand(0), argSubstitutionMap)
+       << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // AMD-only: create_workgroup_barrier brackets the ttg.barrier with two
+  // rocdl.sched.barrier guards, which a non-AMD target cannot lower; on AMD
+  // they constrain scheduling but not results. Local must match exactly -- a
+  // wider mask would be silently under-fenced, so it goes to the generic path.
+  if (auto barrier = dyn_cast<ttg::BarrierOp>(op)) {
+    if (isAMDTarget(op) && barrier.getAddrSpace() == ttg::AddrSpace::Local) {
+      os << "tlx.workgroup_barrier()";
+      printLocComment(op, os);
+      return;
+    }
+    // tl.debug_barrier fences every address space, so it covers any subset;
+    // warp specialization uses this to publish its barrier inits.
+    if (!isAMDTarget(op)) {
+      os << "tl.debug_barrier()";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tl.maximum/minimum/clamp default to propagate_nan=NONE, which is the
+  // NaN-quieting behaviour of maxnumf/minnumf. maximumf/minimumf propagate
+  // NaN instead, and tt.clampf carries the choice in an attribute, so all
+  // three have to say so explicitly or the round trip changes NaN semantics.
+  if ((opName == "arith.maximumf" || opName == "arith.minimumf") &&
+      op->getNumOperands() == 2 && op->getNumResults() == 1) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+       << (opName == "arith.maximumf" ? "tl.maximum(" : "tl.minimum(")
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap)
+       << ", propagate_nan=tl.PropagateNan.ALL)";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (auto clamp = dyn_cast<tt::ClampFOp>(op)) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = tl.clamp(";
+    for (unsigned i = 0; i < 3; ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getOperand(i), argSubstitutionMap);
+    if (clamp.getPropagateNan() == tt::PropagateNan::ALL)
+      os << ", propagate_nan=tl.PropagateNan.ALL";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // amdg.extract_slice takes its offsets as an attribute and gets its shape
+  // from the result type; tlx.extract_slice wants both spelled out.
+  if (opName == "amdg.extract_slice" && op->getNumResults() == 1 &&
+      op->getNumOperands() == 1) {
+    auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    auto srcTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto offsets = op->getAttrOfType<DenseI64ArrayAttr>("static_offsets");
+    // tlx.extract_slice takes the shape and the offsets as equal-length lists;
+    // emitting mismatched ranks would be silently wrong, so leave a disagreeing
+    // op to the generic path, which flags it. A dynamic dimension is the same
+    // hazard: getDimSize would hand back ShapedType::kDynamic and that negative
+    // sentinel would be emitted as the shape. The encodings have to agree too:
+    // only the shape and offsets are emitted, and create_amd_extract_slice
+    // rebuilds the result type from the source encoding, so a result that was
+    // laid out differently would come back silently relaid out. The verifier
+    // pins lane and warp bases but not the register bases, so they can differ.
+    if (resTy && srcTy && resTy.hasStaticShape() &&
+        resTy.getEncoding() == srcTy.getEncoding() && offsets &&
+        offsets.size() == resTy.getRank()) {
+      os << getValueName(op->getResult(0), argSubstitutionMap)
+         << " = tlx.extract_slice("
+         << getValueName(op->getOperand(0), argSubstitutionMap) << ", [";
+      for (unsigned i = 0; i < resTy.getRank(); ++i)
+        os << (i ? ", " : "") << resTy.getDimSize(i);
+      os << "], [";
+      for (unsigned i = 0; i < offsets.size(); ++i)
+        os << (i ? ", " : "") << offsets[i];
+      os << "])";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // gpu.thread_id carries its axis in a `dimension` enum attribute rather than
+  // an operand, so the generic path would drop it.
+  if (opName == "gpu.thread_id" && op->getNumResults() == 1) {
+    if (Attribute dimAttr = op->getAttr("dimension")) {
+      std::string dim;
+      llvm::raw_string_ostream dimOs(dim);
+      dimAttr.print(dimOs);
+      dimOs.flush();
+      // The enum prints as `#gpu<dim y>`. Match the final token exactly rather
+      // than searching the whole string, where an incidental 'y' or 'z' would
+      // pick the wrong axis. An unrecognised or absent dimension falls through
+      // to the generic path, which flags it, rather than defaulting to x.
+      StringRef token = StringRef(dim).rtrim(" >");
+      size_t cut = token.find_last_of(" <");
+      if (cut != StringRef::npos)
+        token = token.drop_front(cut + 1);
+      int axis = token == "x" ? 0 : token == "y" ? 1 : token == "z" ? 2 : -1;
+      if (axis >= 0) {
+        os << getValueName(op->getResult(0), argSubstitutionMap)
+           << " = tlx.thread_id(" << axis << ")";
+        printLocComment(op, os);
+        return;
+      }
+    }
+  }
+
+  // The mask rides through into tlx.amd_sched_barrier as its integer encoding,
+  // whether it is a plain IntegerAttr or a SchedGroupMask enum attribute.
+  if (opName == "rocdl.sched.barrier") {
+    if (auto m = op->getAttrOfType<IntegerAttr>("mask")) {
+      os << "tlx.amd_sched_barrier(" << m.getInt() << ")";
+      printLocComment(op, os);
+      return;
+    }
+    if (auto m = op->getAttrOfType<ROCDL::SchedGroupMaskAttr>("mask")) {
+      os << "tlx.amd_sched_barrier(" << static_cast<uint32_t>(m.getValue())
+         << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tt.atomic_rmw selects its operation with an enum attribute; each maps to a
+  // distinct tl.atomic_* builtin. The switch is exhaustive on purpose: a new
+  // RMWOp then fails the build rather than silently losing which atomic it was.
+  if (auto rmw = dyn_cast<tt::AtomicRMWOp>(op)) {
+    StringRef fn;
+    switch (rmw.getAtomicRmwOp()) {
+    case tt::RMWOp::AND:
+      fn = "tl.atomic_and";
+      break;
+    case tt::RMWOp::OR:
+      fn = "tl.atomic_or";
+      break;
+    case tt::RMWOp::XOR:
+      fn = "tl.atomic_xor";
+      break;
+    case tt::RMWOp::ADD:
+    case tt::RMWOp::FADD:
+      fn = "tl.atomic_add";
+      break;
+    case tt::RMWOp::MAX:
+    case tt::RMWOp::UMAX:
+      fn = "tl.atomic_max";
+      break;
+    case tt::RMWOp::MIN:
+    case tt::RMWOp::UMIN:
+      fn = "tl.atomic_min";
+      break;
+    case tt::RMWOp::XCHG:
+      fn = "tl.atomic_xchg";
+      break;
+    }
+    if (!fn.empty()) {
+      if (op->getNumResults() == 1)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << fn << "(" << getValueName(op->getOperand(0), argSubstitutionMap)
+         << ", " << getValueName(op->getOperand(1), argSubstitutionMap);
+      if (op->getNumOperands() > 2)
+        os << ", mask=" << getValueName(op->getOperand(2), argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tt.scan carries its combiner in a region. An add combiner is a cumulative
+  // sum, which tl.cumsum expresses directly; other combiners have no builtin
+  // and fall through to the unsupported path.
+  if (opName == "tt.scan" && op->getNumResults() == 1 &&
+      op->getNumOperands() == 1 && op->getNumRegions() > 0) {
+    // Only the combiner's own top-level ops decide the kind, matching the
+    // tt.reduce detector. A recursive walk would let an arith.addf nested in,
+    // say, an scf.if masquerade as a cumulative sum.
+    bool isSum = false;
+    for (Block &block : op->getRegion(0))
+      for (Operation &bodyOp : block) {
+        StringRef n = bodyOp.getName().getStringRef();
+        if (n == "arith.addf" || n == "arith.addi")
+          isSum = true;
+      }
+    auto axis = op->getAttrOfType<IntegerAttr>("axis");
+    auto reverse = op->getAttrOfType<BoolAttr>("reverse");
+    if (isSum && axis) {
+      os << getValueName(op->getResult(0), argSubstitutionMap)
+         << " = tl.cumsum("
+         << getValueName(op->getOperand(0), argSubstitutionMap)
+         << ", axis=" << axis.getInt();
+      if (reverse && reverse.getValue())
+        os << ", reverse=True";
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tt.extern_elementwise names its callee in attributes, which the generic
+  // path drops. Call the module-scope wrapper emitted for it instead.
+  if (opName == "tt.extern_elementwise" && op->getNumResults() == 1 &&
+      externSigNames) {
+    auto sig = externSigNames->find(op);
+    if (sig != externSigNames->end()) {
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+         << sig->second << "(";
+      for (unsigned i = 0; i < op->getNumOperands(); ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getOperand(i), argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // ttg.warp_predicate's region is emitted as a module-scope body function;
+  // here we only need the call that binds its results.
+  if (opName == "ttg.warp_predicate" && warpPredicateBodyNames) {
+    // Membership alone says a body was hoisted -- the emitter records only ops
+    // it emitted one for, and the region-comment guards key off it too.
+    auto body = warpPredicateBodyNames->find(op);
+    if (body != warpPredicateBodyNames->end()) {
+      if (op->getNumResults() == 1) {
+        os << getValueName(op->getResult(0), argSubstitutionMap);
+      } else {
+        os << "(";
+        for (unsigned i = 0; i < op->getNumResults(); ++i)
+          os << (i ? ", " : "")
+             << getValueName(op->getResult(i), argSubstitutionMap);
+        os << ")";
+      }
+      os << " = tlx.warp_predicate("
+         << getValueName(op->getOperand(0), argSubstitutionMap) << ", (";
+      // Trailing commas keep single-element tuples from collapsing.
+      for (unsigned i = 1; i < op->getNumOperands(); ++i)
+        os << getValueName(op->getOperand(i), argSubstitutionMap) << ", ";
+      os << "), " << body->second << ", (";
+      SmallVector<Value> captures;
+      getWarpPredicateBodyArgs(op, /*params=*/nullptr, captures);
+      for (Value c : captures)
+        os << getValueName(c, argSubstitutionMap) << ", ";
+      os << ")";
+      if (op->hasAttr("wave_uniform"))
+        os << ", wave_uniform=True";
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // Get the TLX name or use original
+  auto it = opNameMap.find(opName);
+  StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
+
+  // Print results
+  if (op->getNumResults() > 0) {
+    if (op->getNumResults() == 1) {
+      os << getValueName(op->getResult(0), argSubstitutionMap);
+    } else {
+      os << "(";
+      for (unsigned i = 0; i < op->getNumResults(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << getValueName(op->getResult(i), argSubstitutionMap);
+      }
+      os << ")";
+    }
+    os << " = ";
+  }
+
+  // Print operation name
+  os << tlxName;
+
+  // Print operands in parentheses
+  os << "(";
+  bool first = true;
+  for (Value operand : op->getOperands()) {
+    if (!first)
+      os << ", ";
+    first = false;
+    os << getValueName(operand, argSubstitutionMap);
+  }
+  os << ")";
+
+  // An unmapped op is emitted as its raw MLIR name, which is not valid Python.
+  // Flag it inline so the gap is visible in the dump rather than surfacing as
+  // an unexplained NameError when the regenerated kernel is launched.
+  if (it == opNameMap.end())
+    os << "  # UNSUPPORTED: no TLX mapping for " << opName;
+
+  printLocComment(op, os);
+}
+
+// tt.map_elementwise carries its per-element computation in a region; pack > 1
+// runs that body over several elements at once, which has no elementwise form.
+bool isInlinableMapElementwise(Operation *op) {
+  auto pack = op->getAttrOfType<IntegerAttr>("pack");
+  return op->getName().getStringRef() == "tt.map_elementwise" &&
+         op->getNumRegions() > 0 && op->getNumResults() > 0 &&
+         !op->getRegion(0).empty() && pack && pack.getInt() == 1;
+}
+
+// Inline a tt.map_elementwise body as elementwise tensor ops, as
+// map_elementwise is only a scheduling hint.
+void printMapElementwise(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+    DenseMap<Value, Value> *argSubstitutionMap) {
+  DenseMap<Value, Value> bodySubst;
+  if (argSubstitutionMap)
+    bodySubst = *argSubstitutionMap;
+  Block &bb = op->getRegion(0).front();
+  for (unsigned i = 0; i < bb.getNumArguments() && i < op->getNumOperands();
+       ++i) {
+    Value target = op->getOperand(i);
+    if (argSubstitutionMap) {
+      auto it = argSubstitutionMap->find(target);
+      if (it != argSubstitutionMap->end())
+        target = it->second;
+    }
+    bodySubst[bb.getArgument(i)] = target;
+  }
+  for (Operation &bodyOp : bb) {
+    if (bodyOp.getName().getStringRef() == "tt.map_elementwise.return") {
+      for (unsigned k = 0; k < indent; ++k)
+        os << "  ";
+      // One tuple assignment so a multi-result map binds every result; result i
+      // is named in the enclosing scope, returned operand i in the inlined
+      // body.
+      assert(op->getNumResults() == bodyOp.getNumOperands() &&
+             "map_elementwise must return one value per result");
+      unsigned n = std::min(op->getNumResults(), bodyOp.getNumOperands());
+      for (unsigned i = 0; i < n; ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getResult(i), argSubstitutionMap);
+      os << " = ";
+      for (unsigned i = 0; i < n; ++i)
+        os << (i ? ", " : "") << getValueName(bodyOp.getOperand(i), &bodySubst);
+      printLocComment(op, os);
+    } else if (!shouldSkipOp(&bodyOp, allocInfoMap, skippedOps)) {
+      printSimplifiedOp(&bodyOp, os, opNameMap, allocInfoMap, indent,
+                        &bodySubst);
+    }
+  }
+}
+
+// Print a block
+void printBlock(Block &block, llvm::raw_ostream &os,
+                const llvm::StringMap<StringRef> &opNameMap,
+                const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                DenseMap<Value, Value> *argSubstitutionMap = nullptr,
+                ArrayRef<Value> yieldTargets = {}) {
+  // Print block arguments if any
+  if (!block.getArguments().empty() && !block.isEntryBlock()) {
+    for (unsigned i = 0; i < indent; ++i)
+      os << "  ";
+    os << "^bb(";
+    for (unsigned i = 0; i < block.getNumArguments(); ++i) {
+      if (i > 0)
+        os << ", ";
+      os << getValueName(block.getArgument(i), argSubstitutionMap);
+    }
+    os << "):\n";
+  }
+
+  // Print operations
+  for (Operation &op : block) {
+    // Skip module and function ops - just print their contents
+    if (isa<ModuleOp>(op)) {
+      for (Region &region : op.getRegions()) {
+        printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent,
+                    argSubstitutionMap);
+      }
+      continue;
+    }
+
+    if (auto funcOp = dyn_cast<tt::FuncOp>(op)) {
+      // Emit Python module preamble
+      os << "import triton\n";
+      os << "import triton.language as tl\n";
+      os << "try:\n";
+      os << "    import triton.language.extra.cuda.tlx as tlx\n";
+      os << "except ModuleNotFoundError:\n";
+      os << "    import triton.language.extra.tlx as tlx\n";
+      os << "\n";
+
+      // Emit a module-scope @extern wrapper per extern_elementwise; see
+      // externSigNames. This mirrors how libdevice declares its own bindings.
+      static thread_local DenseMap<Operation *, std::string> sigNames;
+      sigNames.clear();
+      externSigNames = &sigNames;
+      unsigned sigIdx = 0;
+      funcOp.walk([&](Operation *externOp) {
+        if (externOp->getName().getStringRef() != "tt.extern_elementwise" ||
+            !canNameExternSignature(externOp))
+          return;
+        // Qualify by function: sigIdx restarts per tt.func, so a bare index
+        // would give two functions in one module the same module-scope def.
+        // The symbol is sanitized because it lands in a Python `def`.
+        std::string name = uniqueModuleScopeName(
+            "_extern_fn_" + sanitizePyIdentifier(funcOp.getName()) + "_" +
+            std::to_string(sigIdx++));
+        sigNames[externOp] = name;
+        auto libname = externOp->getAttrOfType<StringAttr>("libname");
+        auto libpath = externOp->getAttrOfType<StringAttr>("libpath");
+        auto pure = externOp->getAttrOfType<BoolAttr>("pure");
+        unsigned n = externOp->getNumOperands();
+        os << "@tl.core.extern\n";
+        os << "def " << name << "(";
+        for (unsigned i = 0; i < n; ++i)
+          os << "arg" << i << ", ";
+        os << "_semantic=None):\n";
+        os << "    return tl.core.extern_elementwise(";
+        printPythonStringLiteral(libname ? libname.getValue() : StringRef(""),
+                                 os);
+        os << ", ";
+        printPythonStringLiteral(libpath ? libpath.getValue() : StringRef(""),
+                                 os);
+        os << ", [";
+        for (unsigned i = 0; i < n; ++i)
+          os << (i ? ", " : "") << "arg" << i;
+        os << "], {(";
+        for (Value v : externOp->getOperands())
+          // The trailing comma keeps a single-operand key a tuple.
+          os << getElementTypeName(getElementType(v.getType())) << ", ";
+        os << "): (";
+        printPythonStringLiteral(
+            externOp->getAttrOfType<StringAttr>("symbol").getValue(), os);
+        os << ", "
+           << getElementTypeName(
+                  getElementType(externOp->getResult(0).getType()))
+           << ")}, is_pure=" << ((pure && pure.getValue()) ? "True" : "False")
+           << ", _semantic=_semantic)\n\n";
+      });
+
+      // Emit a module-scope body function per ttg.warp_predicate; see
+      // warpPredicateBodyNames.
+      static thread_local DenseMap<Operation *, std::string> bodyNames;
+      bodyNames.clear();
+      warpPredicateBodyNames = &bodyNames;
+      unsigned bodyIdx = 0;
+      funcOp.walk([&](Operation *wp) {
+        // Needs a predicate and at least one init, or the call site falls to
+        // the generic printer and this body would go uncalled.
+        // WarpPredicateOp::verify pins #inits == #results == #yields, so a
+        // skipped op yields nothing and an emitted one has a result; it also
+        // guarantees exactly one block with a ttg.predicate_yield terminator,
+        // so front() is the whole body and its terminator is the yield.
+        if (wp->getName().getStringRef() != "ttg.warp_predicate" ||
+            wp->getNumOperands() < 2 || wp->getNumRegions() == 0 ||
+            wp->getRegion(0).empty())
+          return;
+        // Qualify by function: bodyIdx restarts per tt.func, so a bare index
+        // would give two functions in one module the same module-scope def.
+        // The symbol is sanitized because it lands in a Python `def`.
+        std::string name = uniqueModuleScopeName(
+            "_wp_body_" + sanitizePyIdentifier(funcOp.getName()) + "_" +
+            std::to_string(bodyIdx++));
+        bodyNames[wp] = name;
+        Block &body = wp->getRegion(0).front();
+        SmallVector<std::string> params;
+        SmallVector<Value> captures;
+        getWarpPredicateBodyArgs(wp, &params, captures);
+        os << "@triton.jit\n";
+        os << "def " << name << "(";
+        for (unsigned i = 0; i < params.size(); ++i)
+          os << (i ? ", " : "") << params[i];
+        os << "):\n";
+        // printBlockOps stops at the terminator and, unlike printSimplifiedOp
+        // alone, resolves reduce combiners into tl.max / tl.sum.
+        printBlockOps(body, os, opNameMap, allocInfoMap, skippedOps, 1,
+                      nullptr);
+        if (Operation *yield = body.getTerminator()) {
+          os << "  return ";
+          for (unsigned i = 0; i < yield->getNumOperands(); ++i)
+            os << (i ? ", " : "") << getValueName(yield->getOperand(i));
+          os << "\n";
+        }
+        os << "\n";
+      });
+
+      os << "@triton.jit\n";
+      os << "def "
+         << uniqueModuleScopeName(sanitizePyIdentifier(funcOp.getName()))
+         << "(";
+      // Print function arguments, collapsing expanded TensorDescriptor args.
+      // A host-side TensorDescriptor lowers to a !tt.tensordesc value followed
+      // by expanded shape/stride scalars that share the descriptor's name, in
+      // one of two conventions:
+      //   - underscore-numbered: a_desc, a_desc_0, a_desc_1, ...
+      //   - dot-qualified:       desc_q, desc_q.shape.0, desc_q.stride.1, ...
+      // Detection is type-driven (the leading arg is !tt.tensordesc), so we
+      // support both; keep the descriptor value and drop the expansion args.
+      // Names are compared after sanitization, which spells the dot-qualified
+      // form desc_q_shape_0, desc_q_stride_1, ...
+      SmallVector<std::string> argNames;
+      for (unsigned i = 0; i < funcOp.getNumArguments(); ++i)
+        argNames.push_back(
+            getValueName(funcOp.getArgument(i), argSubstitutionMap));
+      std::set<std::string> skipArgs;
+      for (unsigned i = 0; i < funcOp.getNumArguments(); ++i) {
+        if (!isa<tt::TensorDescType>(funcOp.getArgument(i).getType()))
+          continue;
+        StringRef name(argNames[i]);
+        for (unsigned j = i + 1; j < argNames.size(); ++j) {
+          StringRef next(argNames[j]);
+          bool underscoreExpansion =
+              next.starts_with(name) && next.size() > name.size() &&
+              next[name.size()] == '_' &&
+              std::all_of(next.begin() + name.size() + 1, next.end(),
+                          [](char c) { return std::isdigit(c); });
+          StringRef rest = next.drop_front(name.size());
+          bool dotExpansion = next.starts_with(name) &&
+                              (rest.consume_front("_shape_") ||
+                               rest.consume_front("_stride_")) &&
+                              !rest.empty() &&
+                              std::all_of(rest.begin(), rest.end(), [](char c) {
+                                return std::isdigit(c);
+                              });
+          if (underscoreExpansion || dotExpansion)
+            skipArgs.insert(argNames[j]);
+          else
+            break;
+        }
+      }
+      bool first = true;
+      for (auto &name : argNames) {
+        if (skipArgs.count(name) || name.find(".shape.") != std::string::npos ||
+            name.find(".stride.") != std::string::npos)
+          continue;
+        if (!first)
+          os << ", ";
+        first = false;
+        os << name;
+      }
+      os << "):\n";
+      for (Region &region : op.getRegions()) {
+        printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
+                    argSubstitutionMap);
+      }
+      os << "\n";
+      continue;
+    }
+
+    // Check if we should skip this operation
+    if (shouldSkipOp(&op, allocInfoMap, skippedOps)) {
+      continue;
+    }
+
+    // Special handling for scf.yield - convert to assignments if we have yield
+    // targets, otherwise skip entirely
+    if (op.getName().getStringRef() == "scf.yield") {
+      if (!yieldTargets.empty()) {
+        // Emit the iter-arg updates as a single tuple assignment: scf.yield has
+        // parallel-copy semantics, so sequential `t = v` statements would let a
+        // later target read an already-updated one, desyncing barrier phases
+        // and deadlocking warp-specialized kernels.
+        unsigned n = std::min((size_t)op.getNumOperands(), yieldTargets.size());
+        SmallVector<std::string> lhs, rhs;
+        for (unsigned i = 0; i < n; ++i) {
+          lhs.push_back(getValueName(yieldTargets[i], argSubstitutionMap));
+          rhs.push_back(getValueName(op.getOperand(i), argSubstitutionMap));
+        }
+        if (!lhs.empty()) {
+          for (unsigned j = 0; j < indent; ++j)
+            os << "  ";
+          for (unsigned i = 0; i < lhs.size(); ++i)
+            os << (i ? ", " : "") << lhs[i];
+          os << " = ";
+          for (unsigned i = 0; i < rhs.size(); ++i)
+            os << (i ? ", " : "") << rhs[i];
+          os << "\n";
+        }
+      }
+      // Skip yield in TLX output (either handled above or just skip)
+      continue;
+    }
+
+    // Special handling for warp_specialize
+    if (op.getName().getStringRef() == "ttg.warp_specialize") {
+      printWarpSpecialize(&op, os, opNameMap, allocInfoMap, skippedOps, indent);
+      continue;
+    }
+
+    // Special handling for scf.for - Python range syntax
+    if (op.getName().getStringRef() == "scf.for") {
+      printForOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                 argSubstitutionMap);
+      continue;
+    }
+
+    // Special handling for scf.if - Python if/else with yield-to-assignment
+    if (op.getName().getStringRef() == "scf.if") {
+      printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                argSubstitutionMap);
+      continue;
+    }
+
+    if (isWarpPipelineStage(&op)) {
+      printWarpPipelineStage(&op, os, opNameMap, allocInfoMap, skippedOps,
+                             indent, argSubstitutionMap);
+      continue;
+    }
+
+    // Special handling for scf.while - preserve condition/body and carries.
+    if (op.getName().getStringRef() == "scf.while") {
+      printWhileOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                   argSubstitutionMap);
+      continue;
+    }
+
+    if (isInlinableMapElementwise(&op)) {
+      printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                          argSubstitutionMap);
+      continue;
+    }
+
+    // Special handling for tt.reduce — detect combiner and emit
+    // tl.max/tl.min/tl.sum
+    if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
+        op.getNumResults() > 0) {
+      // Detect combiner type by looking at ops in the body region
+      bool isMax = false, isMin = false, isSum = false, isOr = false,
+           isXor = false;
+      for (Region &bodyRegion : op.getRegions()) {
+        for (Block &block : bodyRegion) {
+          for (Operation &bodyOp : block) {
+            StringRef bodyOpName = bodyOp.getName().getStringRef();
+            if (bodyOpName == "arith.maxf" || bodyOpName == "arith.maxnumf" ||
+                bodyOpName == "arith.maximumf" || bodyOpName == "arith.maxsi" ||
+                bodyOpName == "arith.maxui")
+              isMax = true;
+            if (bodyOpName == "arith.minf" || bodyOpName == "arith.minnumf" ||
+                bodyOpName == "arith.minimumf" || bodyOpName == "arith.minsi" ||
+                bodyOpName == "arith.minui")
+              isMin = true;
+            if (bodyOpName == "arith.addf" || bodyOpName == "arith.addi")
+              isSum = true;
+            if (bodyOpName == "arith.ori")
+              isOr = true;
+            if (bodyOpName == "arith.xori")
+              isXor = true;
+          }
+        }
+      }
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << getValueName(op.getResult(0), argSubstitutionMap) << " = ";
+      if (isMax)
+        os << "tl.max(";
+      else if (isMin)
+        os << "tl.min(";
+      else if (isSum)
+        os << "tl.sum(";
+      else if (isOr)
+        os << "tl.reduce_or(";
+      else if (isXor)
+        os << "tl.xor_sum(";
+      else
+        os << "tl.reduce(";
+      os << getValueName(op.getOperand(0), argSubstitutionMap);
+      // Extract axis from the reduce op — use the result shape vs input shape
+      if (auto inputType =
+              dyn_cast<RankedTensorType>(op.getOperand(0).getType())) {
+        if (auto resultType =
+                dyn_cast<RankedTensorType>(op.getResult(0).getType())) {
+          // Find the axis that was reduced by comparing input and result
+          // shapes dimension by dimension. The reduced axis is the first
+          // dimension in the input that is missing from the result.
+          auto inShape = inputType.getShape();
+          auto outShape = resultType.getShape();
+          int64_t axis = 0;
+          for (int64_t i = 0, j = 0; i < inputType.getRank(); ++i) {
+            if (j < resultType.getRank() && inShape[i] == outShape[j]) {
+              ++j;
+            } else {
+              axis = i;
+              break;
+            }
+          }
+          os << ", " << axis;
+        } else {
+          // Result is scalar — reduce all dims, use axis=0 as default
+          os << ", 0";
+        }
+      }
+      os << ")";
+      printLocComment(&op, os);
+      continue;
+    }
+
+    // Handle operations with regions (while, etc.)
+    if (op.getNumRegions() > 0) {
+      printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
+                        argSubstitutionMap);
+      // warp_predicate already emitted its region as a body function.
+      if (op.getName().getStringRef() == "ttg.warp_predicate" &&
+          warpPredicateBodyNames && warpPredicateBodyNames->count(&op))
+        continue;
+      // Print region body as # comments (valid Python syntax)
+      for (Region &region : op.getRegions()) {
+        for (Block &bodyBlock : region) {
+          for (Operation &bodyOp : bodyBlock) {
+            if (shouldSkipOp(&bodyOp, allocInfoMap, skippedOps))
+              continue;
+            std::string line;
+            llvm::raw_string_ostream lineOs(line);
+            printSimplifiedOp(&bodyOp, lineOs, opNameMap, allocInfoMap, 0,
+                              argSubstitutionMap);
+            lineOs.flush();
+            // Strip trailing newline and print as comment
+            while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
+              line.pop_back();
+            if (!line.empty()) {
+              for (unsigned i = 0; i < indent; ++i)
+                os << "  ";
+              os << "  # " << line << "\n";
+            }
+          }
+        }
+      }
+    } else {
+      printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
+                        argSubstitutionMap);
+    }
+  }
+}
+
+// If the condition value is defined by a cmpi/cmpf in the same block as the
+// cf.cond_br, return the inlined comparison expression (e.g., "var_0 < var_1")
+// and add the defining op to skippedOps so it won't be printed separately.
+// Returns empty string if inlining is not possible.
+std::string getInlinedCondExpr(Value cond,
+                               llvm::DenseSet<Operation *> &skippedOps,
+                               DenseMap<Value, Value> *argSubstitutionMap) {
+  // Resolve through transparent cast ops to find the actual comparison
+  Value resolved = resolveThroughCasts(cond);
+
+  auto *defOp = resolved.getDefiningOp();
+  if (!defOp || defOp->getNumOperands() != 2 || defOp->getNumResults() == 0)
+    return "";
+  auto opName = defOp->getName().getStringRef();
+  if (opName != "arith.cmpi" && opName != "arith.cmpf")
+    return "";
+  auto predAttr = defOp->getAttrOfType<IntegerAttr>("predicate");
+  if (!predAttr)
+    return "";
+  // Only inline if all uses of the comparison result are in CF terminators
+  // (cond_br condition or branch operands), which the structured printer
+  // handles directly.
+  for (auto *user : defOp->getResult(0).getUsers()) {
+    if (!user->hasTrait<OpTrait::IsTerminator>())
+      return "";
+  }
+  int64_t pred = predAttr.getInt();
+  StringRef cmpOp =
+      (opName == "arith.cmpi") ? getCmpIOperator(pred) : getCmpFOperator(pred);
+  skippedOps.insert(defOp);
+  return getValueName(defOp->getOperand(0), argSubstitutionMap) + " " +
+         cmpOp.str() + " " +
+         getValueName(defOp->getOperand(1), argSubstitutionMap);
+}
+
+// Print non-terminator ops from a block (used by CF-aware printer)
+void printBlockOps(Block &block, llvm::raw_ostream &os,
+                   const llvm::StringMap<StringRef> &opNameMap,
+                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                   llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                   DenseMap<Value, Value> *argSubstitutionMap) {
+  for (Operation &op : block) {
+    if (op.hasTrait<OpTrait::IsTerminator>())
+      break;
+    if (shouldSkipOp(&op, allocInfoMap, skippedOps))
+      continue;
+
+    // Reuse the same special-case handling from printBlock
+    if (op.getName().getStringRef() == "scf.yield")
+      continue;
+
+    if (op.getName().getStringRef() == "ttg.warp_specialize") {
+      printWarpSpecialize(&op, os, opNameMap, allocInfoMap, skippedOps, indent);
+      continue;
+    }
+    if (op.getName().getStringRef() == "scf.for") {
+      printForOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                 argSubstitutionMap);
+      continue;
+    }
+    if (op.getName().getStringRef() == "scf.if") {
+      printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                argSubstitutionMap);
+      continue;
+    }
+    if (isWarpPipelineStage(&op)) {
+      printWarpPipelineStage(&op, os, opNameMap, allocInfoMap, skippedOps,
+                             indent, argSubstitutionMap);
+      continue;
+    }
+    if (isInlinableMapElementwise(&op)) {
+      printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                          argSubstitutionMap);
+      continue;
+    }
+    // Special handling for tt.reduce in CF printer
+    if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
+        op.getNumResults() > 0) {
+      bool isMax = false, isMin = false, isSum = false, isOr = false,
+           isXor = false;
+      for (Region &bodyRegion : op.getRegions()) {
+        for (Block &block : bodyRegion) {
+          for (Operation &bodyOp : block) {
+            StringRef n = bodyOp.getName().getStringRef();
+            if (n == "arith.maxf" || n == "arith.maxnumf" ||
+                n == "arith.maximumf" || n == "arith.maxsi" ||
+                n == "arith.maxui")
+              isMax = true;
+            if (n == "arith.minf" || n == "arith.minnumf" ||
+                n == "arith.minimumf" || n == "arith.minsi" ||
+                n == "arith.minui")
+              isMin = true;
+            if (n == "arith.addf" || n == "arith.addi")
+              isSum = true;
+            if (n == "arith.ori")
+              isOr = true;
+            if (n == "arith.xori")
+              isXor = true;
+          }
+        }
+      }
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << getValueName(op.getResult(0), argSubstitutionMap) << " = ";
+      if (isMax)
+        os << "tl.max(";
+      else if (isMin)
+        os << "tl.min(";
+      else if (isSum)
+        os << "tl.sum(";
+      else if (isOr)
+        os << "tl.reduce_or(";
+      else if (isXor)
+        os << "tl.xor_sum(";
+      else
+        os << "tl.reduce(";
+      os << getValueName(op.getOperand(0), argSubstitutionMap);
+      // Extract axis from the reduce op
+      if (auto inputType =
+              dyn_cast<RankedTensorType>(op.getOperand(0).getType())) {
+        if (auto resultType =
+                dyn_cast<RankedTensorType>(op.getResult(0).getType())) {
+          auto inShape = inputType.getShape();
+          auto outShape = resultType.getShape();
+          int64_t axis = 0;
+          for (int64_t i = 0, j = 0; i < inputType.getRank(); ++i) {
+            if (j < resultType.getRank() && inShape[i] == outShape[j]) {
+              ++j;
+            } else {
+              axis = i;
+              break;
+            }
+          }
+          os << ", " << axis;
+        } else {
+          os << ", 0";
+        }
+      }
+      os << ")";
+      printLocComment(&op, os);
+      continue;
+    }
+    if (op.getNumRegions() > 0) {
+      printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
+                        argSubstitutionMap);
+      // warp_predicate already emitted its region as a body function. The same
+      // guard is in printBlock; this traversal needs it too, because the
+      // CF-aware printer reaches ops through here.
+      if (op.getName().getStringRef() == "ttg.warp_predicate" &&
+          warpPredicateBodyNames && warpPredicateBodyNames->count(&op))
+        continue;
+      for (Region &region : op.getRegions()) {
+        for (Block &bodyBlock : region) {
+          for (Operation &bodyOp : bodyBlock) {
+            if (shouldSkipOp(&bodyOp, allocInfoMap, skippedOps))
+              continue;
+            std::string line;
+            llvm::raw_string_ostream lineOs(line);
+            printSimplifiedOp(&bodyOp, lineOs, opNameMap, allocInfoMap, 0,
+                              argSubstitutionMap);
+            lineOs.flush();
+            while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
+              line.pop_back();
+            if (!line.empty()) {
+              for (unsigned i = 0; i < indent; ++i)
+                os << "  ";
+              os << "  # " << line << "\n";
+            }
+          }
+        }
+      }
+    } else {
+      printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
+                        argSubstitutionMap);
+    }
+  }
+}
+
+// Print block arg assignments: dest_arg = src_value
+// If skipArgIdx >= 0, skip that arg index (used for for-loop iterators).
+// A token that only orders a TMA store against its token wait. TLX orders
+// those waits by count, so such tokens -- including block args every
+// predecessor feeds one -- have no Python binding.
+static bool isTMAStoreToken(Value v, llvm::SmallPtrSetImpl<Value> &visited) {
+  if (!isa<ttg::AsyncTokenType>(v.getType()))
+    return false;
+  if (!visited.insert(v).second)
+    return true;
+  if (Operation *def = v.getDefiningOp())
+    return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+               def) ||
+           def->getName().getStringRef() == "ub.poison";
+  auto arg = cast<BlockArgument>(v);
+  Block *block = arg.getOwner();
+  if (block->isEntryBlock())
+    return false;
+  for (auto it = block->pred_begin(); it != block->pred_end(); ++it) {
+    auto branch = dyn_cast<BranchOpInterface>((*it)->getTerminator());
+    if (!branch)
+      return false;
+    Value incoming =
+        branch.getSuccessorOperands(it.getSuccessorIndex())[arg.getArgNumber()];
+    if (!incoming || !isTMAStoreToken(incoming, visited))
+      return false;
+  }
+  return true;
+}
+
+static bool isTMAStoreToken(Value v) {
+  llvm::SmallPtrSet<Value, 8> visited;
+  return isTMAStoreToken(v, visited);
+}
+
+void printBlockArgAssignments(Block *dest, OperandRange operands,
+                              llvm::raw_ostream &os, unsigned indent,
+                              DenseMap<Value, Value> *argSubstitutionMap,
+                              int skipArgIdx = -1) {
+  // Emit block-argument updates as a single tuple assignment so a back-edge to
+  // a loop header follows parallel-copy semantics (all sources read before any
+  // target is updated). Sequential `dest = src` statements would let a later
+  // assignment read an already-updated earlier target; see the scf.yield
+  // handler for the same reasoning.
+  SmallVector<std::string> lhs, rhs;
+  for (unsigned i = 0; i < dest->getNumArguments() && i < operands.size();
+       ++i) {
+    if ((int)i == skipArgIdx || isTMAStoreToken(dest->getArgument(i)))
+      continue;
+    std::string destName =
+        getValueName(dest->getArgument(i), argSubstitutionMap);
+    std::string srcName = getValueName(operands[i], argSubstitutionMap);
+    if (destName != srcName) {
+      lhs.push_back(destName);
+      rhs.push_back(srcName);
+    }
+  }
+  if (lhs.empty())
+    return;
+  for (unsigned j = 0; j < indent; ++j)
+    os << "  ";
+  for (unsigned i = 0; i < lhs.size(); ++i)
+    os << (i ? ", " : "") << lhs[i];
+  os << " = ";
+  for (unsigned i = 0; i < rhs.size(); ++i)
+    os << (i ? ", " : "") << rhs[i];
+  os << "\n";
+}
+
+// Detect if a header block represents a for-loop: iter starts at init,
+// condition is iter < end, update is iter = iter + step.
+bool detectForLoopPattern(Block *header, ForLoopInfo &info,
+                          DenseMap<Value, Value> *argSubstitutionMap) {
+  if (header->getNumArguments() == 0)
+    return false;
+  auto condBr = dyn_cast<cf::CondBranchOp>(header->getTerminator());
+  if (!condBr)
+    return false;
+
+  // Resolve condition through casts to find cmpi
+  Value condResolved = resolveThroughCasts(condBr.getCondition());
+  auto *cmpiOp = condResolved.getDefiningOp();
+  if (!cmpiOp || cmpiOp->getName().getStringRef() != "arith.cmpi")
+    return false;
+  auto predAttr = cmpiOp->getAttrOfType<IntegerAttr>("predicate");
+  if (!predAttr)
+    return false;
+  int64_t pred = predAttr.getInt();
+  // slt (2) or ult (6)
+  if (pred != 2 && pred != 6)
+    return false;
+
+  // LHS must be a header block arg (the iterator)
+  Value lhs = resolveThroughCasts(cmpiOp->getOperand(0));
+  auto iterArg = dyn_cast<BlockArgument>(lhs);
+  if (!iterArg || iterArg.getOwner() != header)
+    return false;
+  unsigned iterIdx = iterArg.getArgNumber();
+
+  // Find loop body blocks via BFS from trueDest (not crossing header)
+  Block *trueDest = condBr.getTrueDest();
+  llvm::SmallDenseSet<Block *, 16> bodyBlocks;
+  llvm::SmallVector<Block *, 8> worklist;
+  worklist.push_back(trueDest);
+  while (!worklist.empty()) {
+    Block *b = worklist.pop_back_val();
+    if (!b || b == header || bodyBlocks.count(b))
+      continue;
+    bodyBlocks.insert(b);
+    auto *t = b->getTerminator();
+    if (auto br = dyn_cast<cf::BranchOp>(t))
+      worklist.push_back(br.getDest());
+    else if (auto cb = dyn_cast<cf::CondBranchOp>(t)) {
+      worklist.push_back(cb.getTrueDest());
+      worklist.push_back(cb.getFalseDest());
+    }
+  }
+
+  // Find step from back-edge predecessor
+  Operation *stepOp = nullptr;
+  std::string stepStr;
+  for (Block *pred : header->getPredecessors()) {
+    if (!bodyBlocks.count(pred))
+      continue;
+    auto *predTerm = pred->getTerminator();
+    Value updateVal;
+    if (auto br = dyn_cast<cf::BranchOp>(predTerm)) {
+      if (br.getDest() == header && iterIdx < br.getDestOperands().size())
+        updateVal = br.getDestOperands()[iterIdx];
+    } else if (auto cb = dyn_cast<cf::CondBranchOp>(predTerm)) {
+      if (cb.getTrueDest() == header &&
+          iterIdx < cb.getTrueDestOperands().size())
+        updateVal = cb.getTrueDestOperands()[iterIdx];
+      else if (cb.getFalseDest() == header &&
+               iterIdx < cb.getFalseDestOperands().size())
+        updateVal = cb.getFalseDestOperands()[iterIdx];
+    }
+    if (!updateVal)
+      continue;
+    Value resolved = resolveThroughCasts(updateVal);
+    auto *addOp = resolved.getDefiningOp();
+    if (!addOp || addOp->getName().getStringRef() != "arith.addi" ||
+        addOp->getNumOperands() != 2)
+      return false;
+    Value a0 = resolveThroughCasts(addOp->getOperand(0));
+    Value a1 = resolveThroughCasts(addOp->getOperand(1));
+    if (a0 == iterArg) {
+      stepStr = getValueName(a1, argSubstitutionMap);
+      stepOp = addOp;
+    } else if (a1 == iterArg) {
+      stepStr = getValueName(a0, argSubstitutionMap);
+      stepOp = addOp;
+    } else {
+      return false;
+    }
+    break;
+  }
+  if (stepStr.empty())
+    return false;
+
+  // Find init from non-body predecessor
+  std::string initStr;
+  for (Block *pred : header->getPredecessors()) {
+    if (bodyBlocks.count(pred))
+      continue;
+    auto *predTerm = pred->getTerminator();
+    Value initVal;
+    if (auto br = dyn_cast<cf::BranchOp>(predTerm)) {
+      if (br.getDest() == header && iterIdx < br.getDestOperands().size())
+        initVal = br.getDestOperands()[iterIdx];
+    } else if (auto cb = dyn_cast<cf::CondBranchOp>(predTerm)) {
+      if (cb.getTrueDest() == header &&
+          iterIdx < cb.getTrueDestOperands().size())
+        initVal = cb.getTrueDestOperands()[iterIdx];
+      else if (cb.getFalseDest() == header &&
+               iterIdx < cb.getFalseDestOperands().size())
+        initVal = cb.getFalseDestOperands()[iterIdx];
+    }
+    if (!initVal)
+      continue;
+    initStr = getValueName(initVal, argSubstitutionMap);
+    break;
+  }
+  if (initStr.empty())
+    return false;
+
+  info.iterArgIdx = iterIdx;
+  info.start = initStr;
+  info.end = getValueName(cmpiOp->getOperand(1), argSubstitutionMap);
+  info.step = stepStr;
+  info.stepOp = stepOp;
+  return true;
+}
+
+// Find the immediate post-dominator (merge block) for a cf.cond_br.
+// For a simple if-else diamond, this is the single successor shared by
+// both branches. We walk forward from each branch to find the first block
+// that is reachable from both sides.
+Block *findMergeBlock(cf::CondBranchOp condBr) {
+  Block *trueDest = condBr.getTrueDest();
+  Block *falseDest = condBr.getFalseDest();
+
+  // Simple case: both branches go to the same block
+  if (trueDest == falseDest)
+    return trueDest;
+
+  // Collect all blocks reachable from trueDest (following unconditional
+  // branches only, stopping at conditional branches or blocks with multiple
+  // predecessors from outside the chain)
+  llvm::SmallDenseSet<Block *, 8> trueReachable;
+  Block *b = trueDest;
+  while (b) {
+    trueReachable.insert(b);
+    auto *term = b->getTerminator();
+    if (auto br = dyn_cast<cf::BranchOp>(term)) {
+      b = br.getDest();
+    } else {
+      break;
+    }
+  }
+
+  // Walk from falseDest, find first block also reachable from true side
+  b = falseDest;
+  while (b) {
+    if (trueReachable.count(b))
+      return b;
+    auto *term = b->getTerminator();
+    if (auto br = dyn_cast<cf::BranchOp>(term)) {
+      b = br.getDest();
+    } else {
+      break;
+    }
+  }
+
+  // No merge found — check if trueDest's successor chain leads to falseDest
+  // or vice versa (one-armed if)
+  b = trueDest;
+  while (b) {
+    auto *term = b->getTerminator();
+    if (auto br = dyn_cast<cf::BranchOp>(term)) {
+      if (br.getDest() == falseDest)
+        return falseDest;
+      b = br.getDest();
+    } else {
+      break;
+    }
+  }
+  b = falseDest;
+  while (b) {
+    auto *term = b->getTerminator();
+    if (auto br = dyn_cast<cf::BranchOp>(term)) {
+      if (br.getDest() == trueDest)
+        return trueDest;
+      b = br.getDest();
+    } else {
+      break;
+    }
+  }
+
+  return nullptr;
+}
+
+// Print a CF region by walking the CFG and emitting structured if/else/while.
+// Handles blocks from `startBlock` up to (but not including) `stopBlock`.
+void printCFBlocks(Block *startBlock, Block *stopBlock, llvm::raw_ostream &os,
+                   const llvm::StringMap<StringRef> &opNameMap,
+                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                   llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                   DenseMap<Value, Value> *argSubstitutionMap,
+                   llvm::SmallDenseSet<Block *, 16> &visitedBlocks,
+                   const DenseMap<Block *, ForLoopInfo> &forLoopHeaders) {
+  Block *current = startBlock;
+  while (current && current != stopBlock) {
+    if (visitedBlocks.count(current))
+      return;
+    visitedBlocks.insert(current);
+
+    // Pre-scan: if the block terminates with cf.cond_br whose condition comes
+    // from a cmpi/cmpf, mark the comparison as skipped before printing block
+    // ops so it gets inlined into the if/while line instead of printed twice.
+    std::string preComputedCondExpr;
+    if (auto condBrPre = dyn_cast<cf::CondBranchOp>(current->getTerminator())) {
+      preComputedCondExpr = getInlinedCondExpr(condBrPre.getCondition(),
+                                               skippedOps, argSubstitutionMap);
+    }
+
+    // Print non-terminator operations
+    printBlockOps(*current, os, opNameMap, allocInfoMap, skippedOps, indent,
+                  argSubstitutionMap);
+
+    Operation *term = current->getTerminator();
+
+    // cf.cond_br: emit if/else structure
+    if (auto condBr = dyn_cast<cf::CondBranchOp>(term)) {
+      Block *trueDest = condBr.getTrueDest();
+      Block *falseDest = condBr.getFalseDest();
+      Block *mergeBlock = findMergeBlock(condBr);
+
+      // Check if this is a while loop header: the false branch exits the
+      // loop (goes to mergeBlock or stopBlock) and the true branch is the
+      // loop body that eventually branches back to current.
+      // Pattern: current block has args, true branch leads back to current.
+      bool isWhileLoop = false;
+      if (current->getNumArguments() > 0) {
+        // BFS to check if the true-side eventually branches back to current
+        llvm::SmallVector<Block *, 8> worklist;
+        llvm::SmallDenseSet<Block *, 16> visited;
+        worklist.push_back(trueDest);
+        while (!worklist.empty() && !isWhileLoop) {
+          Block *walk = worklist.pop_back_val();
+          if (!walk || visited.count(walk))
+            continue;
+          visited.insert(walk);
+          if (walk == current) {
+            isWhileLoop = true;
+            break;
+          }
+          auto *t = walk->getTerminator();
+          if (auto br = dyn_cast<cf::BranchOp>(t)) {
+            worklist.push_back(br.getDest());
+          } else if (auto cb = dyn_cast<cf::CondBranchOp>(t)) {
+            worklist.push_back(cb.getTrueDest());
+            worklist.push_back(cb.getFalseDest());
+          }
+        }
+      }
+
+      if (isWhileLoop) {
+        // Check if this matches a for-loop pattern
+        auto forIt = forLoopHeaders.find(current);
+        if (forIt != forLoopHeaders.end()) {
+          const ForLoopInfo &fli = forIt->second;
+          // Add step op to skippedOps so it's not printed separately
+          if (fli.stepOp)
+            skippedOps.insert(fli.stepOp);
+          int skipIdx = (int)fli.iterArgIdx;
+
+          for (unsigned i = 0; i < indent; ++i)
+            os << "  ";
+          std::string iterName = getValueName(
+              current->getArgument(fli.iterArgIdx), argSubstitutionMap);
+          if (fli.step == "1")
+            os << "for " << iterName << " in tl.range(" << fli.start << ", "
+               << fli.end << "):\n";
+          else
+            os << "for " << iterName << " in tl.range(" << fli.start << ", "
+               << fli.end << ", " << fli.step << "):\n";
+
+          // Print true-dest arg assignments (skip iterator)
+          printBlockArgAssignments(trueDest, condBr.getTrueDestOperands(), os,
+                                   indent + 1, argSubstitutionMap, skipIdx);
+
+          // Print loop body
+          printCFBlocks(trueDest, current, os, opNameMap, allocInfoMap,
+                        skippedOps, indent + 1, argSubstitutionMap,
+                        visitedBlocks, forLoopHeaders);
+
+          // Continue with exit
+          printBlockArgAssignments(falseDest, condBr.getFalseDestOperands(), os,
+                                   indent, argSubstitutionMap, skipIdx);
+          current = falseDest;
+          continue;
+        }
+
+        // Regular while loop
+        std::string condExpr =
+            preComputedCondExpr.empty()
+                ? getValueName(condBr.getCondition(), argSubstitutionMap)
+                : preComputedCondExpr;
+        for (unsigned i = 0; i < indent; ++i)
+          os << "  ";
+        os << "while " << condExpr << ":\n";
+
+        // Print true-dest arg assignments if any
+        printBlockArgAssignments(trueDest, condBr.getTrueDestOperands(), os,
+                                 indent + 1, argSubstitutionMap);
+
+        // Print loop body (true branch), stopping when we get back to current
+        printCFBlocks(trueDest, current, os, opNameMap, allocInfoMap,
+                      skippedOps, indent + 1, argSubstitutionMap, visitedBlocks,
+                      forLoopHeaders);
+
+        // After the while, continue with the false dest (exit)
+        printBlockArgAssignments(falseDest, condBr.getFalseDestOperands(), os,
+                                 indent, argSubstitutionMap);
+        current = falseDest;
+        continue;
+      }
+
+      // Regular if/else
+      std::string condExpr =
+          preComputedCondExpr.empty()
+              ? getValueName(condBr.getCondition(), argSubstitutionMap)
+              : preComputedCondExpr;
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << "if " << condExpr << ":\n";
+
+      auto isBlank = [](StringRef s) {
+        return s.find_first_not_of(" \t\r\n") == StringRef::npos;
+      };
+
+      std::string trueStr;
+      {
+        llvm::raw_string_ostream trueOs(trueStr);
+        printBlockArgAssignments(trueDest, condBr.getTrueDestOperands(), trueOs,
+                                 indent + 1, argSubstitutionMap);
+        if (trueDest != mergeBlock) {
+          printCFBlocks(trueDest, mergeBlock, trueOs, opNameMap, allocInfoMap,
+                        skippedOps, indent + 1, argSubstitutionMap,
+                        visitedBlocks, forLoopHeaders);
+        }
+      }
+      if (isBlank(trueStr)) {
+        for (unsigned i = 0; i < indent + 1; ++i)
+          os << "  ";
+        os << "pass\n";
+      } else {
+        os << trueStr;
+      }
+
+      // Print else branch only if it has real content.
+      if (falseDest != mergeBlock || condBr.getFalseDestOperands().size() > 0) {
+        std::string elseStr;
+        {
+          llvm::raw_string_ostream elseOs(elseStr);
+          printBlockArgAssignments(falseDest, condBr.getFalseDestOperands(),
+                                   elseOs, indent + 1, argSubstitutionMap);
+          if (falseDest != mergeBlock) {
+            printCFBlocks(falseDest, mergeBlock, elseOs, opNameMap,
+                          allocInfoMap, skippedOps, indent + 1,
+                          argSubstitutionMap, visitedBlocks, forLoopHeaders);
+          }
+        }
+        if (!isBlank(elseStr)) {
+          for (unsigned i = 0; i < indent; ++i)
+            os << "  ";
+          os << "else:\n";
+          os << elseStr;
+        }
+      }
+
+      // Continue with merge block
+      if (mergeBlock) {
+        current = mergeBlock;
+        continue;
+      }
+      return;
+    }
+
+    // cf.br: unconditional branch — print arg assignments and continue
+    if (auto br = dyn_cast<cf::BranchOp>(term)) {
+      Block *dest = br.getDest();
+      // Skip iterator arg assignment when branching to a for-loop header
+      int skipIdx = -1;
+      auto forIt = forLoopHeaders.find(dest);
+      if (forIt != forLoopHeaders.end())
+        skipIdx = (int)forIt->second.iterArgIdx;
+      printBlockArgAssignments(dest, br.getDestOperands(), os, indent,
+                               argSubstitutionMap, skipIdx);
+      // If dest is already visited (back-edge) or is the stop block, stop
+      if (visitedBlocks.count(dest) || dest == stopBlock)
+        return;
+      current = dest;
+      continue;
+    }
+
+    // Unknown terminator — just stop
+    return;
+  }
+}
+
+// Entry point for CF-aware region printing
+void printCFRegion(Region &region, llvm::raw_ostream &os,
+                   const llvm::StringMap<StringRef> &opNameMap,
+                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                   llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                   DenseMap<Value, Value> *argSubstitutionMap) {
+  if (region.empty())
+    return;
+
+  // Pre-scan: detect for-loop headers
+  DenseMap<Block *, ForLoopInfo> forLoopHeaders;
+  for (Block &block : region) {
+    ForLoopInfo info;
+    if (detectForLoopPattern(&block, info, argSubstitutionMap))
+      forLoopHeaders[&block] = info;
+  }
+
+  Block &entry = region.front();
+  llvm::SmallDenseSet<Block *, 16> visitedBlocks;
+  printCFBlocks(&entry, nullptr, os, opNameMap, allocInfoMap, skippedOps,
+                indent, argSubstitutionMap, visitedBlocks, forLoopHeaders);
+}
+
+void printRegion(Region &region, llvm::raw_ostream &os,
+                 const llvm::StringMap<StringRef> &opNameMap,
+                 const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                 llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                 DenseMap<Value, Value> *argSubstitutionMap,
+                 ArrayRef<Value> yieldTargets) {
+  // A substitution recorded while printing an op (scf.for maps its results
+  // onto its iter_args) must outlive it for the siblings that consume it.
+  DenseMap<Value, Value> ownedSubstitutionMap;
+  if (!argSubstitutionMap)
+    argSubstitutionMap = &ownedSubstitutionMap;
+
+  // For multi-block regions with CF control flow, use the CF-aware printer
+  if (std::distance(region.begin(), region.end()) > 1) {
+    printCFRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent,
+                  argSubstitutionMap);
+    return;
+  }
+  // Single-block region: print sequentially
+  for (Block &block : region) {
+    printBlock(block, os, opNameMap, allocInfoMap, skippedOps, indent,
+               argSubstitutionMap, yieldTargets);
+  }
+}
+
+} // namespace
+
+struct TLXPrintTTGIRToTLXPass
+    : public impl::TLXPrintTTGIRToTLXBase<TLXPrintTTGIRToTLXPass> {
+public:
+  using impl::TLXPrintTTGIRToTLXBase<
+      TLXPrintTTGIRToTLXPass>::TLXPrintTTGIRToTLXBase;
+
+  void runOnOperation() override {
+    ModuleOp m = getOperation();
+
+    // Ops the printer cannot represent report a diagnostic. Count those so the
+    // pass fails, rather than handing back a silently incomplete kernel.
+    unsigned numErrors = 0;
+    ScopedDiagnosticHandler countErrors(m.getContext(), [&](Diagnostic &diag) {
+      if (diag.getSeverity() == DiagnosticSeverity::Error)
+        ++numErrors;
+      return failure();
+    });
+
+    moduleScopeDefNames.clear();
+
+    // Build the lookup map
+    static llvm::StringMap<StringRef> opNameMap = buildOpNameMap();
+
+    // Build value name cache once using AsmState (avoids O(N^2) SSA
+    // renumbering in getValueName).
+    auto cache = buildValueNameCache(m.getOperation());
+    valueNameCacheStorage = &cache;
+
+    // Pre-analyze all local_alloc operations
+    DenseMap<Operation *, LocalAllocInfo> allocInfoMap;
+    m.walk([&](Operation *op) {
+      if (op->getName().getStringRef() == "ttg.local_alloc") {
+        allocInfoMap[op] = analyzeLocalAlloc(op);
+      }
+    });
+
+    // Track ops to skip
+    llvm::DenseSet<Operation *> skippedOps;
+
+    // Check if TRITON_TLX_DUMP_DIR is set for file output
+    const char *dumpDir = std::getenv("TRITON_TLX_DUMP_DIR");
+    if (dumpDir && dumpDir[0] != '\0') {
+      // Extract kernel function name from module
+      std::string kernelName = "kernel";
+      m.walk([&](tt::FuncOp funcOp) { kernelName = funcOp.getName().str(); });
+
+      // Build output path: <dir>/<kernel_name>.tlx
+      llvm::SmallString<256> outPath(dumpDir);
+      llvm::sys::path::append(outPath, kernelName + ".tlx");
+
+      // Write TLX dump to file
+      std::error_code ec;
+      llvm::raw_fd_ostream fileOs(outPath, ec);
+      if (!ec) {
+        for (Region &region : m->getRegions()) {
+          printRegion(region, fileOs, opNameMap, allocInfoMap, skippedOps, 0);
+        }
+      } else {
+        llvm::errs() << "Warning: Could not open TLX dump file " << outPath
+                     << ": " << ec.message() << "\n";
+        for (Region &region : m->getRegions()) {
+          printRegion(region, llvm::outs(), opNameMap, allocInfoMap, skippedOps,
+                      0);
+        }
+      }
+    } else {
+      // Default behavior: print to stdout
+      for (Region &region : m->getRegions()) {
+        printRegion(region, llvm::outs(), opNameMap, allocInfoMap, skippedOps,
+                    0);
+      }
+    }
+
+    valueNameCacheStorage = nullptr;
+    if (numErrors > 0)
+      signalPassFailure();
+  }
+};
+
+} // namespace tlx
+} // namespace triton
+} // namespace mlir

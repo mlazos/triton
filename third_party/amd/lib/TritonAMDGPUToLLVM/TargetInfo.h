@@ -4,7 +4,9 @@
 #include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "llvm/TargetParser/AMDGPUTargetParser.h"
+#include "llvm/TargetParser/TargetParser.h"
 #include <optional>
+#include <string>
 
 namespace mlir::triton::AMD {
 void registerTargetInfo();
@@ -70,10 +72,14 @@ public:
   void warpSync(Location loc, RewriterBase &rewriter) const override;
 
   void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                    Value ctaId, Value val, Value pred) const override;
+                    Value ctaId, Value val, Value pred,
+                    std::optional<Value> barrierPtr = {}) const override;
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     Value ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
+
+  Value rematerializeDistributedCoordinate(RewriterBase &rewriter, Location loc,
+                                           Value coordinate) const override;
 
   // Describes the parameters of ds_read_tr for a particular data type.
   using LDSTransLoadParams = amdgpu::TargetFeatures::LDSTransLoadParams;
@@ -85,8 +91,8 @@ public:
 
   Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                    int i) const override;
-  std::pair<Value, Value> shuffleUp(RewriterBase &rewriter, Location loc,
-                                    Value val, int delta) const override;
+  Value shuffleUp(RewriterBase &rewriter, Location loc, Value val,
+                  int i) const override;
   Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
                    int i) const override;
   Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
@@ -99,8 +105,10 @@ public:
                   ProgramIDDim axis) const override;
 
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
-                  triton::ReduceOp op, unsigned reduceLaneIdMask,
-                  unsigned broadcastLaneIdMask) const override;
+                  triton::ReduceOp op, unsigned numLaneToReduce,
+                  unsigned interleave,
+                  std::optional<unsigned> broadcastLaneIdMask =
+                      std::nullopt) const override;
 
   void printf(RewriterBase &rewriter, Value formatStrStart,
               int formatStrByteCount, ValueRange args,
@@ -191,10 +199,8 @@ public:
   }
   // Returns the cache policy (cpol) immediate for buffer atomic instructions.
   // When hasUsers is true, sets SC0/TH_ATOMIC_RETURN to return pre-op value.
-  // On CDNA5, also sets SCOPE_DEV for device-wide visibility.
-  int32_t getBufferAtomicCachePolicy(bool hasUsers) const {
-    return targetFeatures.getBufferAtomicCachePolicy(hasUsers);
-  }
+  // On CDNA5, defaults to SCOPE_DEV; clusterScope opts into SCOPE_SE.
+  int32_t getBufferAtomicCachePolicy(bool hasUsers, bool clusterScope) const;
 
   bool supportsWaveId() const { return targetFeatures.supportsWaveId(); }
   bool supportsPermlaneSwap() const {
@@ -223,6 +229,24 @@ public:
   getSharedLdStTiles(int32_t vecBitwidth) const override;
 
 private:
+  // Emit the wave64 DPP butterfly warp-reduce into `acc` (in place) using the
+  // given within-row row_shr step order (count-down 8,4,2,1 for the default
+  // reduction; count-up 1,2,4,8 for an ordered inner_tree reduction). `reduxOp`
+  // is the reduction's single combiner op.
+  void emitDppWarpReduce(RewriterBase &rewriter, Location loc,
+                         SmallVector<Value> &acc, Operation *reduxOp,
+                         ArrayRef<int> rowShrSteps) const;
+
+  // Warp-reduce for a reduction with a defined ("inner_tree") ordering,
+  // emitting the fixed count-up DPP tree so the result is bitwise-identical
+  // across num_warps. Returns false when the count-up DPP tree is not
+  // applicable (partial warp, non-wave64, unsupported arch, or
+  // non-single-combiner reduce) so the shared count-up shuffle tree runs
+  // instead.
+  bool warpReduceInnerTree(RewriterBase &rewriter, Location loc,
+                           SmallVector<Value> &acc, triton::ReduceOp op,
+                           unsigned numLaneToReduce) const;
+
   void printfImpl(Value formatStrStart, int formatStrByteCount, ValueRange args,
                   ArrayRef<bool> isSigned, RewriterBase &rewriter,
                   bool useStdErr) const;

@@ -7,6 +7,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "llvm/Support/MathExtras.h" // Log2_64
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -83,6 +84,9 @@ public:
     // We zero out the bases that are constant
     auto kReg = StringAttr::get(ctx, "register");
     auto ll = toLinearLayout(rtType);
+    // pseudoinvert needs radix-2 inputs and power-of-two outputs.
+    if (ll.hasNonPow2OutDim())
+      return resultVals;
     ll = ll.removeZeroBasesAlongDim(kReg);
     auto dims = to_vector(ll.getOutDimNames());
     auto llReg = ll.sublayout({kReg}, dims);
@@ -90,9 +94,14 @@ public:
     auto invReg = inv.sublayout(dims, {kReg});
     auto bases_inv = invReg.getBases();
     for (auto [c, d] : llvm::zip(constancy, dims)) {
-      assert(llvm::isPowerOf2_32(c));
-      for (int i = 0; i < llvm::Log2_32(c); i++) {
-        bases_inv[d][i] = {0};
+      // Clamp constancy to its largest pow2 divisor (c & -c) before Log2; NPOT
+      // constancy (e.g. 48) would mis-floor. c is a multiple of it, so the
+      // zeroed low bits never cross a constancy block boundary. Pow2 c: no-op.
+      if (c == 0)
+        continue; // Log2_64(0) is UB; nothing to dedup
+      int64_t pow2C = c & (-c);
+      for (int i = 0; i < llvm::Log2_64(pow2C); i++) {
+        bases_inv[d][i][0] = 0;
       }
     }
     auto invBroadcast = LinearLayout(std::move(bases_inv), invReg.getOutDims(),
@@ -165,10 +174,8 @@ struct ElementwiseOpConversion
                                     ConversionPatternRewriter &rewriter,
                                     Type elemTy, MultipleOperandsRange operands,
                                     Location loc) const {
-    auto attrs = splitBuilderAttributes<DestOp>(
-        rewriter, loc, adaptor.getAttributes().getValue());
     auto result = DestOp::create(rewriter, loc, elemTy, operands[0],
-                                 attrs.properties, attrs.discardableAttrs);
+                                 adaptor.getAttributes().getValue());
     Customize(result);
     return {result};
   }

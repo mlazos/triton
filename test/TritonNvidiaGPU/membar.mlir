@@ -9,7 +9,7 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: init_barrier
 	// CHECK: local_alloc
-	// CHECK-NEXT: ttg.barrier local
+// CHECK: ttg.barrier local
 	// CHECK-NEXT: init_barrier
   tt.func @init_barrier() {
   	%cst = arith.constant dense<0> : tensor<1xi64, #blocked0>
@@ -64,7 +64,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: inval_barrier
 	// CHECK: local_alloc
-	// CHECK-NEXT: ttg.barrier local
+	    // CHECK: ttg.barrier local
 	// CHECK-NEXT: init_barrier
 	// CHECK-NEXT: inval_barrier
   tt.func @inval_barrier() {
@@ -132,8 +132,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 		// CHECK: local_dealloc
 		// CHECK-NEXT: local_alloc
 		// CHECK-NEXT: local_alloc
+    // CHECK-NEXT: init_barrier
     // CHECK-NEXT: ttg.barrier local
-		// CHECK-NEXT: init_barrier
+    // CHECK-NEXT: barrier_expect
+    // CHECK-NEXT: async_tma_copy_global_to_local
+    // CHECK-NEXT: wait_barrier
+    // CHECK-NEXT: ttg.barrier local
   	%cst = arith.constant dense<0> : tensor<128x64xi64, #blocked0>
   	%alloc = ttg.local_alloc %cst : (tensor<128x64xi64, #blocked0>) -> !ttg.memdesc<128x64xi64, #shared1, #smem, mutable>
   	ttg.local_dealloc %alloc : !ttg.memdesc<128x64xi64, #shared1, #smem, mutable>
@@ -196,7 +200,6 @@ tt.func @wait_after_mma(
      !ttg.memdesc<128x128xf16, #shared1, #smem>,
      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
      !ttg.memdesc<1xi64, #shared2, #smem, mutable>
-  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.wait_barrier
   ttng.wait_barrier %barrier, %phase : !ttg.memdesc<1xi64, #shared2, #smem, mutable>
   tt.return
@@ -570,9 +573,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107"} {
   // Each barrier receives one local, one routed, and two multicast contributions.
+  // Per-warp distribution scales all counts by the warp count (x4).
   // FOLD-LABEL: @distributed_arrival_cta_routes
   // FOLD: ttng.init_barrier {{.*}}, 16 :
-  // FOLD: ttng.arrive_barrier {{.*}}, 4 :
+  // Merged tags all three arrives per_warp: fork's plain-CTA distribution plus
+  // upstream's routed/multicast distribution. Counts stay uniformly scaled.
+  // FOLD: ttng.arrive_barrier {{.*}}, 4 {per_warp} :
   // FOLD: ttng.arrive_barrier {{.*}}, 4 {fromCTA = 0 : i32, per_warp} :
   // FOLD: ttng.arrive_barrier {{.*}}, 4 {multicastCTA = 1 : i32, per_warp} :
   // FOLD-NEXT: ttng.wait_barrier

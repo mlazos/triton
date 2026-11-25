@@ -276,7 +276,7 @@ def test_scope_metrics(tmp_path: pathlib.Path):
 
 def test_scope_metrics_invalid(tmp_path: pathlib.Path):
     temp_file = tmp_path / "test_scope_metrics.hatchet"
-    proton.start(str(temp_file.with_suffix("")))
+    proton.start(str(temp_file.with_suffix("")), backend="instrumentation")
 
     error = None
 
@@ -422,6 +422,11 @@ def test_throw(tmp_path: pathlib.Path):
 
 @pytest.mark.parametrize("disable", [True, False])
 def test_profile_disable(disable, fresh_knobs, tmp_path: pathlib.Path):
+    try:
+        from triton.backends.nvidia.driver import libcuda_dirs
+        libcuda_dirs()
+    except (AssertionError, OSError):
+        pytest.skip("requires libcuda (unavailable on this worker)")
     fresh_knobs.proton.disable = disable
     temp_file = tmp_path / "test_profile_disable.hatchet"
     proton.start(str(temp_file.with_suffix("")))

@@ -111,8 +111,13 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
     return 0;
   };
 
+  // For AsyncWaitOp ops that do not come with a token to track the specific
+  // copy group, respect the original pending number. Such case is most likely
+  // from user code. The compiler should not generate a non-zero pending number
+  // if it does not know exactly which group to track.
   if (waitOp->getNumOperands() == 0)
-    return 0;
+    return cast<ttg::AsyncWaitOp>(waitOp).getNum();
+
   // Multi-token waits: take the min of minOverHistories across operands. Both
   // the captured `minCommitNumber` and the returned bailout-0s are folded in.
   int minCommits = INT_MAX;
@@ -341,6 +346,11 @@ std::vector<ttng::WarpGroupDotOp> splitRSDot(ttng::WarpGroupDotOp dotOp) {
   if (origK <= instrK) {
     return {dotOp};
   }
+  // splitLhs's reshape/trans/split chain infers binary layouts only, so a
+  // mixed-radix A stays one RS wgmma.
+  if (ttg::toLinearLayout(a.getType()).hasNonPow2OutDim()) {
+    return {dotOp};
+  }
   constexpr int numSplits = 2;
   uint32_t newK = origK / numSplits;
 
@@ -478,6 +488,20 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
     }
     return true;
   };
+
+  // Rule 0: If there are arrive_barrier ops, the dot can't be async.
+  // An arrive_barrier signals "SMEM is free for reuse"; with pendings > 0 the
+  // arrive could fire while the dot is still asynchronously reading SMEM,
+  // letting the producer overwrite the buffer mid-read.
+  // wait_barrier alone (used by TMA pipelining) is safe — it only blocks until
+  // data is ready and does not signal buffer ownership.
+  bool hasCrossWarpBarriers =
+      !forOp.getBody()->getOps<ttng::ArriveBarrierOp>().empty();
+  if (hasCrossWarpBarriers) {
+    LDBG("Can't make dot async because there are arrive_barrier ops in the "
+         "loop.");
+    return std::nullopt;
+  }
 
   // Rule 1: All shmem operands are multi-buffered.
   // We don't have to call checkOperand on getC() because it's always in

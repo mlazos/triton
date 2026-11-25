@@ -10,14 +10,15 @@ add_triton_library(TritonGPUTransforms
   ReduceDataDuplication.cpp
   OptimizeAccumulatorInit.cpp
   OptimizeDotOperands.cpp
+  OptimizeReductionLayout.cpp
   OptimizeThreadLocality.cpp
-  OptimizeThreadRegions.cpp
   Pipeliner/AssignLatencies.cpp
   Pipeliner/LowerLoops.cpp
   Pipeliner/MMAv5PipelineUtility.cpp
   Pipeliner/ScheduleLoops.cpp
   Pipeliner/WGMMAPipeline.cpp
   Pipeliner/PipelineExpander.cpp
+  Pipeliner/PartitionLoopPeeling.cpp
   Pipeliner/TestPipelineLowerLoop.cpp
   Pipeliner/SoftwarePipeliner.cpp
   Pipeliner/TMAStoresPipeline.cpp
@@ -25,6 +26,7 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/PipeliningUtility.cpp
   Pipeliner/Schedule.cpp
   Prefetch.cpp
+  PtxInterpUtils.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp
   CoalesceAsyncCopy.cpp
@@ -33,6 +35,7 @@ add_triton_library(TritonGPUTransforms
   CoalesceUtils.cpp
   LayoutPropagationUtility.cpp
   WarpSpecialization/AutomaticWarpSpecialization.cpp
+  WarpSpecialization/LoadMMASpecialization.cpp
   WarpSpecialization/NormalizeWSWhileLoops.cpp
   WarpSpecialization/Partition.cpp
   WarpSpecialization/OptimizePartitionWarps.cpp
@@ -51,6 +54,7 @@ add_triton_library(TritonGPUTransforms
   TritonIR
   TritonTransforms
   TritonGPUIR
+  TritonAMDGPUIR
   TritonNvidiaGPUIR
   NVWSIR
   NVWSTransforms

@@ -107,8 +107,6 @@ struct WaitOpInfo {
   int pendingCount;
   bool transferWrites;
   bool transferReads;
-  // If true, the wait also completes accesses not yet committed to a group.
-  bool includeStaged = false;
 };
 
 struct AsyncProxyFenceInfo {
@@ -128,12 +126,6 @@ public:
 
   virtual bool isCLCOp(Operation *op) const { return false; }
 
-  // Whether this operation uses the async-copy mbarrier arrival peer thread
-  // class.
-  virtual bool usesAsyncCopyMbarrierArriveThread(Operation *op) const {
-    return false;
-  }
-
   virtual std::optional<BarrierInitInfo>
   getBarrierInitInfo(Operation *op) const = 0;
 
@@ -143,7 +135,8 @@ public:
   virtual std::optional<BarrierInvalidateInfo>
   getBarrierInvalidateInfo(Operation *op) const = 0;
 
-  virtual SmallVector<WaitOpInfo> getWaitOpInfo(Operation *op) const = 0;
+  virtual std::optional<WaitOpInfo>
+  getWaitOpInfo(Operation *op, const AuxDataMap &auxData) const = 0;
 
   virtual std::optional<AsyncProxyFenceInfo>
   getAsyncProxyFenceInfo(Operation *op) const {
@@ -187,8 +180,8 @@ public:
                                        access.value, "", access.sharedKind);
     }
     if (info.operandEffects.empty())
-      return std::nullopt;
-    return info;
+      return std::optional<MemEffectsOpInfo>{};
+    return std::optional<MemEffectsOpInfo>{std::move(info)};
   }
 
   // Returns commit kinds used by addWriteChecks to detect outstanding
@@ -199,7 +192,8 @@ public:
 
   // Returns commit kinds used by addReadChecks to detect outstanding
   // read accesses to shared memory.
-  virtual SmallVector<CommitKindDesc> getOutstandingReadCommitKinds() const {
+  virtual SmallVector<CommitKindDesc>
+  getOutstandingReadCommitKinds(const AuxDataMap &auxData) const {
     return {};
   }
 

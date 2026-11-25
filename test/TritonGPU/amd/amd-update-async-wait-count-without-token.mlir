@@ -569,11 +569,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
-#idx_i32_parent = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
-#idx_i16_parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: tdm_gather_scatter_multiple_instructions
   tt.func public @tdm_gather_scatter_multiple_instructions(
+    %memDesc: !ttg.memdesc<256x128xf16, #shared, #smem, mutable>,
+    %tensorDesc: !tt.tensordesc<64x128xf16>,
+    %row_indices_i32: tensor<64xi32>,
+    %row_indices_i16: tensor<256xi16>,
+    %pred: i32
+  ) {
+    %c0_i32 = arith.constant 0 : i32
+
+    // Gather with 64xi32 indices: 64/8 = 8 instructions
+    amdg.async_tdm_gather %tensorDesc[%row_indices_i32] to %memDesc : tensor<64xi32>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // Scatter with 64xi32 indices: 64/8 = 8 instructions
+    amdg.async_tdm_scatter %tensorDesc[%row_indices_i32] from %memDesc : tensor<64xi32>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // Gather with 128xi16 indices: 256/16 = 16 instructions
+    amdg.async_tdm_gather %tensorDesc[%row_indices_i16] to %memDesc : tensor<256xi16>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // Scatter with 128xi16 indices: 256/16 = 16 instructions
+    amdg.async_tdm_scatter %tensorDesc[%row_indices_i16] from %memDesc : tensor<256xi16>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+
+    // CHECK: amdg.async_tdm_intrinsic_wait {count = 0
+    amdg.async_tdm_wait {num = 0 : i32}
+    // CHECK: amdg.async_tdm_intrinsic_wait {count = 16
+    amdg.async_tdm_wait {num = 1 : i32}
+    // CHECK: amdg.async_tdm_intrinsic_wait {count = 32
+    amdg.async_tdm_wait {num = 2 : i32}
+    // CHECK: amdg.async_tdm_intrinsic_wait {count = 40
+    amdg.async_tdm_wait {num = 3 : i32}
+    // CHECK: amdg.async_tdm_intrinsic_wait {count = 48
+    amdg.async_tdm_wait {num = 4 : i32}
+
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+#idx_i32_parent = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
+#idx_i16_parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tdm_gather_scatter_encoded_multiple_instructions
+  tt.func public @tdm_gather_scatter_encoded_multiple_instructions(
     %memDesc: !ttg.memdesc<256x128xf16, #shared, #smem, mutable>,
     %tensorDesc: !tt.tensordesc<64x128xf16>,
     %row_indices_i32: tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_i32_parent}>>,
@@ -582,12 +621,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   ) {
     %c0_i32 = arith.constant 0 : i32
 
-    %memDesc_i32 = ttg.memdesc_subslice %memDesc [0, 0] : !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 256x128>
-
     // Gather with i32 indices: sizePerThread=16, 4 warps, maxPerInstr=8 => 2 instructions
-    amdg.async_tdm_gather %tensorDesc[%row_indices_i32] to %memDesc_i32 : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_i32_parent}>>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 256x128> -> !tt.tensordesc<64x128xf16>
+    amdg.async_tdm_gather %tensorDesc[%row_indices_i32] to %memDesc : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_i32_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
     // Scatter with i32 indices: 2 instructions
-    amdg.async_tdm_scatter %tensorDesc[%row_indices_i32] from %memDesc_i32 : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_i32_parent}>>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 256x128> -> !tt.tensordesc<64x128xf16>
+    amdg.async_tdm_scatter %tensorDesc[%row_indices_i32] from %memDesc : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_i32_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
     // Gather with i16 indices: sizePerThread=64, 4 warps, maxPerInstr=16 => 4 instructions
     amdg.async_tdm_gather %tensorDesc[%row_indices_i16] to %memDesc : tensor<256xi16, #ttg.slice<{dim = 0, parent = #idx_i16_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
     // Scatter with i16 indices: 4 instructions

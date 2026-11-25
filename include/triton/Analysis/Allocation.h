@@ -10,11 +10,14 @@
 
 #include <limits>
 #include <optional>
+#include <string>
 
 namespace mlir {
 
 namespace triton {
 class AllocationAnalysis;
+class MemoryPlanner;
+class MemoryPlannerTmem;
 
 /// Callback to allow backends to specify target-specific scratch sizes for
 /// some operations.
@@ -27,18 +30,17 @@ unsigned getAtomicResultScratchSize(Value result);
 /// Returns whether an operation uses scratch memory across CTAs.
 bool hasCrossCTAScratch(Operation *op);
 
-/// For result-broadcast scratch, returns the CTA bits broadcast from
+/// For atomic-result scratch, returns the CTA bits broadcast from
 /// each group leader. Physical scratch owners have these bits clear.
-/// Scalar atomic results are broadcast from CTA0 across all CTAs.
+/// Scalar results are broadcast from CTA0 across all CTAs.
 /// Callers check whether scratch has been allocated.
-std::optional<uint16_t> getResultScratchBroadcastMask(Operation *op);
+std::optional<uint16_t> getAtomicScratchBroadcastMask(Operation *op);
 
 unsigned getNumScratchElemsSwizzledCvt(const LinearLayout &srcLayout,
                                        const LinearLayout &dstLayout,
                                        int bitwidth, int numBanks = 32,
                                        gpu::LocalMemOpTile srcTile = {},
                                        gpu::LocalMemOpTile dstTile = {});
-
 unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
                                        RankedTensorType dstTy,
                                        int numBanks = 32,
@@ -196,6 +198,15 @@ private:
     size_t alignment;
     size_t offset;
 
+    // For MemoryPlannerTmem
+    bool isOwnerOfSpace;
+    size_t rowOffset;
+    size_t colOffset;
+    size_t rowSize;
+    size_t colSize;
+    size_t reuseOffset;  // when isOwnerOfSpace is true
+    BufferT *reuseOwner; // when isOwnerOfSpace is false
+
     /// For partitioned tensors: buffers that reside in different physical
     /// partitions.
     SmallVector<BufferT *> neighbors;
@@ -267,6 +278,8 @@ private:
   size_t bufferIdCounter = 0;
 
   friend class triton::AllocationAnalysis;
+  friend class triton::MemoryPlanner;
+  friend class triton::MemoryPlannerTmem;
 };
 
 /// Static analysis that computes the allocation of shared memory buffers
@@ -320,6 +333,33 @@ public:
 private:
   FuncOffsetMapT sharedMemoryValue;
 };
+
+namespace triton {
+
+inline constexpr llvm::StringLiteral kSharedMemoryBreakdownAttr =
+    "ttg.shared_memory_breakdown";
+
+struct SharedMemoryReservation {
+  StringRef kind;
+  size_t offset;
+  size_t size;
+  Operation *owner;
+};
+
+/// Keep original IR identifiers out of downstream printed IR.
+void encodeSharedMemoryBreakdown(ModuleOp mod);
+
+/// Read diagnostic JSON from either its raw or encoded representation.
+std::optional<std::string> getSharedMemoryBreakdown(ModuleOp mod);
+
+/// Capture allocated byte ranges; their sizes are not additive under reuse.
+void attachSharedMemoryBreakdown(ModuleOp mod, ModuleAllocation &allocation);
+
+/// Record reservations made after allocation without changing their placement.
+void appendSharedMemoryReservations(
+    ModuleOp mod, ArrayRef<SharedMemoryReservation> reservations);
+
+} // namespace triton
 
 } // namespace mlir
 

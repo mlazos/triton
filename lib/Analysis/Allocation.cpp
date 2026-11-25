@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <numeric>
 
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Support/LLVM.h"
@@ -14,8 +13,10 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "allocation-shared-memory"
@@ -30,6 +31,7 @@ static size_t getPartitionIndex(size_t offset, size_t partitionSize) {
 }
 
 namespace ttng = mlir::triton::nvidia_gpu;
+namespace ttg = mlir::triton::gpu;
 
 namespace mlir {
 
@@ -55,7 +57,7 @@ unsigned getNumScratchElemsSwizzledCvt(const LinearLayout &srcLayout,
   // The smem has the same CGA layout as srcLayout, so use that instead.
   // Remove the number of elements duplicated in the CGA layout.
   auto nBlocks = product(triton::gpu::getCTASplitNum(
-      gpu::GenericLinearEncodingAttr::get(ctx, srcLayout)));
+      gpu::LinearEncodingAttr::get(ctx, srcLayout)));
   return smem.getTotalOutDimSize() / (reps * nBlocks);
 }
 
@@ -101,10 +103,10 @@ unsigned getAtomicResultScratchSize(Value result) {
 }
 
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
-  if (auto handoff = dyn_cast<gpu::ThreadHandoffOp>(op)) {
-    if (handoff.getSource().hasSameWarpAndBlock(handoff.getDestination()))
-      return 0;
-    return gpu::getSharedMemorySize(handoff.getType());
+  if (auto reshape = dyn_cast<ReshapeOp>(op)) {
+    RankedTensorType srcTy = reshape.getSrc().getType();
+    if (gpu::isNpotSharedReshape(srcTy, reshape.getType()))
+      return srcTy.getNumElements() * getBitwidth(srcTy) / 8;
   }
   if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
     return ReduceOpHelper(reduceOp).getScratchSizeInBytes();
@@ -129,6 +131,8 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   if (auto cvtLayout = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto srcTy = cvtLayout.getSrc().getType();
     auto dstTy = cvtLayout.getType();
+    if (auto bytes = getMixedRadixConversionScratchBytes(cvtLayout))
+      return *bytes;
     if (!cvtNeedsSharedMemory(cvtLayout))
       return 0;
     // The generic pass uses swizzling
@@ -157,10 +161,7 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   return 0;
 }
 
-std::optional<uint16_t> getResultScratchBroadcastMask(Operation *op) {
-  if (auto handoff = dyn_cast<gpu::ThreadHandoffOp>(op))
-    return handoff.getSource().getBlock() &
-           ~handoff.getDestination().getBlock();
+std::optional<uint16_t> getAtomicScratchBroadcastMask(Operation *op) {
   if (!isa<AtomicOpInterface, AtomicPollOp, gpu::LocalAtomicScatterRMWOp>(op))
     return std::nullopt;
   if (op->getNumResults() == 0)
@@ -177,9 +178,6 @@ std::optional<uint16_t> getResultScratchBroadcastMask(Operation *op) {
 bool hasCrossCTAScratch(Operation *op) {
   if (gpu::lookupNumCTAs(op) == 1)
     return false;
-  if (auto handoff = dyn_cast<gpu::ThreadHandoffOp>(op))
-    return handoff.getSource().getBlock() !=
-           handoff.getDestination().getBlock();
   if (auto cvt = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto block = StringAttr::get(op->getContext(), "block");
     return !isCvtDimSync(gpu::toLinearLayout(cvt.getSrc().getType()),
@@ -198,9 +196,20 @@ bool hasCrossCTAScratch(Operation *op) {
   }
   if (auto poll = dyn_cast<AtomicPollOp>(op))
     return poll.getTimeout() && !poll.getResult().use_empty() &&
-           getResultScratchBroadcastMask(op).value_or(0) != 0;
-  if (isa<AtomicOpInterface, gpu::LocalAtomicScatterRMWOp>(op))
-    return atomicResultHasCTABroadcast(op);
+           getAtomicScratchBroadcastMask(op).value_or(0) != 0;
+  if (isa<AtomicOpInterface, gpu::LocalAtomicScatterRMWOp>(op)) {
+    if (op->getNumResults() == 0)
+      return false;
+    Value result = op->getResult(0);
+    if (result.use_empty())
+      return false;
+    auto resultTy = dyn_cast<RankedTensorType>(result.getType());
+    if (!resultTy)
+      return true;
+    auto block = StringAttr::get(op->getContext(), "block");
+    return gpu::toLinearLayout(resultTy).getFreeVariableMasks().lookup(block) !=
+           0;
+  }
   return false;
 }
 
@@ -320,10 +329,14 @@ private:
     if (auto func = dyn_cast<FunctionOpInterface>(op)) {
       unsigned numWarpIndices = 0;
       // Warp specialization communicates states over shared memory to each
-      // warp. Add space for an i8 for each warpgroup warp.
-      func.walk([&](gpu::WarpSpecializeOp op) {
-        numWarpIndices = std::max(numWarpIndices, op.getTotalPartitionWarps());
-      });
+      // warp. Add space for an i8 for each warpgroup warp. If single-WS
+      // lowering, dispatch from warp id instead of a state id, so it needs no
+      // state array and we skip this allocation.
+      if (!gpu::hasSingleWarpSpecialize(op->getParentOfType<ModuleOp>()))
+        func.walk([&](gpu::WarpSpecializeOp op) {
+          numWarpIndices =
+              std::max(numWarpIndices, op.getTotalPartitionWarps());
+        });
       maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, numWarpIndices);
       return;
     }
@@ -475,17 +488,70 @@ private:
     // Analyze liveness of explicit buffers
     Liveness liveness(operation);
     auto getValueLivenessRange = [&](Value value) {
+      Operation *defOp = value.getDefiningOp();
       auto liveOperations = liveness.resolveLiveness(value);
       auto minId = std::numeric_limits<size_t>::max();
       auto maxId = std::numeric_limits<size_t>::min();
       llvm::for_each(liveOperations, [&](Operation *liveOp) {
-        if (operationId[liveOp] < minId) {
-          minId = operationId[liveOp];
-        }
-        if ((operationId[liveOp] + 1) > maxId) {
-          maxId = operationId[liveOp] + 1;
+        if (liveOp && isa<mlir::triton::gpu::WarpSpecializeOp>(liveOp)) {
+          minId = 0;
+          if ((operationId[liveOp] + 1) > maxId) {
+            maxId = operationId[liveOp] + 1;
+          }
+        } else {
+          if (operationId[liveOp] < minId) {
+            minId = operationId[liveOp];
+          }
+          if ((operationId[liveOp] + 1) > maxId) {
+            maxId = operationId[liveOp] + 1;
+          }
         }
       });
+      if (hasOpOfAnyTypeInForwardSlice<ttg::RemoteShmemStoreOp,
+                                       ttg::AsyncRemoteShmemStoreOp,
+                                       ttg::AsyncRemoteShmemCopyOp>(defOp)) {
+        // For RemoteShmemStoreOp and
+        // AsyncRemoteShmemStoreOp/AsyncRemoteShmemCopyOp, ensure that the
+        // liveness range of the value covers the entire function. This will
+        // prevent reuse of shmem used by remote stores. This will remove the
+        // need to add expensive cluster barriers before/after these ops to
+        // protect against memory hazards between remote CTAs writing to an
+        // shmem location on a local CTA and the local CTA reusing the same
+        // shmem location for another op
+        minId = 0;
+        maxId = operationId.size();
+      }
+      // For barriers, extend liveness to the entire function. By default,
+      // SMEM based mbarriers (on NV GPU) need to be invalidated before reusing.
+      // If bar inval op is not explicitly inserted, it should be assumed that
+      // the bar is alive until kernel end. Without this lifetime extension, a
+      // later bar could think an earlier bar was dead since the last explicit
+      // reference to it and reuse the buffer, causing corruption when
+      // performing bar init again on this mem location.
+      if (hasOpOfAnyTypeInForwardSlice<ttng::InitBarrierOp>(defOp)) {
+        minId = 0;
+        maxId = operationId.size();
+      }
+      // For SMEM buffers used by AsyncTMACopyLocalToGlobalOp (early TMA
+      // store lowering), the buffer must remain live until the corresponding
+      // TMAStoreTokenWaitOp completes. SSA liveness only tracks the memdesc
+      // use at the async_tma_copy op, but the TMA hardware continues reading
+      // from the buffer asynchronously until the token wait. Without this
+      // extension, two such buffers can be assigned the same SMEM offset,
+      // causing a data race when the second local_alloc overwrites the first
+      // buffer while the TMA is still reading it.
+      if (hasOpOfAnyTypeInForwardSlice<ttng::AsyncTMACopyLocalToGlobalOp>(
+              defOp)) {
+        llvm::SetVector<Operation *> forwardSlice;
+        getForwardSlice(defOp, &forwardSlice);
+        for (Operation *op : forwardSlice) {
+          if (isa<ttng::TMAStoreTokenWaitOp>(op)) {
+            if ((operationId[op] + 1) > maxId) {
+              maxId = operationId[op] + 1;
+            }
+          }
+        }
+      }
       return Interval(minId, maxId);
     };
 
@@ -912,5 +978,174 @@ Allocation::getLiveBuffers() {
   rootOperation->walk(analyzeOperation);
   return liveBuffers;
 }
+
+namespace triton {
+namespace {
+
+std::string diagnosticJsonString(std::string value) {
+  if (!llvm::json::isUTF8(value))
+    value = llvm::json::fixUTF8(value);
+  return value;
+}
+
+llvm::json::Object describeSharedMemoryRange(StringRef kind, size_t offset,
+                                             size_t size, Operation *owner) {
+  std::string location;
+  llvm::raw_string_ostream os(location);
+  owner->getLoc().print(os);
+  return llvm::json::Object{
+      {"kind", kind},
+      {"offset", static_cast<int64_t>(offset)},
+      {"size", static_cast<int64_t>(size)},
+      {"operation", owner->getName().getStringRef()},
+      {"location", diagnosticJsonString(std::move(location))}};
+}
+
+constexpr llvm::StringLiteral kSharedMemoryBreakdownEncoding = "hex-v1:";
+
+void storeSharedMemoryBreakdown(ModuleOp mod, const llvm::json::Value &report,
+                                bool encoded = false) {
+  std::string value = llvm::formatv("{0}", report).str();
+  if (encoded)
+    value = kSharedMemoryBreakdownEncoding.str() + llvm::toHex(value);
+  mod->setAttr(kSharedMemoryBreakdownAttr,
+               StringAttr::get(mod.getContext(), value));
+}
+
+} // namespace
+
+std::optional<std::string> getSharedMemoryBreakdown(ModuleOp mod) {
+  auto attr = mod->getAttrOfType<StringAttr>(kSharedMemoryBreakdownAttr);
+  if (!attr)
+    return std::nullopt;
+  StringRef value = attr.getValue();
+  if (!value.consume_front(kSharedMemoryBreakdownEncoding))
+    return value.str();
+  if (value.size() % 2 != 0 ||
+      !std::all_of(value.begin(), value.end(),
+                   [](char c) { return llvm::isHexDigit(c); }))
+    return std::nullopt;
+  return llvm::fromHex(value);
+}
+
+void encodeSharedMemoryBreakdown(ModuleOp mod) {
+  auto attr = mod->getAttrOfType<StringAttr>(kSharedMemoryBreakdownAttr);
+  if (!attr || attr.getValue().starts_with(kSharedMemoryBreakdownEncoding))
+    return;
+  // Preserve readable allocator snapshots, but transport original identifiers
+  // opaquely once downstream transformations start changing the IR.
+  mod->setAttr(
+      kSharedMemoryBreakdownAttr,
+      StringAttr::get(mod.getContext(), kSharedMemoryBreakdownEncoding.str() +
+                                            llvm::toHex(attr.getValue())));
+}
+
+void attachSharedMemoryBreakdown(ModuleOp mod, ModuleAllocation &allocation) {
+  constexpr size_t maxAllocations = 32;
+  auto roots = allocation.getRoots();
+  llvm::sort(roots, [](auto lhs, auto rhs) {
+    return SymbolTable::getSymbolName(lhs).getValue() <
+           SymbolTable::getSymbolName(rhs).getValue();
+  });
+
+  llvm::json::Array functions;
+  for (auto root : roots) {
+    auto *funcAllocation = allocation.getFuncData(root);
+    struct Record {
+      Allocation::BufferId id;
+      Operation *owner;
+      size_t size;
+      size_t offset;
+    };
+    SmallVector<Record> records;
+    DenseSet<Allocation::BufferId> seen;
+    auto record = [&](Allocation::BufferId id, Operation *owner) {
+      if (id != Allocation::InvalidBufferId && seen.insert(id).second)
+        records.push_back({id, owner, funcAllocation->getAllocatedSize(id),
+                           funcAllocation->getOffset(id)});
+    };
+    root.walk<WalkOrder::PreOrder>([&](Operation *op) {
+      record(funcAllocation->getBufferId(op), op);
+      for (Value result : op->getResults())
+        for (auto id : funcAllocation->getBufferIds(result))
+          record(id, op);
+    });
+    llvm::stable_sort(records, [](const Record &lhs, const Record &rhs) {
+      if (lhs.size != rhs.size)
+        return lhs.size > rhs.size;
+      return lhs.offset < rhs.offset;
+    });
+
+    llvm::json::Array buffers;
+    for (const Record &record : ArrayRef(records).take_front(maxAllocations)) {
+      bool explicitBuffer = funcAllocation->isExplicitBuffer(record.id);
+      StringRef kind = explicitBuffer                               ? "explicit"
+                       : funcAllocation->isVirtualBuffer(record.id) ? "virtual"
+                                                                    : "scratch";
+      auto entry = describeSharedMemoryRange(kind, record.offset, record.size,
+                                             record.owner);
+      entry["barrier_backed"] =
+          explicitBuffer &&
+          hasOpOfAnyTypeInForwardSlice<ttng::InitBarrierOp>(record.owner);
+      buffers.push_back(std::move(entry));
+    }
+    functions.push_back(llvm::json::Object{
+        {"name", diagnosticJsonString(
+                     SymbolTable::getSymbolName(root).getValue().str())},
+        {"reserved_bytes",
+         static_cast<int64_t>(funcAllocation->getSharedMemorySize())},
+        {"allocations", std::move(buffers)},
+        {"omitted_allocations",
+         static_cast<int64_t>(records.size() -
+                              std::min(records.size(), maxAllocations))}});
+  }
+  storeSharedMemoryBreakdown(
+      mod, llvm::json::Object{
+               {"version", 1},
+               {"reserved_bytes",
+                static_cast<int64_t>(allocation.getSharedMemorySize())},
+               {"functions", std::move(functions)},
+               {"reservations", llvm::json::Array{}}});
+}
+
+void appendSharedMemoryReservations(
+    ModuleOp mod, ArrayRef<SharedMemoryReservation> reservations) {
+  if (reservations.empty())
+    return;
+  auto attr = mod->getAttrOfType<StringAttr>(kSharedMemoryBreakdownAttr);
+  if (!attr)
+    return;
+  bool encoded = attr.getValue().starts_with(kSharedMemoryBreakdownEncoding);
+  auto value = getSharedMemoryBreakdown(mod);
+  if (!value) {
+    mod->removeAttr(kSharedMemoryBreakdownAttr);
+    return;
+  }
+  auto report = llvm::json::parse(*value);
+  if (!report) {
+    llvm::consumeError(report.takeError());
+    mod->removeAttr(kSharedMemoryBreakdownAttr);
+    return;
+  }
+  auto *object = report->getAsObject();
+  auto reserved = object ? object->getInteger("reserved_bytes") : std::nullopt;
+  auto *entries = object ? object->getArray("reservations") : nullptr;
+  if (!reserved || *reserved < 0 || !entries ||
+      object->getInteger("version") != 1) {
+    mod->removeAttr(kSharedMemoryBreakdownAttr);
+    return;
+  }
+  for (const auto &reservation : reservations) {
+    entries->push_back(
+        describeSharedMemoryRange(reservation.kind, reservation.offset,
+                                  reservation.size, reservation.owner));
+    *reserved = std::max(
+        *reserved, static_cast<int64_t>(reservation.offset + reservation.size));
+  }
+  (*object)["reserved_bytes"] = *reserved;
+  storeSharedMemoryBreakdown(mod, *report, encoded);
+}
+
+} // namespace triton
 
 } // namespace mlir

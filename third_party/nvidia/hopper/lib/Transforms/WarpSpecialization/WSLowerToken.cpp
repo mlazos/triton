@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 
@@ -29,7 +30,42 @@ namespace {
 
 // Lower to use GetCanonicalWarpIdOp.
 // In Hopper, each task is a warpgroup consisting of 4 warps.
-const int THREADS_PER_TASK = 128;
+const int THREADS_PER_WARP = 32;
+
+// Token lowering emits one CTA barrier after initializing each token's full
+// and empty mbarriers.  Consecutive token initializers in the same block can
+// share the last barrier: no token user can execute until that barrier, and
+// delaying the earlier synchronization only extends initialization ordering.
+static void
+coalesceAdjacentTokenInitBarriers(ArrayRef<ttg::BarrierOp> initBarriers) {
+  // drop_front() asserts on an empty ArrayRef, and a kernel with no tokens
+  // reaches here with nothing to coalesce.
+  if (initBarriers.empty())
+    return;
+
+  DenseSet<Operation *> generatedBarriers;
+  for (ttg::BarrierOp barrier : initBarriers)
+    generatedBarriers.insert(barrier);
+
+  for (auto [barrier, nextBarrier] :
+       llvm::zip(initBarriers, initBarriers.drop_front())) {
+    if (barrier->getBlock() != nextBarrier->getBlock())
+      continue;
+
+    bool onlyInitScaffolding = true;
+    for (Operation *op = barrier->getNextNode(); op != nextBarrier;
+         op = op->getNextNode()) {
+      if (!op || (!generatedBarriers.contains(op) &&
+                  !isa<arith::ConstantOp, ttg::LocalAllocOp,
+                       ttg::MemDescIndexOp, ttng::InitBarrierOp>(op))) {
+        onlyInitScaffolding = false;
+        break;
+      }
+    }
+    if (onlyInitScaffolding)
+      barrier->erase();
+  }
+}
 
 Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
                           bool emptyBarrier) {
@@ -55,9 +91,12 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
   Value phase = getMBarrierPhaseBit(builder, op, true);
   auto i32Ty = builder.getIntegerType(32);
   phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
-  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferEmpty, phase);
+  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferEmpty, phase,
+                                            /*pred=*/Value(), /*deps=*/{},
+                                            op.getConstraintsAttr());
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
+  copyLoopScheduleInfo(waitOp, op);
 }
 
 void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
@@ -66,16 +105,14 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
   auto loc = op.getLoc();
   ttng::ArriveBarrierOp arriveOp;
 
-  if (loadType == ttnvws::TokenLoadType::TMALoadOp) {
-    // Get the count from the barriers: trace the local_alloc for the barrier
-    // then find the count from init_barrier
-    arriveOp = ttng::ArriveBarrierOp::create(builder, loc, bufferFull, fullCnt);
-  } else {
-    llvm::report_fatal_error("unsupported load type for producer commit");
-  }
+  assert(loadType != ttnvws::TokenLoadType::AsyncLoadOp);
+  arriveOp = ttng::ArriveBarrierOp::create(
+      builder, loc, bufferFull, 1, /*pred=*/Value(), /*perThread=*/false,
+      op.getConstraintsAttr());
 
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
+  copyLoopScheduleInfo(arriveOp, op);
 }
 
 void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
@@ -84,28 +121,38 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
   Value phase = getMBarrierPhaseBit(builder, op, false);
   auto i32Ty = builder.getIntegerType(32);
   phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
-  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferFull, phase);
+  auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferFull, phase,
+                                            /*pred=*/Value(), /*deps=*/{},
+                                            op.getConstraintsAttr());
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
+  copyLoopScheduleInfo(waitOp, op);
 }
 
 void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
-                              Value bufferEmpty, int numCTAs,
-                              unsigned emptyCnt) {
+                              Value bufferEmpty, int numCTAs, unsigned emptyCnt,
+                              ttnvws::TokenLoadType loadType) {
   auto loc = op.getLoc();
-  auto arriveOp =
-      ttng::ArriveBarrierOp::create(builder, loc, bufferEmpty, emptyCnt);
+  auto arriveOp = ttng::ArriveBarrierOp::create(
+      builder, loc, bufferEmpty, 1, /*pred=*/Value(), /*perThread=*/false,
+      op.getConstraintsAttr());
+  // Only a TMA refill writes through the async proxy; ProxyFenceInsertion
+  // places the fence once the barrier passes are done moving the arrive.
+  if (loadType == ttnvws::TokenLoadType::TMALoadOp &&
+      op->hasAttr(ttng::kFenceGenericReadsAttrName))
+    arriveOp->setAttr(ttng::kFenceGenericReadsAttrName, builder.getUnitAttr());
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
+  copyLoopScheduleInfo(arriveOp, op);
 }
 
 void lowerTokenOperations(Operation *parentOp, int numCTAs,
                           int numConsumerGroups) {
   SmallVector<Operation *> deprecatedOps;
   SmallVector<Operation *> deprecatedTokenOps;
-  DenseSet<Operation *> warpSpecOps;
   DenseMap<Operation *, Value> tokenToFull;
   DenseMap<Operation *, Value> tokenToEmpty;
+  SmallVector<ttg::BarrierOp> tokenInitBarriers;
   parentOp->walk([&](ttnvws::CreateTokenOp createTokenOp) {
     ttnvws::TokenLoadType loadType = createTokenOp.getLoadType();
     MLIRContext *context = createTokenOp.getContext();
@@ -136,9 +183,80 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     tokenToFull[createTokenOp.getOperation()] = bufferFullArray;
     tokenToEmpty[createTokenOp.getOperation()] = bufferEmptyArray;
 
-    unsigned bufferFullCount =
-        loadType == ttnvws::TokenLoadType::TMALoadOp ? 1 : THREADS_PER_TASK;
-    unsigned bufferEmptyCount = THREADS_PER_TASK;
+    // Need to check number of warps here. FullBarrier is used for
+    // ProducerCommit and ConsumerWait, EmptyBarrier is used for ProducerAcquire
+    // and ConsumerRelease. Need to check number of warps for the partition
+    // containing ProducerCommit and ConsumerRelease. What if a token has
+    // multiple producers or consumers? Check if num_warps agree.
+    unsigned producerWarps = 0, consumerWarps = 0;
+    SmallVector<Operation *> usersForToken;
+    for (OpOperand &use : createTokenOp.getResult().getUses()) {
+      Operation *user = use.getOwner();
+      if (auto wsOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
+        unsigned opndNum = use.getOperandNumber();
+        // Handle the regions. Trace uses of the argument corresponding to the
+        // captured value.
+        for (Region &region : wsOp.getPartitionRegions()) {
+          LDBG("-- region " << region.getNumArguments());
+          auto tArg = region.getArgument(opndNum);
+          for (Operation *tUser : tArg.getUsers()) {
+            // Use of TokenOp via capture of warp_specialize.
+            usersForToken.push_back(tUser);
+          }
+        }
+      } else {
+        usersForToken.push_back(user);
+      }
+    }
+    // Detect and skip same-partition ProducerCommit/ConsumerWait pairs.
+    // When both ops are in the same warp-specialize partition, the
+    // synchronization is redundant — program order within a partition
+    // already guarantees correctness. This happens for OperandD channels
+    // where the MMA accumulator is both produced and consumed in the
+    // Gemm partition.
+    DenseSet<Operation *> samePartitionOps;
+    {
+      DenseMap<int, SmallVector<Operation *>> commitsByTask, waitsByTask;
+      for (Operation *user : usersForToken) {
+        auto taskIds = getAsyncTaskIds(user);
+        if (taskIds.size() != 1)
+          continue;
+        int tid = taskIds[0];
+        if (isa<ttnvws::ProducerCommitOp>(user))
+          commitsByTask[tid].push_back(user);
+        else if (isa<ttnvws::ConsumerWaitOp>(user))
+          waitsByTask[tid].push_back(user);
+      }
+      for (auto &[tid, commits] : commitsByTask) {
+        if (waitsByTask.count(tid)) {
+          for (auto *op : commits)
+            samePartitionOps.insert(op);
+          for (auto *op : waitsByTask[tid])
+            samePartitionOps.insert(op);
+        }
+      }
+    }
+
+    for (Operation *user : usersForToken) {
+      if (dyn_cast<ttnvws::ProducerCommitOp>(user) ||
+          dyn_cast<ttnvws::ProducerAcquireOp>(user)) {
+        auto nWarps = mlir::triton::gpu::lookupNumWarps(user);
+        assert(producerWarps == 0 || producerWarps == nWarps);
+        producerWarps = nWarps;
+      } else if (dyn_cast<ttnvws::ConsumerReleaseOp>(user) ||
+                 dyn_cast<ttnvws::ConsumerWaitOp>(user) ||
+                 dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+        auto nWarps = mlir::triton::gpu::lookupNumWarps(user);
+        assert(consumerWarps == 0 || consumerWarps == nWarps);
+        consumerWarps = nWarps;
+      }
+    }
+
+    // Full barrier is for ProducerCommit and ConsumerWait.
+    unsigned bufferFullCount = loadType == ttnvws::TokenLoadType::TMALoadOp
+                                   ? 1
+                                   : THREADS_PER_WARP * producerWarps;
+    unsigned bufferEmptyCount = THREADS_PER_WARP * consumerWarps;
     for (unsigned i = 0; i < createTokenOp.getNumBuffers(); i++) {
       Value idx = arith::ConstantIntOp::create(builder, loc, i, 32);
       Value barrierFullView = ttg::MemDescIndexOp::create(
@@ -146,17 +264,17 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
       // EmptyView is used for ConsumerRelease and ProducerAcquire.
       // FullView is for ConsumerWait and ProducerCommit.
       ttng::InitBarrierOp::create(builder, loc, barrierFullView,
-                                  bufferFullCount);
+                                  1); // bufferFullCount);
 
       Value barrierEmptyView = ttg::MemDescIndexOp::create(
           builder, loc, singleBarrierMemDescType, bufferEmptyArray, idx);
       ttng::InitBarrierOp::create(builder, loc, barrierEmptyView,
-                                  bufferEmptyCount);
+                                  1); // bufferEmptyCount);
     }
 
     assert(numCTAs == 1 && "remote CTA is not supported yet");
-    mlir::triton::gpu::BarrierOp::create(builder, loc,
-                                         triton::gpu::AddrSpace::Local);
+    tokenInitBarriers.push_back(mlir::triton::gpu::BarrierOp::create(
+        builder, loc, triton::gpu::AddrSpace::Local));
 
     // Helper function for extracting one index from bufferFullArray.
     auto extractBufferFull = [&](Location loc, Value idx) -> Value {
@@ -170,6 +288,12 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
                                          bufferEmptyArray, idx);
     };
     auto handleOneUser = [&](Operation *user) -> bool {
+      // Skip same-partition ProducerCommit/ConsumerWait pairs — the
+      // synchronization is redundant within a single warp group.
+      if (samePartitionOps.count(user)) {
+        deprecatedOps.push_back(user);
+        return true;
+      }
       // Here builder is at the user, make sure usage of values outside of
       // warp_specialize is via capture if user is in a partition region.
       // We need bufferFullArray and bufferEmptyArray.
@@ -200,8 +324,20 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
-                                 bufferEmptyCount);
+                                 bufferEmptyCount, loadType);
         deprecatedOps.push_back(user);
+        return true;
+      } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+        Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
+        for (auto [nvwsTok, nvwsIdx] :
+             llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
+          Value bufferEmpty = extractBufferEmpty(loc, nvwsIdx);
+          setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
+          op.addBarrier(bufferEmpty, truePred);
+        }
+        op.getNvwsTokensMutable().clear();
+        op.getNvwsTokenIndicesMutable().clear();
+        // Do NOT erase — the op stays with its newly-added real barriers.
         return true;
       }
       return false;
@@ -209,27 +345,10 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
 
     // Process token users: ProducerAcquireOp, ProducerCommitOp, ConsumerWaitOp,
     // and ConsumerReleaseOp.
-    for (OpOperand &use : createTokenOp.getResult().getUses()) {
-      Operation *user = use.getOwner();
+    for (Operation *user : usersForToken) {
       builder.setInsertionPoint(user);
-      bool handled = handleOneUser(user);
-      if (auto wsOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
-        unsigned opndNum = use.getOperandNumber();
-        // Handle the regions. Trace uses of the argument corresponding to the
-        // captured value.
-        for (Region &region : wsOp.getPartitionRegions()) {
-          LDBG("-- region " << region.getNumArguments());
-          auto tArg = region.getArgument(opndNum);
-          for (Operation *tUser : tArg.getUsers()) {
-            builder.setInsertionPoint(tUser);
-            // Use of TokenOp via capture of warp_specialize.
-            handleOneUser(tUser);
-          }
-        }
-        warpSpecOps.insert(user);
-      } else if (!handled) {
-        llvm_unreachable("Unexpected user of token");
-      }
+      auto loc = user->getLoc();
+      handleOneUser(user);
     }
 
     deprecatedTokenOps.push_back(createTokenOp);
@@ -275,12 +394,6 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
           for (Region &region : wsOp.getPartitionRegions()) {
             LDBG("-- region " << region.getNumArguments());
             auto tArg = region.getArgument(opndNum);
-            for (Operation *tUser : tArg.getUsers()) {
-              LLVM_DEBUG({
-                LDBG("user for arg");
-                tUser->dump();
-              });
-            }
             region.eraseArgument(opndNum);
             BlockArgument arg =
                 region.addArgument(full.getType(), full.getLoc());
@@ -295,6 +408,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     op->erase();
   }
 
+  coalesceAdjacentTokenInitBarriers(tokenInitBarriers);
+
   assert(numCTAs == 1 && "remote CTA is not supported yet");
   LLVM_DEBUG({
     LDBG("after lowering");
@@ -304,7 +419,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
 
 } // namespace
 
-void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
+void doTokenLowering(triton::FuncOp funcOp, unsigned numConsumerGroups) {
   ModuleOp mod = funcOp.getOperation()->getParentOfType<ModuleOp>();
   int numCTAs = ttg::TritonGPUDialect::getNumCTAs(mod);
 

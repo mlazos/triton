@@ -69,9 +69,8 @@ SmallVector<Value> createTDMDescriptor(RewriterBase &rewriter, Location loc,
 // `warpUsedHint`: see TritonAMDGPUOps.td for the axis-aligned hint rule.
 // `isPureForm`: inherit `pred` from the descriptor (group0[0]) instead of the
 // `pred` arg, and leave the barrier-enable bit untouched.
-// Warps the layout leaves idle get a NULL descriptor (pred = 0). When
-// `barrierPtr` is set they get a NOP instead (tile_dim0 = 0, workgroup mask
-// cleared, pred kept), so every warp sends exactly one barrier arrive.
+// `descriptorOffsets`: optional signed offsets folded from an unclamped
+// descriptor update. These advance the address but do not shrink the bounds.
 void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
                        const LLVMTypeConverter *typeConverter, Type elementType,
                        SmallVector<int64_t> blockShape, int numWarps,
@@ -82,13 +81,13 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
                        const triton::LinearLayout &sharedLayout, Value ctaId,
                        bool isStore, ArrayRef<unsigned> warpsPerCTA,
                        std::optional<uint32_t> warpUsedHint = std::nullopt,
-                       bool isPureForm = false);
+                       bool isPureForm = false,
+                       ArrayRef<Value> descriptorOffsets = {});
 
 // Emit a TDM load/store for regular contiguous transfers (1D-5D).
 // PartitionedSharedEncoding aligns warps to LDS partitions; without a hint
 // the op auto-splits into multiple instructions when warps don't cover all
 // pieces, while a hint guarantees single-instruction emission (verifier).
-// Only the last instruction carries `barrierPtr`, so each warp arrives once.
 // `warpUsedHint`: see TritonAMDGPUOps.td.
 void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       const LLVMTypeConverter *typeConverter,
@@ -102,7 +101,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       std::optional<uint32_t> warpUsedHint = std::nullopt,
                       bool isPureForm = false);
 
-// A struct representing information needed for one member of a fused TDM load.
+// Information required to materialize one member of a fused TDM load.
 struct TDMFusedLoadMemberInfo {
   unsigned padInterval = 0;
   unsigned padAmount = 0;
@@ -111,24 +110,23 @@ struct TDMFusedLoadMemberInfo {
   Attribute sharedEncoding;
   SmallVector<int64_t> shapePerCTA;
   Value multicastMask;
-  SmallVector<Value> desc;        // unpacked descriptor groups
-  SmallVector<Value> copyOffsets; // per-member copy offsets
-  SmallVector<Value> dstPtrs;     // shared-memory base pointers
-  Value pred;                     // optional per-copy predicate
+  SmallVector<Value> desc;
+  SmallVector<Value> copyOffsets;
+  // Folded address-only update, in tensor elements and Triton dimension order.
+  SmallVector<Value> descriptorOffsets;
+  SmallVector<Value> dstPtrs;
+  Value pred;
 };
 
-// Emit one fused TDM load intrinsic, `select`ing each wave's descriptor on an
-// SGPR-uniform per-wave selector. `memberHints` must be verifier-legal and
-// pairwise disjoint; no mbarrier is encoded for fused loads.
+// Emit one fused TDM load intrinsic, selecting the descriptor used by each
+// wave from the verifier-legal, pairwise-disjoint member hints.
 void emitTDMLoadFused(RewriterBase &rewriter, Location loc,
                       const LLVMTypeConverter *typeConverter,
                       ArrayRef<TDMFusedLoadMemberInfo> members, int numWarps,
                       Value ctaId, int32_t auxBits,
                       ArrayRef<uint32_t> memberHints);
 
-// Effective warp count that drives hinted TDM descriptor layout.  A
-// `warp_used_hint` maps the active tile distribution to K = popcount(hint)
-// warps.
+// Effective warp count used to build a hinted TDM descriptor.
 int getTDMEffectiveWarps(int numWarps, std::optional<uint32_t> warpUsedHint);
 
 // Returns (warpsPerCTA, numTDMInstructions) for a given shared encoding.
@@ -157,8 +155,6 @@ size_t getTDMGatherScatterIntrinsicCount(RankedTensorType indicesType);
 //   whether indices are 32-bit or 16-bit, detect redundant warps (via
 //   getFreeVariableMasks), and compute per-warp LDS offsets.
 // Multiple TDM instructions are issued automatically if more rows are needed.
-// Only the last one carries `barrierPtr`; with a barrier, redundant warps get
-// a NOP on it rather than a NULL descriptor, so each warp arrives once.
 LogicalResult
 emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
                      const LLVMTypeConverter *typeConverter,
@@ -167,7 +163,7 @@ emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
                      Value multicastMask, Type elementType, Value barrierPtr,
                      const triton::LinearLayout &cgaLayout, Value ctaId,
                      ArrayRef<Value> rowIndices, bool isGather, int numWarps,
-                     RankedTensorType indicesType, int32_t auxBits);
+                     RankedTensorType indicesType);
 
 // Emit prefetches for a TDM tile to make it available for an actual load in
 // the future. Data is prefetched cooperatively across all CTAs, warps, and

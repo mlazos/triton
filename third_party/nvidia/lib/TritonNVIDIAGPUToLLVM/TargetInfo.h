@@ -3,6 +3,7 @@
 
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TargetFeatures.h"
+#include <optional>
 
 namespace mlir::triton::NVIDIA {
 
@@ -42,13 +43,20 @@ public:
 
   void warpSync(Location loc, RewriterBase &rewriter) const override;
 
-  void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                    Value ctaId, Value val, Value pred) const override;
+  void
+  storeDShared(RewriterBase &rewriter, Location loc, Value ptr, Value ctaId,
+               Value val, Value pred,
+               std::optional<Value> barrierPtr = std::nullopt) const override;
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     Value ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
   Value mapDShared(RewriterBase &rewriter, Location loc, Value ptr, Value ctaId,
                    Value pred) const;
+
+  void copyBulkSharedToRemoteShared(RewriterBase &rewriter, Location loc,
+                                    Value srcPtr, Value dstPtr,
+                                    Value barrierPtr, Value ctaId,
+                                    Value size) const override;
 
   bool supportLdMatrix() const override {
     return targetFeatures.supportLdMatrix();
@@ -71,8 +79,8 @@ public:
 
   Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                    int i) const override;
-  std::pair<Value, Value> shuffleUp(RewriterBase &rewriter, Location loc,
-                                    Value val, int delta) const override;
+  Value shuffleUp(RewriterBase &rewriter, Location loc, Value val,
+                  int i) const override;
   Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
                    int i) const override;
   Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
@@ -85,8 +93,15 @@ public:
                   ProgramIDDim axis) const override;
 
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+                  triton::ReduceOp op, unsigned numLaneToReduce,
+                  unsigned interleave,
+                  std::optional<unsigned> broadcastLaneIdMask) const override;
+  // Mask-based entry point matching upstream #12067; holds the shared redux
+  // heuristics. No default on the override above so internal calls resolve
+  // to this overload unambiguously.
+  bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
                   triton::ReduceOp op, unsigned reduceLaneIdMask,
-                  unsigned broadcastLaneIdMask) const override;
+                  unsigned broadcastLaneIdMask) const;
   unsigned getReductionTreeArity(Operation *combinerOp) const override;
 
   void printf(RewriterBase &rewriter, Value formatStrStart,
@@ -107,13 +122,14 @@ public:
   int getAddressSpace(Attribute addressSpace) const override;
 
   bool supportVectorizedAtomics() const override;
-  bool supportNativeBF16AtomicAdd() const override {
-    return getComputeCapability() >= 90;
-  }
 
   int getPtxVersion() const { return ptxVersion; }
   int getComputeCapability() const {
     return targetFeatures.getComputeCapability();
+  }
+  bool supportsMbarrierMulticast() const {
+    // mbarrier.arrive.multicast was introduced in PTX 9.4 for Rubin.
+    return targetFeatures.supportsMbarMulticast() && ptxVersion >= 94;
   }
   const triton::nvidia_gpu::TargetFeatures &getTargetFeatures() const {
     return targetFeatures;
@@ -122,6 +138,8 @@ public:
   bool isCuda() const override { return true; }
 
 private:
+  bool useExplicitSharedStore() const;
+
   triton::nvidia_gpu::TargetFeatures targetFeatures;
   int ptxVersion;
 };

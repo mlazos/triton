@@ -1,0 +1,569 @@
+# Partition Scheduling Meta
+
+This document covers the `PartitionSchedulingMeta` pass, which assigns partition
+IDs to operations for warp specialization. This is the first pass in the AutoWS
+pipeline — it determines which warp group each operation will execute on.
+
+**File**: `PartitionSchedulingMeta.cpp`
+
+## Overview
+
+The pass walks supported loop-like operations with the `tt.warp_specialize`
+attribute and assigns each operation inside the scheduled body (and post-loop
+consumers) to a **partition**. Each partition maps to a warp group at runtime.
+The supported forms are `scf.for` and ordered-subset-carry `scf.while`.
+
+```
+Phase 1: Categorize operations         (OpCategorizer + collectMMABackwardSlices)
+Phase 2: Create partition layout       (createPartitionLayout with tuning knobs)
+Phase 3: Schedule anchor ops           (loads, epilogue stores, MMAs)
+Phase 4: Propagate users               (load users, correction, reductions)
+Phase 5: Create computation partitions (per-MMA user scheduling + dpId assignment)
+Phase 6: Schedule post-loop ops        (schedulePostLoopOps — epilogue routing)
+  ─── end of getInitialSchedule ───
+Post:    propagatePartitions + optimizeSchedule + splitDataPartitionedIfOps
+```
+
+## Supported Loop Forms
+
+Partition scheduling uses `LoopLikeOpInterface` at its API boundary, but does
+not accept arbitrary loop-like operations. `scf.for` uses its body region and
+retains the existing induction-variable offset. `scf.while` uses its after
+region as the scheduled body and has no induction variable.
+
+An `scf.while` is schedulable when `scf.condition` forwards a direct, unique,
+non-empty, order-preserving subset of its before-region arguments. Forwarded values map
+from after-region arguments through the condition operands to their actual
+yield slots; non-forwarded values are condition-only state and do not re-enter
+the scheduled body. This supports CLC's `(valid, x)` carry, where only `x` is
+forwarded. Empty, reordered, duplicate, or computed forwarding is rejected by
+stripping loop-local warp-specialization metadata and leaving a plain while.
+
+The before region remains loop control rather than a PSM partition. Task-ID
+propagation marks the while, its condition computation, `scf.condition`, and
+`scf.yield` with the union of tasks after the single-partition PSM anchors have
+been converted to task IDs.
+
+## Tuning Knobs
+
+Partition layout is controlled by `SchedulingOptions`, exposed as pass options
+in `Passes.td`:
+
+| Knob | Pass Option | Default | Effect |
+|------|-------------|---------|--------|
+| `mergeCorrection` | `--merge-correction` | false | Correction ops → computation[dpId] |
+| `mergeEpilogue` | `--merge-epilogue` | false | Epilogue ops → correction/reduction/computation |
+| `mergeEpilogueToComputation` | `--merge-epilogue-to-computation` | false | Epilogue ops → computation[dpId] directly |
+| `mergeReduction` | `--merge-reduction` | false | Reduction ops → computation[dpId] |
+| `separateEpilogueStore` | `--separate-epilogue-store` | false | Epilogue store ops → own 1-warp partition |
+
+Per-loop `tt.merge_epilogue` attribute overrides the `mergeEpilogue` pass option.
+
+### Epilogue Terminology
+
+Post-loop operations are split into two categories:
+
+- **Epilogue ops**: Non-store post-loop operations (tmem_load acc, normalize,
+  truncf, convert_layout). These are computation that must happen after the
+  main loop before the final store.
+- **Epilogue store ops**: Post-loop TMA store operations (DescriptorStoreOp,
+  AsyncTMACopyLocalToGlobalOp). These write the final results to global memory.
+
+The epilogue tuning knobs control where these go:
+
+**`mergeEpilogue` routing**: When true, epilogue ops go to the correction
+partition (if it exists), else the reduction partition, else computation[dpId].
+This preserves the priority: correction > reduction > computation. Used by
+FA forward where epilogue ops (normalize acc) belong in the correction
+partition.
+
+**`mergeEpilogueToComputation` routing**: When true, epilogue ops go directly
+to computation[dpId], even if a correction or reduction partition exists. This
+is used by FA backward where post-loop ops (tmem_load dK/dV, reshape, split,
+truncf) are data-partitioned and should stay with their corresponding
+computation partition rather than being merged into the reduction partition.
+
+`mergeEpilogueToComputation` takes priority over `mergeEpilogue` when both are
+set.
+
+Epilogue store ops are independent of these knobs — they always go to
+`epilogue_store` (when `separateEpilogueStore`) or `epilogue` partition.
+
+### Target Partition Layouts
+
+| Case | Knobs | Partitions |
+|------|-------|------------|
+| Blackwell FA fwd | mergeEpilogue + separateEpilogueStore | correction, gemm, load, epilogue_store, comp×2 |
+| Blackwell FA bwd | mergeEpilogueToComputation (merge_epilogue=true) | reduction, gemm, load, computation |
+| Blackwell FA bwd, dependent 2-CTA | mergeEpilogueToComputation + relay | computation(default), reduction, gemm, load, relay |
+| Blackwell flex fwd | mergeEpilogue | correction, gemm, load, comp×2 |
+| Hopper FA fwd | mergeCorrection + mergeEpilogue | load, comp×2 |
+| Simple GEMM | separateEpilogueStore | gemm, load, epilogue, epilogue_store |
+| No-MMA reduction (RMS/LayerNorm) | mergeEpilogue + separateEpilogueStore | reduction, load, epilogue_store |
+
+The **No-MMA reduction** layout serves reduction-only kernels (RMS norm,
+LayerNorm, softmax-only) that have **no MMA** and use a plain in-register
+`tt.reduce` (not a TMA-atomic reduce). The `reduction` partition is the default
+(index 0, 4 warps) and holds all tensor compute (square, `tt.reduce`,
+accumulate, the rsqrt/normalize chain). The whole path is gated to
+`mmas.empty()`, so MMA kernels — including the MMA-with-epilogue-reduction case —
+are unaffected. Mechanics:
+
+- **Trigger** (`OpCategorizer::hasComputeAnchorNoMMA`): `mmas.empty()` and the
+  loop nest contains any `triton::ReduceOp`, except when the loop nest also
+  contains a register `tt.dot` (an MMA that `mmas` does not track, e.g.
+  mma.sync at BLOCK_M=32) **and** a separate "epilogue" partition will be
+  created (`createsEpiloguePartition`: an EpilogueStore op, no
+  `mergeEpilogue`, no `mergeEpilogueToComputation`). In that case the
+  reduction layout would put the dot in "reduction" but the K loop carrying its
+  accumulator in "epilogue", so the anchor is off and the kernel gets the plain
+  register-GEMM layout (dot, K loop and epilogue in "epilogue"). Without an
+  epilogue partition (merge flags set, or a pointer `tt.store` epilogue) the
+  "reduction" partition holds all of it and the anchor stays on. Drives
+  `hasComputeAnchor` in `createPartitionLayout`.
+- **Register dot + TMA reduce**: a TMA reduce creates the reduction partition
+  through `hasReduction` regardless of the anchor, so with a register `tt.dot`
+  and an epilogue partition `getInitialSchedule` returns no schedule and the
+  loop is not specialized (partition-scheduler bug #48).
+- **Reduction first → index 0**: the reduction branch fires for
+  `hasReduction || hasComputeAnchor`, and because it runs before the
+  load/epilogue_store branches it gets index 0 (the default 4-warp group), so
+  `getDefaultPartition()` becomes non-null.
+- **Phase 4 runs** (see the guard exception below): with `defaultPartition ==
+  reductionPartition`, the load-user walk routes the in-loop tensor compute into
+  the reduction partition (there is no Phase 5 for no-MMA kernels).
+- **In-loop epilogue-store anchoring**: the generic anchoring keys on the
+  non-store `epiloguePartition` (null here under `mergeEpilogue`), so a no-MMA
+  gated step anchors in-loop epilogue store ops — the TMA store **and** its
+  `async_tma_store_token_wait` — to `epilogue_store` *before* Phase 4. The
+  staging `local_alloc` stays in reduction, forming the reduction→store SMEM
+  channel. A TMA reduce's token wait (`isReduceTokenWait`) is not anchored: it
+  stays in the partition of its reduce.
+- **Scalar-offset fixup**: before serialization, a no-MMA gated fixpoint assigns
+  each still-unannotated value-producing op (e.g. `offs = i * 64`) the union of
+  its partitioned users' ids (`muli` feeding both load and store gets both).
+  These scalar ops are otherwise skipped by `propagatePartitions` yet must carry
+  `ttg.partition` for the `tt.warp_specialize` verifier.
+
+## Phase 1: Operation Categorization (`OpCategorizer`)
+
+### Categories
+
+| Category | Ops | Purpose |
+|----------|-----|---------|
+| `Load` | `DescriptorLoadOp`, `DescriptorGatherOp` | TMA loads |
+| `MMA` | `MMAv5OpInterface`, `WarpGroupDotOp` | Tensor core operations |
+| `MemDescView` | ops with `MemDescViewTrait` | Memory descriptor views feeding MMA |
+| `EpilogueStore` | `DescriptorStoreOp`, `AsyncTMACopyLocalToGlobalOp` | Epilogue store ops (TMA output stores) |
+| `TMAReduction` | `DescriptorReduceOp`, `AsyncTMAReduceOp` | Atomic reductions |
+| `Correction` | Cross-iteration MMA users | Online softmax rescaling |
+| `DataPartition` | Exclusive ops in one MMA's backward slice | Per-MMA-group computation |
+
+### MMA Type Support
+
+The pass supports both Blackwell and Hopper MMA types via the `isMMAOp()`
+helper:
+- **MMAv5** (`tc_gen5_mma`): Blackwell tensor cores. Gets its own `gemm`
+  partition for TMEM-based accumulation.
+- **WarpGroupDot** (`warp_group_dot`): Hopper tensor cores. No separate `gemm`
+  partition — MMA ops go directly into computation partitions.
+
+### Categorization Order
+
+```
+categorizeLoads()
+categorizeMMAs()
+categorizeEpilogueStores()
+categorizeTMAReductions()
+categorizeCorrectionOps()       ← runs before DataPartition
+categorizeDataPartitionOps()    ← skips already-categorized ops
+```
+
+Correction runs before DataPartition so that correction ops (accumulator
+rescaling) are not stolen by the data partition categorizer.
+
+Categorized operations retain their deterministic discovery order separately
+from the pointer-keyed category lookup map. Scheduling phases process operations
+in that discovery order; iterating the lookup map directly would make shared
+producer ownership depend on pointer hash order when multiple anchor backward
+slices reach the same index or mask chain.
+
+### Central dpId Assignment (`collectMMABackwardSlices`)
+
+`collectMMABackwardSlices` is the single source of truth for data partition ID
+(dpId) assignment. It:
+
+1. **Collects backward slices** for each MMA, **entering `scf.if` regions**
+   selectively — only following yield operands that correspond to results
+   consumed by the current slice. This captures ops like `tmem_load QK` and
+   `mulf(QK*scale)` in flex attention without pulling in ops from the other
+   data partition.
+2. **Groups dependent MMAs** via union-find. MMA B depends on MMA A if A's
+   forward user set overlaps B's backward slice (e.g., QK MMA feeds PV MMA).
+   The forward user set walk **escapes `scf.if` regions** by following
+   `scf.yield` → the parent `scf.if`'s corresponding result (matched by yield
+   operand index), mirroring how the backward slice selectively enters
+   `scf.if`. Without this, a forward set that enters a causal-mask `scf.if`
+   would dead-end at `scf.yield` (a terminator with no SSA results), fail to
+   overlap the dependent MMA's backward slice, and leave QK/PV MMAs unmerged
+   in separate computation partitions. Following the specific operand index
+   (rather than the whole `scf.if`) keeps distinct data partitions separate
+   for cases like flex attention.
+
+   A **second union-find edge** groups MMAs that write the **same accumulator
+   TMEM buffer**. Accumulator-chained MMAs (e.g. `dq += K0ᵀ·dS0` then
+   `dq += K1ᵀ·dS1` into one `dq` tile, or `acc = A@B; acc += C@D`) form a serial
+   reduction whose dependency flows through the accumulator memdesc/token, *not*
+   an SSA result operand — so the forward-user-set walk above stops at each MMA
+   and never sees it. Without this edge the chained dots would be counted as
+   independent groups and split across partitions, racing on the shared tile.
+   `getAccumulatorBuffer` resolves each MMA's accumulator to a canonical buffer
+   identity: it stops at the backing `TMEMAllocOp`; traces through
+   region/offset-preserving views only (`MemDescTransOp`, `MemDescReinterpretOp`);
+   treats an offset-selecting `MemDescIndexOp` as its **own** identity (so two
+   different-offset sub-tiles of one allocation are *not* collapsed); and bails
+   to `nullptr` (logged) on any unrecognized producer rather than guessing.
+3. **Builds `opToDpId` map** for ALL reachable ops:
+   - **Inner-loop ops**: From backward slices, using normalized group IDs.
+     Ops appearing in multiple groups get `SHARED_DPID` sentinel.
+   - **Pre-loop ops**: Following MMA operands backward across the loop
+     boundary (Q loads, allocs).
+   - **Post-loop ops**: Following loop results forward to post-loop consumers
+     (descriptor stores, normalization).
+
+All `categorize*` functions look up dpId from `opToDpId` via `addCategorizedOp`,
+which auto-resolves the dpId when not explicitly provided.
+
+### Data Partition Factor Detection
+
+1. **Collect backward slices** for each MMA.
+2. **Identify shared ops** — ops appearing in multiple slices.
+3. **Union-find grouping** — MMAs are grouped by two edges: (a) forward user
+   sets that overlap another MMA's backward slice, and (b) writing the same
+   accumulator buffer (`getAccumulatorBuffer`, see above). Edge (b) keeps
+   accumulator-chained MMAs in one group even when no slice overlap exists.
+4. **Count groups with exclusive ops** — only groups with at least one
+   non-shared, non-constant op count. This becomes `dataPartitionFactor`.
+
+For FA forward with `data_partition_factor=2`, this yields `dpFactor=2`.
+For FA backward, MMAs are data-dependent (QK feeds PV via the same accumulator),
+so all MMAs group together → `dpFactor=1`.
+
+### Accumulator-chain backstop
+
+After all partition assignments are finalized (post `propagatePartitions` +
+`optimizeSchedule`, before serialization), a verification walk guards against
+any assignment path — union-find above, preassignment, or flex — that splits a
+shared tensor-memory accumulator across partitions that cannot be co-located.
+Concurrent accumulating MMAs into one tile race and silently corrupt the
+reduction, so this is turned into a **hard compile error** rather than a latent
+accuracy bug.
+
+The check maintains, per accumulator buffer, the **running intersection** of the
+partition-id sets of every MMA that writes it, and errors the moment that
+intersection becomes empty (no single partition is common to the whole chain).
+This is correct for chains of 3+ writers: `{0,1},{0,2},{2,3}` is flagged (empty
+overall intersection) while `{0,1},{0,2},{0,3}` passes on common partition `0`.
+The diagnostic attaches a note pointing at the first MMA on the chain. The fix
+is to co-locate the chain in one partition (lower `data_partition_factor`) or to
+give each partition its own accumulator and reduce at the end.
+
+## Phase 2: Partition Layout (`createPartitionLayout`)
+
+Creates partitions based on the categorizer results and `SchedulingOptions`.
+
+Partition creation order determines the partition index. The first partition
+created gets index 0, which becomes the "default" warp group in
+`tt.warp_specialize` (receives 4 warps):
+
+1. **Correction** — when `!mergeCorrection && hasCorrection`. Serves as default
+   for FA/flex (shared ops, load users go here). Created first → index 0.
+2. **Reduction** — when `!mergeReduction && (hasReduction || hasComputeAnchor)`.
+   Serves as default for bwd (TMA-atomic reduce) and for no-MMA in-register
+   reduction kernels. `hasComputeAnchor` is true only when `mmas.empty()` and the
+   loop contains a `tt.reduce` (`OpCategorizer::hasComputeAnchorNoMMA`), so it
+   never fires for MMA kernels; it is also off for a register `tt.dot` when an
+   epilogue partition will be created (see the trigger above). Created first → index 0.
+3. **Gemm** — only when MMAv5 ops exist (Blackwell). Hopper `warp_group_dot`
+   is not MMAv5, so no gemm partition is created for Hopper.
+4. **Load** — always.
+5. **Epilogue** — when `!mergeEpilogue && !mergeEpilogueToComputation &&
+   hasEpilogue`. Holds epilogue ops (non-store post-loop computation).
+6. **Epilogue store** — when `separateEpilogueStore && hasEpilogue`. Gets 1
+   warp. Holds epilogue store ops (TMA stores). When no separate epilogue store
+   partition exists, epilogue store ops go to the epilogue partition instead.
+7. **Computation** — pre-created in Phase 5 per data partition (reverse dpId
+   order for consistent partition index assignment).
+
+There is no dedicated "default" partition. Uncategorized ops (e.g., pre-loop
+acc inits, shared ops, load users) that are not assigned by any phase are
+routed to existing partitions with the fallback priority:
+correction → reduction → epilogue → computation.
+
+When merged (`mergeCorrection=true`), no correction partition is created and
+those ops go to the next available partition in the fallback chain.
+
+## Phase 3–5: Partition Assignment
+
+### Phase 3: Anchor Ops
+
+1. **Loads** → `load` partition. Includes `LocalAllocOp` users with matching
+   shared encoding and `TMEMAllocOp` users.
+2. **Epilogue store ops** → `epilogue_store` partition (when it exists), else
+   follow the same routing as regular epilogue ops.
+3. **MMAs** → `gemm` partition (MMAv5 only). Non-MMAv5 MMAs (WarpGroupDot) are
+   left for Phase 5 where they go to computation partitions.
+4. **MemDesc views** → `gemm` partition (MMAv5 only). Skipped when no gemm
+   partition exists.
+
+### Phase 4: Propagate Users
+
+1. **Load users** → routed with the uncategorized op fallback priority:
+   correction → reduction → epilogue → computation.
+   **Guard**: When `defaultPartition == reductionPartition` (BWD case where
+   no real correction/epilogue/computation partition exists yet), load-user
+   scheduling is **skipped** to prevent transitively pulling the softmax
+   chain into the reduction partition. Phase 5's MMA forward walk handles
+   these ops instead. **Exception**: no-MMA reduction kernels (`mmas.empty()`)
+   have no Phase 5, so the guard adds `|| mmas.empty()` and the load-user walk
+   runs — it is exactly how the reduction (default) partition receives its
+   tensor compute (square, `tt.reduce`, accumulate, normalize).
+2. **Correction ops** → correction partition (+ `scheduleUsers` for transitive
+   users). `scheduleUsers` walks **forward only** through the use chain
+   starting from the correction-categorized op (the `tmem_load` of the PV
+   accumulator). It claims all transitive forward users — reshape, trans,
+   split, convert_layout, inline_asm (the mul with alpha), join, trans,
+   reshape, convert_layout, tmem_store — for the correction partition.
+   However, it does **not** walk backward to claim co-operands of visited ops.
+   For example, when `inline_asm(mul %acc_split, %alpha_broadcast)` is
+   claimed for correction, `scheduleUsers` does not trace back to
+   `%alpha_broadcast` or `expand_dims %alpha`. These ops are left for
+   Phase 5 (computation) and later `optimizeSchedule` (cloning).
+3. **TMA reduction ops** → reduction partition (+ backward slice producers).
+
+### Phase 5: Computation Partitions
+
+Pre-creates computation partitions for each dpId that has `DataPartition`-
+categorized ops (in reverse dpId order to match legacy partition index ordering).
+Then iterates over MMAs (calling `scheduleUsers` to walk forward from each):
+
+- **Pre-assigned MMAs** (PV MMAs): Use the pre-assigned computation partition.
+- **Non-pre-assigned MMAs** (QK MMAs): First check user partitions, then look up
+  dpId from `opToDpId` to find the correct existing computation partition. This
+  prevents creating extra partitions.
+- **Non-MMAv5** (Hopper): MMA ops themselves are scheduled into the computation
+  partition (not gemm, since no gemm partition exists).
+- **BWD (dpFactor≤1)**: All MMA users share one `sharedComputePartition`.
+  `scheduleUsers` walks forward from each MMA: token result → tmem_load →
+  subf/exp2/mulf → truncf → tmem_alloc/local_alloc, assigning all to computation.
+- **3-loop causal**: MMAs in the second loop are matched to first-loop MMAs
+  and `scheduleUsers` reuses their partition.
+
+### dpId-Based Inner-Loop Assignment
+
+After Phase 5, some inner-loop ops may remain unscheduled (e.g., `l_ij` reduce,
+`tmem_alloc` p, `l_i*alpha`, `l_i+l_ij`). These ops have dpIds but aren't
+reached by `scheduleUsers` because they're downstream of correction ops
+(already scheduled in Phase 4) whose use chains `scheduleUsers` skips.
+
+For each unscheduled inner-loop op with a tensor result:
+1. Look up dpId from `opToDpId`.
+2. If no entry, **trace through operands** to find the dpId from an operand
+   that IS in `opToDpId` or already assigned to a computation partition.
+3. Assign to the corresponding `dpIdToPartition` computation partition.
+
+Scalar integer ops (loop counters) and `scf.yield` are excluded from this
+assignment since they are loop-control ops, not data-partition computation ops.
+
+### Phase 6: `schedulePostLoopOps`
+
+Schedules post-loop operations (called at the end of `getInitialSchedule`,
+before `propagatePartitions`):
+
+- **Epilogue store ops** → `epilogue_store` partition (when it exists), else
+  follow the same routing as regular epilogue ops.
+- **TMA reduce token waits** (`isReduceTokenWait`) → the partition of the
+  reduce whose token they consume, not `epilogue_store`. A wait placed apart
+  from its reduce makes `doCodePartition` clone the reduce into the wait's
+  partition, so the value is reduced into global memory twice.
+- **Epilogue ops** (non-store) → routing depends on tuning knobs:
+  - `mergeEpilogueToComputation`: → computation[dpId] directly
+  - `mergeEpilogue`: → correction (if exists) → reduction → computation[dpId]
+  - Neither: → `epiloguePartition` (if exists) → correction/reduction →
+    computation
+
+The `postLoopPartition` fallback order (for epilogue ops when no merge knob
+is active) is:
+1. `epiloguePartition` (when it exists)
+2. Correction/reduction partition (whichever serves as default)
+3. First `dpIdToPartition` entry (Hopper with all merges, last resort)
+
+## Post-Processing
+
+### `propagatePartitions`
+
+Handles unscheduled ops by forming **clusters** — groups of adjacent
+unscheduled ops connected via the SSA def-use graph. Each cluster tracks:
+
+- **defPartitions**: Partitions of already-scheduled ops that feed into the
+  cluster (upstream).
+- **sinkPartitions**: Partitions of already-scheduled ops that consume the
+  cluster's outputs (downstream).
+
+**Nested loop visibility**: `iterateUsers` follows use chains into nested
+inner loops to find partitioned consumers. When a captured value (e.g.,
+`tt.splat` producing `tensor<!tt.ptr>`) is used inside a nested `scf.for`,
+`iterateUsers` walks the use chain inside the nested loop until it finds an
+op with a partition annotation. This ensures the cluster gets the correct
+sink partition (e.g., computation) rather than falling back to the def
+partition (e.g., reduction). Without this, `propagatePartitions` would
+assign pointer tensor ops to reduction, creating cross-partition channels
+for pointer types that crash `WSCodePartition`.
+
+**Scalar op exclusion**: During cluster assignment, ops that produce only
+scalar results (non-tensor, non-memdesc) are skipped. These ops can be
+rematerialized in any partition and should not force partition assignment.
+Clusters with empty `defPartitions` (containing only scalar ops) are also
+skipped.
+
+After schedule optimization, a scalar closure expands every scalar producer to
+the union of its consumers' partitions. This includes scalar ops that already
+have an anchor partition, such as a jagged sequence-offset `tt.load` initially
+assigned to the load task. Code specialization then clones the scalar chain in
+each consuming task instead of attempting an unsupported cross-partition scalar
+channel. The closure runs to a fixpoint so pointer arithmetic feeding a scalar
+load inherits the same task set.
+
+A backstop immediately after the closure verifies the property the closure is
+supposed to establish: every scalar producer owns at least the partitions of
+all its consumers. A violation is reported as a compile error naming the
+producer, the partitions it owns, and the consuming partition, so a scalar edge
+that escapes the closure fails here instead of crashing channel creation or
+silently dropping the value in the consuming task. It sits next to the
+accumulator-chained MMA backstop and, like it, is unreachable while the phase
+above it is intact — it exists to keep a later re-partitioning phase from
+reintroducing a scalar channel undetected. Any lit test that runs the pass
+enforces it.
+
+Cluster assignment rules:
+
+1. **Multiple def or sink partitions**: The cluster sits between multiple
+   partitions. For BWD-like kernels (has reduction, no epilogue, has
+   computation), assign to the existing computation partition. Otherwise
+   create a new computation partition (unless `createComputePartitions=false`,
+   in which case merge into existing computation).
+2. **No sink partition** (no downstream consumers with partitions): Assign
+   the entire cluster to its def partition.
+3. **Single def and single sink**: Assign to the sink partition (downstream
+   consumer), or to the def partition if they're the same.
+
+### `optimizeSchedule`
+
+Clones cheap ops into each partition that has users. This rematerializes
+metadata-only or layout-only ops in consumer partitions rather than creating
+cross-partition channels.
+
+**Cloneable ops**:
+- `MemDescTransOp`: metadata-only reinterpretation of shared memory layout
+- `ConvertLayoutOp`, `BroadcastOp`, `ExpandDimsOp`, `MakeRangeOp`, `SplatOp`:
+  cheap element rearrangement or index construction
+- integer/index `arith` operations: cheap index and mask construction. Floating
+  point tensor arithmetic remains excluded so reductions and activation work
+  are not duplicated into multiple partitions.
+
+**Not cloned**: `LocalAllocOp`. When a shared SMEM buffer (e.g., K/V in
+Flash Attention) is consumed by ops in multiple partitions, the correct
+model is a 1-producer to N-consumer channel: one TMA load writes the buffer,
+all consumer partitions read from it. The downstream
+`separateLocalAllocWithSrc` assigns the `local_store` the source op's
+single task ID (the TMA load partition), and `createAllocChannel` creates a
+proper 1-to-N channel. This avoids buffer duplication and the SMEM it costs
+(per-consumer copies pushed FA3 forward over H100's 228KB SMEM limit).
+
+The cloning walks in reverse post-order so that an `ExpandDimsOp` feeding a
+`BroadcastOp` is visited after the broadcast has already been cloned. When
+`BroadcastOp` B is cloned into partition P (because B's user is in P), and
+`ExpandDimsOp` E feeds B, then E is also cloned into P in the same pass
+(because E's user — the cloned B — is now in P).
+
+**Operand chain cloning**: After cloning any cloneable root,
+`optimizeSchedule` walks backward through the clone's operand chain and
+also clones cloneable producers that feed it from a different partition. This
+handles both layout chains (for example,
+`expand_dims -> convert_layout -> broadcast`) and causal-mask index chains
+such as `make_range -> addi -> expand_dims -> broadcast`. Starting the walk
+from integer arithmetic users is necessary when the broadcast itself feeds an
+unassigned mask cluster; otherwise the full broadcasted index tensor becomes a
+cross-partition SMEM channel.
+
+When a `MemDescTransOp` clone references a `LocalAllocOp` from a different
+partition (e.g., `local_alloc -> memdesc_trans -> dot`), the backward walk
+stops at the `LocalAllocOp` boundary. The `MemDescTransOp` clone keeps a
+reference to the original shared alloc, which is correct because the alloc
+is shared across partitions. The `separateLocalAllocWithSrc` pass later
+assigns the producer task ID from the source op, creating a 1-to-N channel.
+
+Without the backward walk, the cloned op would reference an operand in a
+different partition, creating an unintended cross-partition boundary and
+forcing the value through an smem channel instead of keeping it within the
+partition.
+
+### `splitDataPartitionedIfOps`
+
+Splits `scf.if` ops whose results feed different computation partitions into
+separate per-partition `scf.if` ops. Required for flex attention masking where
+a single `scf.if` yields values for both data partitions.
+
+## Partition Type Summary
+
+For FA forward with `dpFactor=2`, `mergeEpilogue` + `separateEpilogueStore`
+(Blackwell):
+```
+partition 0: correction      — correction ops, load users, epilogue ops (normalize acc)
+partition 1: gemm            — MMA operations + mem desc views
+partition 2: load            — TMA loads + associated allocs
+partition 3: epilogue_store  — descriptor stores
+partition 4: computation     — MMA user group 1 (PV_1 chain)
+partition 5: computation     — MMA user group 0 (PV_0 chain)
+```
+
+For FA backward with `dpFactor=1`, `mergeEpilogueToComputation` (Blackwell):
+```
+partition 0: reduction   — TMA reduction ops, pre-loop tmem_stores
+partition 1: gemm        — MMA operations + mem desc views
+partition 2: load        — TMA loads + associated allocs
+partition 3: computation — all MMA users + epilogue ops (tmem_load dK/dV,
+                           reshape, split, truncf, descriptor_store)
+```
+
+For flex attention forward with `dpFactor=2`, `mergeEpilogue` (Blackwell):
+```
+partition 0: correction  — correction ops, load users, sparse indexing,
+                           epilogue ops (normalize acc)
+partition 1: gemm        — MMA operations + mem desc views
+partition 2: load        — TMA loads + associated allocs
+partition 3: computation — MMA user group 0 (includes QK tmem_load + scale)
+partition 4: computation — MMA user group 1 (includes QK tmem_load + scale)
+```
+
+For FA forward with `dpFactor=2` (Hopper, mergeCorrection + mergeEpilogue):
+```
+partition 0: load        — TMA loads + associated allocs
+partition 1: computation — MMA group 0 (QK + PV + softmax + correction + epilogue)
+partition 2: computation — MMA group 1 (QK + PV + softmax + correction + epilogue)
+```
+
+For GEMM with `separateEpilogueStore` (no correction/reduction):
+```
+partition 0: gemm           — MMA operations + mem desc views
+partition 1: load           — TMA loads + associated allocs
+partition 2: epilogue       — epilogue ops (post-loop tmem_load, truncf)
+partition 3: epilogue_store — TMA stores (descriptor_store, async_tma_copy)
+```
+
+## Debug
+
+- `TRITON_LLVM_DEBUG_ONLY="tritongpu-partition-scheduling"` enables debug logging.
+- The categorizer prints all ops grouped by category with dpId.
+- `createPartitionLayout` logs which partitions are created.
+- Phase 5 logs MMA processing with dpId and pre-assignment status.

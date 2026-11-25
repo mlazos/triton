@@ -9,6 +9,8 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/IR/Constants.h"
@@ -138,11 +140,11 @@ void init_triton_nvidia_passes_ttgpuir(py::module_ &m) {
   ADD_PASS_OPTION_WRAPPER_2("add_membar",
                             mlir::triton::createTritonNvidiaGPUMembar, int32_t,
                             int32_t);
-  m.def("add_to_llvmir",
-        [](mlir::PassManager &pm, int32_t capability, int32_t ptxVersion) {
-          pm.addPass(mlir::triton::createConvertTritonGPUToLLVMPass(
-              capability, ptxVersion));
-        });
+  m.def("add_to_llvmir", [](mlir::PassManager &pm, int32_t capability,
+                            int32_t ptxVersion, bool enableTreeReduction) {
+    pm.addPass(mlir::triton::createConvertTritonGPUToLLVMPass(
+        capability, ptxVersion, enableTreeReduction));
+  });
 }
 
 std::unique_ptr<mlir::Pass>
@@ -157,6 +159,13 @@ createTritonGPUProxyFenceInsertionWrapper(int32_t capability) {
   ttng::TritonGPUProxyFenceInsertionOptions options;
   options.computeCapability = capability;
   return ttng::createTritonGPUProxyFenceInsertion(options);
+}
+
+static std::unique_ptr<mlir::Pass>
+createPromoteLoadToTMAWrapper(bool deviceMode) {
+  ttng::TritonNvidiaGPUPromoteLoadToTMAPassOptions options;
+  options.deviceMode = deviceMode;
+  return ttng::createTritonNvidiaGPUPromoteLoadToTMAPass(options);
 }
 
 std::unique_ptr<mlir::Pass>
@@ -175,6 +184,19 @@ createInitializeWSClusterBarriersWrapper(int32_t capability,
   return mlir::triton::createInitializeWSClusterBarriers(options);
 }
 
+static std::unique_ptr<mlir::Pass>
+createCheckMatmulTwoCTAWrapper(bool allowDependentChains) {
+  ttng::TritonNvidiaGPUCheckMatmulTwoCTAPassOptions options;
+  options.allowDependentChains = allowDependentChains;
+  return ttng::createTritonNvidiaGPUCheckMatmulTwoCTAPass(options);
+}
+
+static std::unique_ptr<mlir::Pass> createTLXBarrierHotspotReportWrapper() {
+  ttng::TritonNvidiaGPUPromoteMBarrierToNamedBarrierPassOptions options;
+  options.reportLikelyBarrierPerfLocations = true;
+  return ttng::createTritonNvidiaGPUPromoteMBarrierToNamedBarrierPass(options);
+}
+
 void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_assign_cga_layouts",
                      ttng::createTritonNvidiaGPUAssignCGALayoutsPass);
@@ -189,6 +211,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
   ADD_PASS_WRAPPER_1("add_hoist_mbarrier_lifecycle",
                      createTritonNvidiaGPUHoistMBarrierLifecycleWrapper,
                      int32_t);
+  ADD_PASS_WRAPPER_0("add_tmem_load_reduce",
+                     ttng::createTritonNvidiaGPUFuseTMEMLoadReducePass);
   ADD_PASS_WRAPPER_0("add_tmem_barrier_insertion",
                      ttng::createTritonNvidiaGPUTMemBarrierInsertionPass);
   ADD_PASS_WRAPPER_0("add_optimize_mbarrier_arrivals",
@@ -196,16 +220,22 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
   ADD_PASS_WRAPPER_0(
       "add_cluster_barrier_mbar_allocator",
       ttng::createTritonNvidiaGPUClusterBarrierMbarAllocatorPass);
-  ADD_PASS_WRAPPER_0("add_tmem_load_reduce",
-                     ttng::createTritonNvidiaGPUFuseTMEMLoadReducePass);
   ADD_PASS_WRAPPER_0("add_tma_lowering",
                      ttng::createTritonNvidiaGPUTMALoweringPass);
+  ADD_PASS_WRAPPER_0("add_tma_multicast",
+                     ttng::createTritonNvidiaGPUTMAMulticastPass);
+  ADD_PASS_WRAPPER_1("add_promote_load_to_tma", createPromoteLoadToTMAWrapper,
+                     bool);
+  ADD_PASS_WRAPPER_0("add_tma_store_buffer_reuse",
+                     ttng::createTritonNvidiaGPUTMAStoreBufferReusePass);
   ADD_PASS_WRAPPER_0("add_promote_lhs_to_tmem",
                      ttng::createTritonNvidiaGPUPromoteLHSToTMemPass);
   ADD_PASS_WRAPPER_0("add_remove_tmem_tokens",
                      ttng::createTritonNvidiaGPURemoveTMEMTokensPass);
-  ADD_PASS_WRAPPER_0("add_check_matmul_two_cta",
-                     ttng::createTritonNvidiaGPUCheckMatmulTwoCTAPass);
+  ADD_PASS_WRAPPER_0("add_mma_collector_reuse",
+                     ttng::createTritonNvidiaGPUMMACollectorReusePass);
+  ADD_PASS_WRAPPER_1("add_check_matmul_two_cta", createCheckMatmulTwoCTAWrapper,
+                     bool);
   ADD_PASS_WRAPPER_0("add_nvgpu_to_llvm",
                      mlir::triton::createConvertNVGPUToLLVM);
   ADD_PASS_WRAPPER_2("add_initialize_ws_cluster_barriers",
@@ -223,6 +253,21 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
                      ttng::createTritonNvidiaGPUOptimizeTMemLayoutsPass);
   ADD_PASS_WRAPPER_0("add_interleave_tmem",
                      ttng::createTritonNvidiaGPUInterleaveTMemPass);
+  ADD_PASS_WRAPPER_0("add_unify_ws_barrier_locations",
+                     ttng::createTritonNvidiaGPUUnifyWSBarrierLocationsPass);
+  ADD_PASS_WRAPPER_0("add_prune_unused_barriers",
+                     ttng::createTritonNvidiaGPUPruneUnusedBarriersPass);
+  ADD_PASS_WRAPPER_0(
+      "add_promote_mbarrier_to_named_barrier",
+      ttng::createTritonNvidiaGPUPromoteMBarrierToNamedBarrierPass);
+  ADD_PASS_WRAPPER_0("add_verify_named_barrier_counts",
+                     ttng::createTritonNvidiaGPUVerifyNamedBarrierCountsPass);
+  ADD_PASS_WRAPPER_0("add_report_tlx_barrier_hotspots",
+                     createTLXBarrierHotspotReportWrapper);
+  ADD_PASS_WRAPPER_0("add_clc_split", ttng::createTritonNvidiaGPUCLCSplitPass);
+  ADD_PASS_WRAPPER_0("add_clc_hoist", ttng::createTritonNvidiaGPUCLCHoistPass);
+  ADD_PASS_WRAPPER_0("add_clc_materialize",
+                     ttng::createTritonNvidiaGPUCLCMaterializePass);
   ttng::registerConSanNVIDIAHooks();
 }
 
@@ -238,8 +283,39 @@ void init_triton_nvidia_passes_nvws(py::module_ &m) {
 
 void init_triton_hopper_passes(py::module_ &m) {
   // Meta's autoWS
-  ADD_PASS_OPTION_WRAPPER_2("add_hopper_warpspec",
-                            mlir::createNVGPUWarpSpecialization, int, bool);
+  ADD_PASS_OPTION_WRAPPER_8("add_hopper_warpspec",
+                            mlir::createNVGPUWarpSpecialization, int, int, bool,
+                            bool, int, bool, int, bool);
+  ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
+                            mlir::createNVGPUWSDataPartition, int);
+  ADD_PASS_WRAPPER_0("add_tma_store_lowering",
+                     mlir::createNVGPUWSTMAStoreLowering);
+  ADD_PASS_WRAPPER_0("add_sink_broadcast", mlir::createNVGPUSinkBroadcast);
+  ADD_PASS_WRAPPER_0("add_tma_store_token_wait_lowering",
+                     mlir::createNVGPUTMAStoreTokenWaitLowering);
+  ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
+                     mlir::createNVGPUPartitionSchedulingMeta);
+  ADD_PASS_WRAPPER_0("add_analyze_2cta_dependencies",
+                     mlir::createNVGPUAnalyze2CTADependencies);
+  ADD_PASS_WRAPPER_0("add_plan_2cta_exchange",
+                     mlir::createNVGPUPlan2CTAExchange);
+  ADD_PASS_WRAPPER_0("add_materialize_2cta_exchange",
+                     mlir::createNVGPUMaterialize2CTAExchange);
+  ADD_PASS_OPTION_WRAPPER_2("add_form_multi_cta_collectives",
+                            mlir::createNVGPUFormMultiCTACollectives, int,
+                            bool);
+  ADD_PASS_WRAPPER_0("add_lower_cluster_reduce_to_ttgir",
+                     mlir::createNVGPULowerClusterReduceToTTGIR);
+  ADD_PASS_WRAPPER_0("add_modulo_schedule", mlir::createNVGPUModuloSchedule);
+  ADD_PASS_WRAPPER_0("add_list_schedule", mlir::createNVGPUListSchedule);
+  ADD_PASS_WRAPPER_0("add_llm_schedule", mlir::createNVGPULLMSchedule);
+  ADD_PASS_WRAPPER_0("add_joint_schedule",
+                     mlir::createNVGPUJointSolverSchedule);
+  ADD_PASS_WRAPPER_0("add_modulo_ws_partition",
+                     mlir::createNVGPUModuloWSPartition);
+  ADD_PASS_WRAPPER_0("add_insert_2cta_sync", mlir::createNVGPUInsert2CTASync);
+  ADD_PASS_WRAPPER_0("add_2cta_transform_loads",
+                     mlir::createNVGPU2CTATransformLoads);
 }
 
 void checkMatmulConstraints(const std::string &A_dtype,
@@ -311,9 +387,15 @@ void init_triton_nvidia(py::module_ &m) {
                     mlir::triton::nvgpu::NVGPUDialect,
                     mlir::triton::nvws::NVWSDialect>();
     mlir::registerNVVMDialectTranslation(registry);
+    mlir::triton::gpu::registerNpotTargetLegality(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });
+
+  m.def("requests_warp_specialization", [](mlir::ModuleOp &mod) {
+    return mlir::triton::moduleRequestsMetaWarpSpecialization(mod);
+  });
+  m.attr("USE_META_WS_ATTR_NAME") = mlir::triton::kUseMetaWSAttrName.str();
 
   // TODO: could be done in python if we had a generic interface to set metadata
   m.def("set_nvvm_reflect_ftz", [](llvm::Module *mod) {

@@ -190,69 +190,23 @@ def nvfp4_to_mxfp8_tile(values, scales, tensor_scale=None):
 
 
 # fmt: off
+
+# ---------------------------------------------------------------------------
+# Shared upcast computation (called from both TMA and pointer kernels)
+# ---------------------------------------------------------------------------
 @triton.jit
-def _upcast_from_mxfp(
-    out_desc,
-    mx_tensor_desc,
-    mx_scale_ptr,
-    stride_scale_outer,
-    stride_scale_quant,
-    outer_dim,
-    quant_dim,
+def _upcast_compute(
+    tensor, scale, dst_scale,
+    dst_dtype: tl.constexpr,
+    mx_tensor_dtype: tl.constexpr,
     BLOCK_SIZE_OUT_DIM: tl.constexpr,
     BLOCK_SIZE_QUANT_DIM: tl.constexpr,
+    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr,
     MX_BLOCK_SIZE: tl.constexpr,
+    scale_is_ocp: tl.constexpr,
 ):
-
-    tl.static_assert(MX_BLOCK_SIZE == MXFP_BLOCK_SIZE or MX_BLOCK_SIZE == NVFP_BLOCK_SIZE)
-    tl.static_assert(BLOCK_SIZE_QUANT_DIM % MX_BLOCK_SIZE == 0, f"Block size along quantization block must be a multiple of {MX_BLOCK_SIZE=}")
-    # uint8 signifies two fp4 e2m1 values packed into a single byte
-    mx_tensor_dtype: tl.constexpr = mx_tensor_desc.dtype
-    dst_dtype: tl.constexpr = out_desc.dtype
-    tl.static_assert(dst_dtype == tl.float16 or dst_dtype == tl.bfloat16 or dst_dtype == tl.float32)
-    tl.static_assert(
-        mx_tensor_dtype == tl.uint8
-        or ((mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5) or mx_tensor_dtype == dst_dtype),
-        "mx_tensor_ptr must be uint8 or float8 or dst_dtype")
-    tl.static_assert(
-        mx_scale_ptr.dtype.element_ty == tl.uint8 or mx_scale_ptr.dtype.element_ty == tl.float8e4nv,
-        "mx_scale_ptr must be uint8 or float8e4nv",
-    )
-
-    # Determine if we are dealing with fp8 types.
     is_fp4: tl.constexpr = mx_tensor_dtype == tl.uint8
     is_fp8: tl.constexpr = mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5
-    scale_is_ocp: tl.constexpr = mx_scale_ptr.dtype.element_ty == tl.uint8
-    K_DIVISOR: tl.constexpr = 2 if is_fp4 else 1
-    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = BLOCK_SIZE_QUANT_DIM // MX_BLOCK_SIZE
-    BLOCK_SIZE_QUANT_MX_TENSOR: tl.constexpr = BLOCK_SIZE_QUANT_DIM // K_DIVISOR
-
-    # Compute starting indices for the quantized (packed) dimension and the outer dimension.
-    outer_block = tl.program_id(0).to(tl.int64)
-    quant_block = tl.program_id(1).to(tl.int64)
-
-    start_mxt_quant = quant_block * BLOCK_SIZE_QUANT_MX_TENSOR
-    start_out_quant = quant_block * BLOCK_SIZE_QUANT_DIM
-    start_mx_scale_quant = quant_block * BLOCK_SIZE_QUANT_MX_SCALE
-    start_out = outer_block * BLOCK_SIZE_OUT_DIM
-
-    # Load the quantized value tensor.
-    tensor = mx_tensor_desc.load([start_out.to(tl.int32), start_mxt_quant.to(tl.int32)])
-
-    offs_outer = tl.arange(0, BLOCK_SIZE_OUT_DIM)[:, None].to(tl.int64)
-    offs_scale = tl.arange(0, BLOCK_SIZE_QUANT_MX_SCALE)[None, :].to(tl.int64)
-    mask_outer = start_out + offs_outer < outer_dim
-    mask_scale = start_mx_scale_quant + offs_scale < tl.cdiv(quant_dim, MX_BLOCK_SIZE)
-    full_scale_mask = mask_scale & mask_outer
-    scale_offsets = offs_scale * stride_scale_quant + offs_outer * stride_scale_outer
-    scale_ptr_base = mx_scale_ptr + start_out * stride_scale_outer + start_mx_scale_quant * stride_scale_quant
-    scale = tl.load(scale_ptr_base + scale_offsets, mask=full_scale_mask)
-
-    # Upcast the scale to the destination type.
-    if scale_is_ocp:
-        dst_scale = upcast_ue8m0_scale(scale, dst_dtype, handle_nan=False)
-    else:
-        dst_scale = scale.to(dst_dtype)
 
     # Now upcast the tensor.
     intermediate_dtype: tl.constexpr = tl.bfloat16 if dst_dtype == tl.float32 else dst_dtype
@@ -296,5 +250,162 @@ def _upcast_from_mxfp(
     # Correct any NaNs encoded via OCP E8M0 scales.
     if scale_is_ocp:
         out_tensor = tl.where(scale == 0xFF, float("nan"), out_tensor)
-    out_tensor = out_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM])
-    out_desc.store([start_out.to(tl.int32), start_out_quant.to(tl.int32)], out_tensor)
+    return out_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM])
+
+
+# ---------------------------------------------------------------------------
+# TMA-based kernel (SM 90+: Hopper / Blackwell)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _upcast_from_mxfp_tma(
+    out_desc,
+    mx_tensor_desc,
+    mx_scale_ptr,
+    stride_scale_outer,
+    stride_scale_quant,
+    outer_dim,
+    quant_dim,
+    BLOCK_SIZE_OUT_DIM: tl.constexpr,
+    BLOCK_SIZE_QUANT_DIM: tl.constexpr,
+    MX_BLOCK_SIZE: tl.constexpr,
+):
+
+    tl.static_assert(MX_BLOCK_SIZE == MXFP_BLOCK_SIZE or MX_BLOCK_SIZE == NVFP_BLOCK_SIZE)
+    tl.static_assert(BLOCK_SIZE_QUANT_DIM % MX_BLOCK_SIZE == 0, f"Block size along quantization block must be a multiple of {MX_BLOCK_SIZE=}")
+    mx_tensor_dtype: tl.constexpr = mx_tensor_desc.dtype
+    dst_dtype: tl.constexpr = out_desc.dtype
+    tl.static_assert(dst_dtype == tl.float16 or dst_dtype == tl.bfloat16 or dst_dtype == tl.float32)
+    tl.static_assert(
+        mx_tensor_dtype == tl.uint8
+        or ((mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5) or mx_tensor_dtype == dst_dtype),
+        "mx_tensor_ptr must be uint8 or float8 or dst_dtype")
+    tl.static_assert(
+        mx_scale_ptr.dtype.element_ty == tl.uint8 or mx_scale_ptr.dtype.element_ty == tl.float8e4nv,
+        "mx_scale_ptr must be uint8 or float8e4nv",
+    )
+
+    is_fp4: tl.constexpr = mx_tensor_dtype == tl.uint8
+    scale_is_ocp: tl.constexpr = mx_scale_ptr.dtype.element_ty == tl.uint8
+    K_DIVISOR: tl.constexpr = 2 if is_fp4 else 1
+    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = BLOCK_SIZE_QUANT_DIM // MX_BLOCK_SIZE
+    BLOCK_SIZE_QUANT_MX_TENSOR: tl.constexpr = BLOCK_SIZE_QUANT_DIM // K_DIVISOR
+
+    outer_block = tl.program_id(0).to(tl.int64)
+    quant_block = tl.program_id(1).to(tl.int64)
+
+    start_mxt_quant = quant_block * BLOCK_SIZE_QUANT_MX_TENSOR
+    start_out_quant = quant_block * BLOCK_SIZE_QUANT_DIM
+    start_mx_scale_quant = quant_block * BLOCK_SIZE_QUANT_MX_SCALE
+    start_out = outer_block * BLOCK_SIZE_OUT_DIM
+
+    # Load the quantized value tensor via TMA.
+    tensor = mx_tensor_desc.load([start_out.to(tl.int32), start_mxt_quant.to(tl.int32)])
+
+    offs_outer = tl.arange(0, BLOCK_SIZE_OUT_DIM)[:, None].to(tl.int64)
+    mask_outer = start_out + offs_outer < outer_dim
+
+    # Load and upcast scales (always pointer-based).
+    offs_scale = tl.arange(0, BLOCK_SIZE_QUANT_MX_SCALE)[None, :].to(tl.int64)
+    mask_scale = start_mx_scale_quant + offs_scale < tl.cdiv(quant_dim, MX_BLOCK_SIZE)
+    full_scale_mask = mask_scale & mask_outer
+    scale_offsets = offs_scale * stride_scale_quant + offs_outer * stride_scale_outer
+    scale_ptr_base = mx_scale_ptr + start_out * stride_scale_outer + start_mx_scale_quant * stride_scale_quant
+    scale = tl.load(scale_ptr_base + scale_offsets, mask=full_scale_mask)
+
+    # Upcast the scale to the destination type.
+    if scale_is_ocp:
+        dst_scale = upcast_ue8m0_scale(scale, dst_dtype, handle_nan=False)
+    else:
+        dst_scale = scale.to(dst_dtype)
+
+    out_tensor = _upcast_compute(tensor, scale, dst_scale, dst_dtype, mx_tensor_dtype,
+                                 BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM, BLOCK_SIZE_QUANT_MX_SCALE,
+                                 MX_BLOCK_SIZE, scale_is_ocp)
+
+    # Store the output via TMA. Ensure type matches descriptor after potential promotion in helper.
+    out_desc.store([start_out.to(tl.int32), start_out_quant.to(tl.int32)], out_tensor.to(dst_dtype))
+
+
+# ---------------------------------------------------------------------------
+# Pointer-based kernel (all GPUs)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _upcast_from_mxfp(
+    out_ptr, stride_o_outer, stride_o_quant: tl.constexpr,
+    mx_scale_ptr, stride_scale_outer, stride_scale_quant,
+    mx_tensor_ptr, stride_tensor_outer, stride_tensor_quant: tl.constexpr,
+    outer_dim, quant_dim,
+    BLOCK_SIZE_OUT_DIM: tl.constexpr,
+    BLOCK_SIZE_QUANT_DIM: tl.constexpr,
+    MX_BLOCK_SIZE: tl.constexpr,
+):
+
+    tl.static_assert(stride_o_quant == 1, "the weight must be contiguous in the k dimension for mx")
+    tl.static_assert(MX_BLOCK_SIZE == MXFP_BLOCK_SIZE or MX_BLOCK_SIZE == NVFP_BLOCK_SIZE)
+    tl.static_assert(BLOCK_SIZE_QUANT_DIM % MX_BLOCK_SIZE == 0, f"Block size along quantization block must be a multiple of {MX_BLOCK_SIZE=}")
+    mx_tensor_dtype: tl.constexpr = mx_tensor_ptr.dtype.element_ty
+    dst_dtype: tl.constexpr = out_ptr.dtype.element_ty
+    tl.static_assert(dst_dtype == tl.float16 or dst_dtype == tl.bfloat16 or dst_dtype == tl.float32)
+    tl.static_assert(
+        mx_tensor_dtype == tl.uint8
+        or ((mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5) or mx_tensor_dtype == dst_dtype),
+        "mx_tensor_ptr must be uint8 or float8 or dst_dtype")
+    tl.static_assert(
+        mx_scale_ptr.dtype.element_ty == tl.uint8 or mx_scale_ptr.dtype.element_ty == tl.float8e4nv,
+        "mx_scale_ptr must be uint8 or float8e4nv",
+    )
+
+    is_fp4: tl.constexpr = mx_tensor_dtype == tl.uint8
+    scale_is_ocp: tl.constexpr = mx_scale_ptr.dtype.element_ty == tl.uint8
+    K_DIVISOR: tl.constexpr = 2 if is_fp4 else 1
+    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = BLOCK_SIZE_QUANT_DIM // MX_BLOCK_SIZE
+    BLOCK_SIZE_QUANT_MX_TENSOR: tl.constexpr = BLOCK_SIZE_QUANT_DIM // K_DIVISOR
+
+    outer_block = tl.program_id(0).to(tl.int64)
+    quant_block = tl.program_id(1).to(tl.int64)
+
+    start_mxt_quant = quant_block * BLOCK_SIZE_QUANT_MX_TENSOR
+    start_out_quant = quant_block * BLOCK_SIZE_QUANT_DIM
+    start_mx_scale_quant = quant_block * BLOCK_SIZE_QUANT_MX_SCALE
+    start_out = outer_block * BLOCK_SIZE_OUT_DIM
+
+    # Compute offsets and masks.
+    offs_src_quant = tl.arange(0, BLOCK_SIZE_QUANT_MX_TENSOR)[None, :].to(tl.int64)
+    offs_out_quant = tl.arange(0, BLOCK_SIZE_QUANT_DIM)[None, :].to(tl.int64)
+    offs_outer = tl.arange(0, BLOCK_SIZE_OUT_DIM)[:, None].to(tl.int64)
+
+    mask_outer = start_out + offs_outer < outer_dim
+    mask_out_quant = start_out_quant + offs_out_quant < quant_dim
+    full_mask_out = mask_out_quant & mask_outer
+
+    mask_src_quant = start_mxt_quant + offs_src_quant < tl.cdiv(quant_dim, K_DIVISOR)
+    full_mask_src = mask_src_quant & mask_outer
+
+    tensor_offsets = offs_src_quant * stride_tensor_quant + offs_outer * stride_tensor_outer
+    out_offsets = offs_out_quant * stride_o_quant + offs_outer * stride_o_outer
+
+    mx_tensor_ptr += start_mxt_quant * stride_tensor_quant + start_out * stride_tensor_outer
+    out_ptr += start_out * stride_o_outer + start_out_quant * stride_o_quant
+
+    # Load the packed tensor.
+    tensor = tl.load(mx_tensor_ptr + tensor_offsets, mask=full_mask_src)
+
+    # Load and upcast scales (always pointer-based).
+    offs_scale = tl.arange(0, BLOCK_SIZE_QUANT_MX_SCALE)[None, :].to(tl.int64)
+    mask_scale = start_mx_scale_quant + offs_scale < tl.cdiv(quant_dim, MX_BLOCK_SIZE)
+    full_scale_mask = mask_scale & mask_outer
+    scale_offsets = offs_scale * stride_scale_quant + offs_outer * stride_scale_outer
+    scale_ptr_base = mx_scale_ptr + start_out * stride_scale_outer + start_mx_scale_quant * stride_scale_quant
+    scale = tl.load(scale_ptr_base + scale_offsets, mask=full_scale_mask)
+
+    # Upcast the scale to the destination type.
+    if scale_is_ocp:
+        dst_scale = upcast_ue8m0_scale(scale, dst_dtype, handle_nan=False)
+    else:
+        dst_scale = scale.to(dst_dtype)
+
+    out_tensor = _upcast_compute(tensor, scale, dst_scale, dst_dtype, mx_tensor_dtype,
+                                 BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM, BLOCK_SIZE_QUANT_MX_SCALE,
+                                 MX_BLOCK_SIZE, scale_is_ocp)
+
+    tl.store(out_ptr + out_offsets, out_tensor, mask=full_mask_out)

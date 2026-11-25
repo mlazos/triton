@@ -6,6 +6,18 @@
 // COMMON-DAG: [[$GLOBAL_MMRA_TAG:#[A-Za-z0-9_]+]] = #llvm.mmra_tag<"amdgpu-synchronize-as":"global">
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // COMMON-LABEL: read_barrier_phase
+  tt.func @read_barrier_phase(%alloc: !ttg.memdesc<1xi64, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>) -> i32 {
+    // COMMON: %[[PHASE:.*]] = llvm.load {{.*}} : !llvm.ptr<3> -> i32
+    // CHECK-NEXT: rocdl.s.waitcnt 49279
+    // GFX950-NEXT: rocdl.s.waitcnt 49279
+    // GFX906-NEXT: rocdl.s.waitcnt 49279
+    // GFX1250-NEXT: rocdl.s.wait.dscnt 0
+    // COMMON-NEXT: llvm.return %[[PHASE]] : i32
+    %phase = "amdg.read_barrier_phase"(%alloc) : (!ttg.memdesc<1xi64, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>) -> i32
+    tt.return %phase : i32
+  }
+
   // COMMON-LABEL: lower_barrier
   tt.func @lower_barrier() {
     // COMMON: llvm.fence syncscope("workgroup") release {llvm.mmra = [[$LOCAL_MMRA_TAG]]}
@@ -226,6 +238,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#remat_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#remat_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#remat_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: local_load_rematerialized_coordinates
+  tt.func @local_load_rematerialized_coordinates(%arg0: tensor<256xf32, #remat_blocked>, %arg1: tensor<256x!tt.ptr<f32>, #remat_blocked>, %arg2: tensor<256xf32, #remat_blocked>, %arg3: tensor<256x!tt.ptr<f32>, #remat_blocked>) {
+    %0 = ttg.local_alloc %arg0 : (tensor<256xf32, #remat_blocked>) -> !ttg.memdesc<256xf32, #remat_shared, #remat_smem>
+    // One lane and one warp anchor are shared by both loads in group 7.
+    // COMMON-COUNT-2: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // COMMON-NOT: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // COMMON: llvm.load
+    %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 7 : i32} : !ttg.memdesc<256xf32, #remat_shared, #remat_smem> -> tensor<256xf32, #remat_blocked>
+    tt.store %arg1, %1 : tensor<256x!tt.ptr<f32>, #remat_blocked>
+    %2 = ttg.local_alloc %arg2 : (tensor<256xf32, #remat_blocked>) -> !ttg.memdesc<256xf32, #remat_shared, #remat_smem>
+    %3 = ttg.local_load %2 {tlx.rematerialize_coordinates_group = 7 : i32} : !ttg.memdesc<256xf32, #remat_shared, #remat_smem> -> tensor<256xf32, #remat_blocked>
+    tt.store %arg3, %3 : tensor<256x!tt.ptr<f32>, #remat_blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // Smoke test to check that mfma 32 and dot operand layouts can work with small tensors, for example with shape 16x16
 #mfma = #ttg.amd_mfma<{version = 2, warpsPerCTA = [2, 2], instrShape = [32, 32, 8], isTransposed = true}>
 #dotop0 = #ttg.dot_op<{opIdx = 0, parent = #mfma, kWidth=4}>
@@ -238,9 +272,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK-NOT: ttg.convert_layout
     %0 = ttg.local_alloc %arg0 : (tensor<16x16xf16, #mfma>) -> !ttg.memdesc<16x16xf16, #shared, #smem>
     // CHECK-4: store {{.*}} vector<4xf16>
-    %1 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop0>
+    %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 8 : i32} : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop0>
     // CHECK-2: load {{.*}} vector<4xf16>
-    %2 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop1>
+    // The two loads take the AMD ds_read_tr and generic local-load paths, but
+    // their named coordinate group must still share one rematerialization.
+    // GFX950-COUNT-1: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // GFX950-NOT: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    %2 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 8 : i32} : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop1>
     // CHECK-8: load {{.*}} vector<1xf16>
     %3 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #mfma>
     // CHECK-4: load {{.*}} vector<4xf16>
@@ -480,37 +518,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
 // -----
 
-#linear64 = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [0, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [], block = []}>
-#slice64 = #ttg.slice<{dim = 0, parent = #linear64}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // GFX950-LABEL: reduce_xor_permlane_swap
-  tt.func @reduce_xor_permlane_swap(%arg0: tensor<32x2xf32, #linear64>) {
-    // stride 32: CDNA4 permlane32.swap + select
-    // GFX950-NOT: rocdl.ds_bpermute
-    // GFX950: llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"
-    // GFX950: llvm.select
-
-    // stride 16: CDNA4 permlane16.swap + select
-    // GFX950: llvm.call_intrinsic "llvm.amdgcn.permlane16.swap"
-    // GFX950: llvm.select
-    %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
-    ^bb0(%arg1: f32, %arg2: f32):
-      %1 = arith.maxnumf %arg1, %arg2 : f32
-      tt.reduce.return %1 : f32
-    }) : (tensor<32x2xf32, #linear64>) -> tensor<2xf32, #slice64>
-    tt.return
-  }
-}
-
-// -----
-
 #linear = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [0, 0], [2, 0], [4, 0], [8, 0]], warp = [], block = []}>
 #slice = #ttg.slice<{dim = 0, parent = #linear}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // GFX1250-LABEL: reduce_xor_row_xmask
   tt.func @reduce_xor_row_xmask(%arg0: tensor<16x2xf32, #linear>) {
-    // stride 16
+    // Lane bit 1 is broadcast while bits 0, 2, 3, and 4 move the reduction
+    // axis. Reduce only those participating bits: strides 16, 8, 4, and 1.
     // GFX1250-NOT: rocdl.ds_bpermute
+
+    // stride 16: permlanex16
     // GFX1250: rocdl.permlanex16
 
     // stride 8: ROW_XMASK:8
@@ -699,6 +716,23 @@ module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.n
     %2 = ttg.local_load %1 : !ttg.memdesc<64x16xf16, #shared, #smem, mutable, 64x64> -> tensor<64x16xf16, #blocked>
     // CHECK-COUNT-4: llvm.store {{.*}} : vector<1xf16>, !llvm.ptr<3>
     ttg.local_store %2, %1 : tensor<64x16xf16, #blocked> -> !ttg.memdesc<64x16xf16, #shared, #smem, mutable, 64x64>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: dynamic_subslice_shared_layout
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @dynamic_subslice_shared_layout(%arg0: tensor<8x16xf16, #blocked>, %row: i32) {
+    %zero = arith.constant 0 : i32
+    %buffer = ttg.local_alloc %arg0 : (tensor<8x16xf16, #blocked>) -> !ttg.memdesc<8x16xf16, #shared, #smem, mutable>
+    // CHECK: llvm.add %{{.*}}, %{{.*}} : i32
+    // CHECK-NOT: ttg.memdesc_dynamic_subslice
+    %view = ttg.memdesc_dynamic_subslice %buffer[%row, %zero] : !ttg.memdesc<8x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<1x16xf16, #shared, #smem, mutable, 8x16>
     tt.return
   }
 }
@@ -1006,57 +1040,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   tt.func @func_attr() {
     tt.return
   }
-}
-
-// -----
-
-#linear = #ttg.linear<{register=[[64]], lane=[[1], [2], [4], [8], [16], [32]], warp=[], block=[]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
-    // COMMON-LABEL: clampf_f32
-    tt.func public @clampf_f32(%x : tensor<128xf32, #linear>, %ptr : tensor<128x!tt.ptr<f32>, #linear>) {
-        %min = arith.constant dense<-1.00000e+00> : tensor<128xf32, #linear>
-        %max = arith.constant dense<1.000000e+00> : tensor<128xf32, #linear>
-        // COMMON: rocdl.fmed3
-        %0 = tt.clampf %x, %min, %max, propagateNan = none : tensor<128xf32, #linear>
-        // COMMON-NOT: llvm.select
-        tt.store %ptr, %0 : tensor<128x!tt.ptr<f32>, #linear>
-        tt.return
-    }
-
-    // COMMON-LABEL: clampf_f16
-    tt.func public @clampf_f16(%x : tensor<128xf16, #linear>, %ptr : tensor<128x!tt.ptr<f16>, #linear>) {
-        %min = arith.constant dense<-1.00000e+00> : tensor<128xf16, #linear>
-        %max = arith.constant dense<1.000000e+00> : tensor<128xf16, #linear>
-        // COMMON: rocdl.fmed3
-        %0 = tt.clampf %x, %min, %max, propagateNan = none : tensor<128xf16, #linear>
-        // COMMON-NOT: llvm.select
-        tt.store %ptr, %0 : tensor<128x!tt.ptr<f16>, #linear>
-        tt.return
-    }
-
-    // COMMON-LABEL: clampf_f32_propagateNan
-    tt.func public @clampf_f32_propagateNan(%x : tensor<128xf32, #linear>, %ptr : tensor<128x!tt.ptr<f32>, #linear>) {
-        %min = arith.constant dense<-1.00000e+00> : tensor<128xf32, #linear>
-        %max = arith.constant dense<1.000000e+00> : tensor<128xf32, #linear>
-        // COMMON: [[MED:%.*]] = rocdl.fmed3 [[X:%.*]], %{{.*}}, %{{.*}} : f32
-        %0 = tt.clampf %x, %min, %max, propagateNan = all : tensor<128xf32, #linear>
-        // COMMON: [[ISNAN:%.*]] = llvm.fcmp "une" [[X]], [[X]] : f32
-        // COMMON: llvm.select [[ISNAN]], [[X]], [[MED]] : i1, f32
-        tt.store %ptr, %0 : tensor<128x!tt.ptr<f32>, #linear>
-        tt.return
-    }
-
-    // COMMON-LABEL: clampf_bf16
-    tt.func public @clampf_bf16(%x : tensor<128xbf16, #linear>, %ptr : tensor<128x!tt.ptr<bf16>, #linear>) {
-        %min = arith.constant dense<-1.00000e+00> : tensor<128xbf16, #linear>
-        %max = arith.constant dense<1.000000e+00> : tensor<128xbf16, #linear>
-        // COMMON-NOT: rodcl.fmed3
-        // COMMON: llvm.intr.maxnum
-        // COMMON: llvm.intr.minnum
-        %0 = tt.clampf %x, %min, %max, propagateNan = none : tensor<128xbf16, #linear>
-        tt.store %ptr, %0 : tensor<128x!tt.ptr<bf16>, #linear>
-        tt.return
-    }
 }
 
 // -----

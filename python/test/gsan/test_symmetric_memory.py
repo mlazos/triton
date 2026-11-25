@@ -17,9 +17,15 @@ from triton.experimental.gluon import language as gl
 
 from triton._internal_testing import is_cuda
 from triton.experimental.gsan import _stream_sync, symmetric_memory
-from triton.experimental.gsan._testing_utils import atomic_poll, shadow_cell_from_address, shadow_tensor_for
+from triton.experimental.gsan._testing_utils import (
+    shadow_cell_from_address,
+    shadow_tensor_for,
+)
 
-pytestmark = pytest.mark.xdist_group("gsan-symmetric-memory")
+pytestmark = [
+    pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend"),
+    pytest.mark.xdist_group("gsan-symmetric-memory"),
+]
 _PROCESS_GROUP_TIMEOUT = timedelta(seconds=30)
 _SPAWN_TIMEOUT_SECONDS = 60
 
@@ -79,7 +85,7 @@ def _single_cta_atomic_sync_kernel(counter_ptr, payload_ptr, peer_payload_ptr, n
 
     num_ready = tl.atomic_add(counter_ptr, 1, sem="acq_rel", scope="sys")
     if num_ready != num_gpus - 1:
-        atomic_poll(counter_ptr, num_gpus, sem="acquire", scope="sys")
+        tl.atomic_poll(counter_ptr, num_gpus, sem="acquire", scope="sys")
 
     seen_peer = tl.load(peer_payload_ptr)
     tl.store(num_ready_ptr, num_ready)

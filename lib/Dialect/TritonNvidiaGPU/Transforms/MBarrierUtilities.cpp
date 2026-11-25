@@ -4,24 +4,26 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+
+#include <cstdint>
+#include <optional>
 
 namespace mlir::triton::nvidia_gpu {
 
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 
-bool isCrossCTALoadStore(ttg::MemDescType memDescTy, RankedTensorType regTy,
-                         bool isStore) {
+bool isCrossCTALoadStore(ttg::MemDescType memDescTy, RankedTensorType regTy) {
   auto kRegister = StringAttr::get(memDescTy.getContext(), "register");
   auto kBlock = StringAttr::get(memDescTy.getContext(), "block");
   LinearLayout regLayout =
       ttg::toLinearLayout(regTy).removeZeroBasesAlongDim(kRegister);
-  LinearLayout sharedLayout = ttg::toLinearLayoutIgnoringPadding(memDescTy);
-  LinearLayout conversion =
-      isStore ? invertAndComposeStore(sharedLayout, regLayout)
-              : invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
+  LinearLayout conversion = invertAndComposeLocal(
+      ttg::toLinearLayoutIgnoringPadding(memDescTy), regLayout, {kBlock});
   return !conversion.isIdentityOnOutDim(kBlock);
 }
 
@@ -67,12 +69,10 @@ std::optional<bool> hasCrossCTASharedAccess(Operation *op) {
     return isCrossCTALoadStore(load.getSrc().getType(), load.getType());
   if (auto store = dyn_cast<ttg::LocalStoreOp>(op))
     return isCrossCTALoadStore(store.getDst().getType(),
-                               store.getSrc().getType(),
-                               /*isStore=*/true);
+                               store.getSrc().getType());
   if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op))
     return alloc.getSrc() &&
-           isCrossCTALoadStore(alloc.getType(), alloc.getSrc().getType(),
-                               /*isStore=*/true);
+           isCrossCTALoadStore(alloc.getType(), alloc.getSrc().getType());
   if (auto gather = dyn_cast<ttg::LocalGatherOp>(op))
     return isCrossCTAGatherScatter(gather.getSrc().getType(), gather.getType(),
                                    gather.getAxis());
@@ -148,6 +148,32 @@ bool requiresCrossCTAMBarrierInitSync(
                    : WalkResult::advance();
       })
       .wasInterrupted();
+}
+
+bool arrivesFromEveryThread(Operation *op) {
+  auto arrive = dyn_cast<ArriveBarrierOp>(op);
+  return arrive && arrive.getPerThread() &&
+         (!arrive.getPred() || matchPattern(arrive.getPred(), m_One()));
+}
+
+bool countsEveryThread(Operation *op) {
+  Value numThreads;
+  if (auto arrive = dyn_cast<NamedBarrierArriveOp>(op))
+    numThreads = arrive.getNumThreads();
+  else if (auto wait = dyn_cast<NamedBarrierWaitOp>(op))
+    numThreads = wait.getNumThreads();
+  else
+    return false;
+  APInt count;
+  if (!matchPattern(numThreads, m_ConstantInt(&count)))
+    return false;
+  std::optional<int> numWarps = ttg::maybeLookupNumWarps(op);
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!numWarps || !mod)
+    return false;
+  int64_t regionThreads =
+      int64_t(*numWarps) * ttg::TritonGPUDialect::getThreadsPerWarp(mod);
+  return count.getSExtValue() >= regionThreads;
 }
 
 } // namespace mlir::triton::nvidia_gpu

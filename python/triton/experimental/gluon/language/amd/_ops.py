@@ -161,18 +161,28 @@ def _wmma(version, a, b, acc, semantic):
     return ttgl.tensor(handle, acc.type)
 
 
-def _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, scale_fn, semantic):
+def _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, scale_fn, semantic, packed=False):
     """ Shared implementation for AMD WMMA scaled and MFMA scaled operation. """
+
+    def _unpacked_k(packed_k, format):
+        if format == "e2m1":
+            return packed_k * 2
+        if format in ("e2m3", "e3m2"):
+            # fp6 shapes count logical values in groups of 16 per 12
+            # bytes, so the K dim must be a multiple of 16.
+            assert packed_k % 16 == 0, \
+                f"fp6 K dim {packed_k} must be a multiple of 16 (16 values per 96-bit / 12-byte dense group)"
+            return packed_k
+        return packed_k
 
     def _get_scale_shape(op_idx, operand, format, scale_factor):
         operand_shape = [s for s in operand.type.shape]
         scale_shape = operand_shape
-        unpack_factor = 2 if format == "e2m1" else 1
         if op_idx == 0:
-            k = scale_shape[-1] * unpack_factor
+            k = _unpacked_k(scale_shape[-1], format)
             scale_shape[-1] = k // scale_factor
         else:
-            k = scale_shape[-2] * unpack_factor
+            k = _unpacked_k(scale_shape[-2], format)
             scale_shape[-2] = k // scale_factor
             scale_shape[-2], scale_shape[-1] = scale_shape[-1], scale_shape[-2]
         return scale_shape
@@ -220,7 +230,7 @@ def _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, scale_fn, seman
     a_scale = _create_and_broadcast_default_scale(0, a_scale, a_format, scale_factor)
     b_scale = _create_and_broadcast_default_scale(1, b_scale, b_format, scale_factor)
     output = semantic.dot_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, fast_math=False, lhs_k_pack=True,
-                                 rhs_k_pack=True, out_dtype=ttgl.float32)
+                                 rhs_k_pack=True, out_dtype=ttgl.float32, fp6_packed=packed)
     return ttgl.tensor(output.handle, acc.type)
 
 

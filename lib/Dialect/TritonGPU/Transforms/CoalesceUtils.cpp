@@ -1,4 +1,5 @@
 #include "triton/Dialect/TritonGPU/Transforms/CoalesceUtils.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -108,8 +109,8 @@ void CoalescedEncodingAnalysis::computeSliceInfo(FunctionOpInterface func) {
       // The only dependence on the CTA shape is a minimum with its contiguous
       // extent. Aggregate using the full shape, then apply that minimum when
       // querying the layout, so different CTA layouts can share a summary.
-      unsigned perThread = getNumElementsPerThread(node->op, key.second,
-                                                   axisInfoAnalysis, key.first);
+      unsigned perThread = getNumElementsPerThread(
+          node->op, key.second, axisInfoAnalysis, key.first, maxVecBits);
       summary[key] = std::max(summary[key], perThread);
     }
     for (SliceNode *node : *it) {
@@ -142,6 +143,8 @@ BlockedEncodingAttr CoalescedEncodingAnalysis::getEncoding(
 
   int numElems = product<int64_t>(shapePerCTA);
   int numThreads = numWarps * threadsPerWarp;
+  unsigned opPerThread = getNumElementsPerThread(op, order, axisInfoAnalysis,
+                                                 shapePerCTA, maxVecBits);
   unsigned perThread;
   if (isa<LoadOp>(op) && ptr.getDefiningOp()) {
     auto it = elementsPerThread.find(op);
@@ -156,16 +159,57 @@ BlockedEncodingAttr CoalescedEncodingAnalysis::getEncoding(
     // between the writes of neighboring threads. The dependency maximum cannot
     // change this bound, so these operations need no slice analysis. Loads from
     // block-argument pointers also retain their original local bound.
-    perThread =
-        getNumElementsPerThread(op, order, axisInfoAnalysis, shapePerCTA);
+    perThread = opPerThread;
   }
   perThread = std::min<int>(perThread, std::max(numElems / numThreads, 1));
   LDBG("perThread: " << perThread);
 
+  auto load = dyn_cast<triton::LoadOp>(op);
+  if (!load || ((load.getIsVolatile() || load.getMask()) &&
+                hasRelatedUnalignedVectorizedLoad(op, order, refTensorType))) {
+    // For ops that can result in a global memory write, we should enforce
+    // that each thread handles at most maxVecBits bits, which is the widest
+    // available vectorized store op; otherwise, the store will have "gaps"
+    // in the memory write at the warp level, resulting in worse performance.
+    // For loads, we can expect that the gaps won't matter due to the L1
+    // cache. Masked and volatile loads must retain their own safe transaction
+    // width when a related unaligned load selects a wider layout.
+    perThread = std::min(perThread, opPerThread);
+  }
   SmallVector<unsigned> sizePerThread(refTensorType.getRank(), 1);
   sizePerThread[order[0]] = perThread;
   return BlockedEncodingAttr::get(op->getContext(), refTensorType.getShape(),
                                   sizePerThread, order, numWarps,
                                   threadsPerWarp, cgaLayout);
+}
+
+// Whether another op with the same shape and contiguity order in op's slice
+// can use unaligned vectorized loads. This preserves the pre-refactor
+// memAccessesSameOrder predicate exactly for masked and volatile loads: the
+// cached per-key summary cannot exclude the queried op itself, so recompute
+// the original getSlice walk for this narrow query class instead of
+// approximating it.
+bool CoalescedEncodingAnalysis::hasRelatedUnalignedVectorizedLoad(
+    Operation *op, const SmallVector<unsigned> &order,
+    RankedTensorType refTensorType) {
+  Value ptr = getMemAccessPtr(op);
+  if (!ptr.getDefiningOp())
+    return false;
+  auto matchesShape = [&refTensorType](const Value &val) {
+    auto rttType = dyn_cast<RankedTensorType>(val.getType());
+    return rttType && rttType.getShape() == refTensorType.getShape();
+  };
+  for (Operation *use : mlir::getSlice(op)) {
+    if (use == op)
+      continue;
+    Value val = getMemAccessPtr(use);
+    if (!val || !matchesShape(val))
+      continue;
+    auto currOrder = getOrderFromContiguity(
+        axisInfoAnalysis.getAxisInfo(val)->getContiguity());
+    if (order == currOrder && canUseUnalignedVectorizedLoad(use))
+      return true;
+  }
+  return false;
 }
 } // namespace mlir::triton::gpu

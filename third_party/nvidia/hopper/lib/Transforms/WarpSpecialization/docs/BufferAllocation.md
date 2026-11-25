@@ -1,0 +1,170 @@
+# Buffer Allocation
+
+Buffer allocation is a pre-pass that discovers cross-partition channels,
+creates or hoists SMEM and TMEM allocations to function scope, and
+normalizes `local_alloc` ops for downstream code partitioning passes.
+
+**File**: `WSCodePartition.cpp`
+**Function**: `doBufferAllocation(funcOp)`
+**Pass**: `NVGPUTestWSBufferAllocation`
+
+## Pipeline Context
+
+```
+doTaskIdPropagate       ← assigns async_task_id to all ops
+  → doConvertDescriptorLoadsToNVWS
+  → doBufferAllocation  ← THIS STEP: channels + alloc hoisting
+  → doMemoryPlanner     ← decides multi-buffering (buffer.copy)
+  → doCodePartition ← inserts accumCnts, async copies, sync ops
+```
+
+`doBufferAllocation` creates single-copy buffers. Multi-buffering is
+decided later by the memory planner. Code partitioning then uses
+[accumulation counters](AccumulationCounters.md) to index into
+multi-buffered allocations.
+
+## Algorithm
+
+### Step 0: `swapTransposedLocalAllocs`
+
+When a `local_alloc` uses a transposed `#shared2` (NVMMAShared with
+`transposed=true`) layout and its only use is a `memdesc_trans` back to
+non-transposed `#shared` feeding MMA operand A, swap the layouts:
+
+```
+Before:  local_alloc → #shared_transposed  →  memdesc_trans → #shared
+After:   local_alloc → #shared             →  memdesc_trans → #shared_transposed
+```
+
+This enables the alloc to share a buffer with other allocs of the same
+source that already use `#shared` layout.
+
+### Step 0.5: `mergeDuplicateLocalAllocs`
+
+After layout normalization, merge `LocalAllocOp`s that have the same
+source value and the same `MemDescType` — replace duplicates with the
+first alloc.
+
+### Step 0.75: `hoistDescriptorLoadBuffers`
+
+Descriptor conversion has already replaced every `tt.descriptor_load` with a
+buffer-writing `nvws.descriptor_load`. Trace each NVWS destination through
+memdesc views to its backing `local_alloc` and hoist nested allocations to
+function scope. This makes descriptor buffers canonical before remaining
+tensor channels are discovered and before memory planning.
+
+### Step 0.9: `foldDescriptorLoadMmaBridge`
+
+An exact-layout `local_load -> local_alloc` round trip is removed when the
+second allocation feeds one MMAv5 operation. The descriptor destination then
+serves both its register consumer and MMAv5 directly, so channel discovery
+models one allocation and one lifetime: the producer refills a slot only after
+the register consumer's release (which carries `ttng.fence_generic_reads`, so
+a proxy fence orders its generic reads before the TMA refill) and the MMA
+completion. The fold is limited to one CTA. It rejects views, additional
+writers, more than one register consumer, alignment changes, non-MMA uses, and
+control-flow differences. The descriptor write, register load, bridge, and MMA
+must be ordered in one block; the register load, bridge, and MMA must also
+share one pipeline cadence and distinct single-task roles. The descriptor
+producer may be scheduled at an earlier pipeline stage. Data-partitioned
+slices fold independently, since each slice owns its destination, register
+load, bridge, and MMA. `TRITON_WS_DISABLE_BRIDGE_FOLD=1` disables the fold.
+
+### Step 1: `collectAsyncChannels`
+
+Walk the function to find cross-partition data dependencies. For each
+operation with a single `async_task_id` that is a **channel anchor op**
+(loads, dots, allocs with source, etc.), call `createChannel` to identify
+consumers in different partitions. All channels are created with
+`numBuffers=1` (single-buffered).
+
+### Step 2: `reorderEpilogOps`
+
+Reorder epilogue operations (stores after the main loop) to align with
+the expected producer completion order. Groups stores by type
+(`DescriptorStoreOp` vs `StoreOp`) and interleaves them so
+earlier-completed producers are consumed first.
+
+When an epilogue channel feeds a TMA store, the `DescriptorStoreOp` is the
+ordering anchor for the consumer partition. Since `createBuffer` inserts
+`LocalStoreOp` in producer order, this step preserves producer order within
+each descriptor-store group so the producer-side `local_store` sequence
+matches the TMA-store sequence.
+
+Streamlining moves each op right after its last SSA operand, with two
+memory-order guards: an op is not hoisted across another op touching the same
+underlying buffer (`hoistsAcrossMemoryOp`), and a TMA staging write
+(`local_alloc` with a source, read by a TMA store or reduce) is not hoisted
+across any TMA store or reduce (`hoistsStagingWriteAcrossTMAOp`). The memory
+planner later folds a descriptor's staging allocs into a ring of K copies whose
+store waits are placed relative to the TMA ops, so the writes must stay
+interleaved with them; otherwise, with more subtiles than copies, a later
+subtile overwrites a slot before an earlier TMA store has read it. A staging
+write that would cross a TMA op is left where it is.
+
+### Step 3: `createBuffer`
+
+The core step. For each channel (grouped by producer), create or hoist
+the backing allocation to function entry:
+
+- **TMEM channels** (existing `TMEMAllocOp` or `TCGen5MMAOp` source):
+  Hoist the existing alloc to function entry via `hoistLocalAlloc`.
+
+- **SMEM channels** (existing `LocalAllocOp` source):
+  Hoist the existing alloc to function entry via `hoistLocalAlloc`.
+
+- **Tensor-typed channels** (no existing alloc):
+  Call `createLocalAlloc` which creates a new `LocalAllocOp` (SMEM)
+  or `TMEMAllocOp` (for 1D tensors on Blackwell ≥ cc100), and also
+  inserts a `LocalStoreOp` after the producer and a `LocalLoadOp`
+  before the consumer.
+
+Channels sharing the same producer value share the same buffer.
+
+### Step 4: `separateLocalAllocWithSrc`
+
+Split any remaining `local_alloc %val` (alloc-with-source) into
+`local_alloc` + `local_store %val`. This normalization exposes
+cross-partition SMEM dependencies as separate store ops, enabling
+downstream `doCodePartition`/`doCodePartition` to detect them
+as channels.
+
+The `local_store`'s task ID determines the producer partition for the
+channel. When the source is produced by a single-partition op (e.g. a TMA
+`DescriptorLoadOp`), the store takes the source op's task ID rather than the
+alloc's, which also carries consumer partitions from backward propagation.
+This models a 1-producer to N-consumer channel — one TMA load writes the
+shared buffer and every consumer partition reads it — instead of duplicating
+the buffer per consumer.
+
+Before buffer allocation, `doConvertDescriptorLoadsToNVWS` replaces every
+`tt.descriptor_load` with a buffer-writing `nvws.descriptor_load`. A load whose
+only user is `local_store` writes directly to that store's allocation. Other
+loads, including bias loads followed by arithmetic, receive a descriptor-layout
+SMEM allocation and a `local_load` preserving the original tensor uses. This
+makes their transfer buffers visible to memory planning. No unconverted
+descriptor load is allowed past this point.
+
+## Key Distinction
+
+`doBufferAllocation` does **not** insert:
+- Accumulation counters (see [Accumulation Counters](AccumulationCounters.md))
+- Async copies or TMA lowering
+- Tokens or synchronization ops (barriers, acquire/release)
+
+Those are handled by `doCodePartition` / `doCodePartition`.
+
+## Key Functions
+
+| Function | File | Description |
+|----------|------|-------------|
+| `doBufferAllocation` | `WSCodePartition.cpp` | Entry point |
+| `swapTransposedLocalAllocs` | `WSCodePartition.cpp` | Layout normalization for buffer sharing |
+| `mergeDuplicateLocalAllocs` | `WSCodePartition.cpp` | Dedup same-source allocs |
+| `hoistDescriptorLoadBuffers` | `WSCodePartition.cpp` | Hoist explicit NVWS descriptor destinations |
+| `collectAsyncChannels` | `WSCodePartition.cpp` | Channel discovery |
+| `reorderEpilogOps` | `WSCodePartition.cpp` | Epilogue store reordering |
+| `createBuffer` | `WSCodePartition.cpp` | Buffer creation / hoisting |
+| `createLocalAlloc` | `WSCodePartition.cpp` | New SMEM/TMEM alloc for tensor channels |
+| `hoistLocalAlloc` | `WSCodePartition.cpp` | Move existing alloc to function entry |
+| `separateLocalAllocWithSrc` | `WSCodePartition.cpp` | Split alloc+src into alloc + store |

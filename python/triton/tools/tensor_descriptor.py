@@ -26,6 +26,8 @@ class TensorDescriptor:
         if self.fp6_format is not None:
             if self.fp6_format not in ("e2m3", "e3m2") or canonicalize_dtype(self.base.dtype) != "u8":
                 raise ValueError("FP6 descriptors require uint8 storage and format 'e2m3' or 'e3m2'")
+            if tuple(self.shape) == tuple(getattr(self.base, "shape", ())):
+                raise ValueError("FP6 descriptors require a packed-byte base view distinct from the logical shape")
             validate_fp6_box(self.block_shape[-1], self.shape[-1], self.strides[:-1], self.padding, host=True)
         elem_bytes = self.base.dtype.itemsize
         for stride in self.strides[:-1]:
@@ -41,7 +43,12 @@ class TensorDescriptor:
             assert dtype_name == "fp32", "round_f32_to_tf32 is only supported for float32 tensors"
 
     @staticmethod
-    def from_tensor(tensor: Any, block_shape: List[int], padding="zero", round_f32_to_tf32=False, fp6_format=None):
-        """For packed FP6 storage, block_shape and descriptor offsets count logical FP6 values."""
+    def from_tensor(tensor: Any, block_shape: List[int], padding="zero", round_f32_to_tf32=False, *args, **kwargs):
+        """For packed FP6 storage, pass fp6_format and specify block_shape and offsets in logical FP6 values.
+
+        PyTorch tracing inspects fixed factory parameters, so forward the FP6 option to the constructor.
+        """
+        fp6_format = args[0] if args else kwargs.get("fp6_format")
         shape = fp6_logical_shape(tensor.shape) if fp6_format is not None else tensor.shape
-        return TensorDescriptor(tensor, shape, tensor.stride(), block_shape, padding, round_f32_to_tf32, fp6_format)
+        return TensorDescriptor(tensor, shape, tensor.stride(), block_shape, padding, round_f32_to_tf32, *args,
+                                **kwargs)

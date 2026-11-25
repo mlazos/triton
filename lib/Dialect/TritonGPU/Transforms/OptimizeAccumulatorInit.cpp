@@ -3,6 +3,7 @@
 #include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PtxInterpUtils.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -23,31 +24,84 @@ public:
                                 PatternRewriter &rewriter) const override {
     if (op.getSrc() == nullptr)
       return failure();
+    Block *block = op->getBlock();
     SmallVector<Operation *> users(op.getResult().getUsers().begin(),
                                    op.getResult().getUsers().end());
-    if (users.size() > 2)
+    if (users.empty())
       return failure();
-    triton::nvidia_gpu::MMAv5OpInterface mmaOp = nullptr;
-    triton::nvidia_gpu::TMEMLoadOp tmemLoad = nullptr;
-    for (auto user : users) {
-      if (auto load = dyn_cast<triton::nvidia_gpu::TMEMLoadOp>(user)) {
-        tmemLoad = load;
-      } else if (auto mma =
-                     dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user)) {
-        mmaOp = mma;
+    // Only track accesses we understand, all in the same block as the alloc.
+    // Anything else (e.g. a store, which may preserve lanes under a mask)
+    // keeps the init.
+    for (Operation *user : users) {
+      if (user->getBlock() != block)
+        return failure();
+      if (!isa<triton::nvidia_gpu::TMEMLoadOp>(user) &&
+          !isa<triton::nvidia_gpu::MMAv5OpInterface>(user))
+        return failure();
+      // Upstream #11887: only an MMA writing this tile as its accumulator
+      // overwrites the init; an MMA reading it as operand A keeps the init.
+      if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user)) {
+        if (mma.getAccumulator() != op.getResult())
+          return failure();
       }
     }
-    if (!mmaOp || mmaOp.getAccumulator() != op.getResult())
+    // Walk the token chain from the alloc. The init is dead iff the first
+    // accessor unconditionally overwrites the whole tile and every other
+    // accessor is ordered behind it.
+    //
+    // In general the first accessor in *every* possible execution order must
+    // overwrite (e.g. an `scf.if` with a use_acc=false MMA in each arm would
+    // also qualify). The walk below only proves one linear order -- same-block
+    // accessors chained on a single token -- so anything else keeps the init.
+    Value tok = op.getToken();
+    if (!tok)
       return failure();
-    if (tmemLoad && !mmaOp->isBeforeInBlock(tmemLoad))
-      return failure();
-    Value useAccFlag = mmaOp.useAccumulator();
-    if (!useAccFlag)
-      return failure();
-    auto flagConstOp = useAccFlag.getDefiningOp<arith::ConstantOp>();
-    if (!flagConstOp)
-      return failure();
-    if (cast<IntegerAttr>(flagConstOp.getValue()).getInt() != 0)
+    llvm::SmallDenseSet<Operation *, 4> remaining(users.begin(), users.end());
+    bool overwritten = false;
+    Value cur = tok;
+    while (!remaining.empty()) {
+      // Find the single remaining accessor consuming the current token.
+      Operation *next = nullptr;
+      for (Operation *user : cur.getUsers()) {
+        if (!remaining.contains(user))
+          continue;
+        Value dep;
+        if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user))
+          dep = mma.getAccDep();
+        else
+          dep = cast<triton::nvidia_gpu::TMEMLoadOp>(user).getDep();
+        if (dep != cur)
+          continue;
+        if (next)
+          return failure(); // Token fans out: order is ambiguous.
+        next = user;
+      }
+      if (!next)
+        return failure(); // Accessor not ordered behind the token chain.
+      if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(next)) {
+        if (!overwritten) {
+          auto useAcc = getBoolFromConstant(mma.useAccumulator());
+          if (!useAcc || *useAcc)
+            return failure();
+          auto pred = getBoolFromConstant(mma.getPredicate());
+          if (!pred || !*pred)
+            return failure();
+          overwritten = true;
+        }
+      } else if (!overwritten) {
+        return failure(); // Read before any overwrite.
+      }
+      remaining.erase(next);
+      Value nextTok;
+      if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(next))
+        nextTok = mma.getToken();
+      else
+        nextTok = cast<triton::nvidia_gpu::TMEMLoadOp>(next).getToken();
+      if (!nextTok)
+        break;
+      cur = nextTok;
+    }
+    if (!remaining.empty())
       return failure();
     op.getSrcMutable().clear();
     return success();
@@ -156,7 +210,12 @@ std::optional<std::pair<Operation *, int>>
 findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
   Value v = accUse;
   if (auto arg = dyn_cast<BlockArgument>(v)) {
-    assert(arg.getOwner() == forOp.getBody());
+    // A zero-preserving op can also consume a value captured from an outer
+    // block (for example the scale operand of a packed multiply).  Such a
+    // value is not the accumulator loop argument and does not establish a
+    // zero origin.
+    if (arg.getOwner() != forOp.getBody())
+      return std::nullopt;
     if (isConstantZeroTensor(forOp.getInitArgs()[arg.getArgNumber() - 1])) {
       loopArgIsZero = true;
     }
@@ -168,6 +227,37 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
     return std::nullopt;
   }
   if (auto selOp = dyn_cast<arith::SelectOp>(defOp)) {
+    // A select can preserve the same zero-initialized loop accumulator along
+    // both arms without either arm being a literal zero.  Attention's
+    // conditional rescale is the canonical example:
+    //
+    //   scaled = acc * alpha
+    //   acc = select should_rescale, scaled, acc
+    //
+    // Both arms are zero on the first iteration, so the first MMA can
+    // initialize operand D directly.  Trace the arms independently: sharing
+    // loopArgIsZero while visiting the first arm would otherwise make an
+    // unsupported second arm look zero-preserving.
+    bool trueLoopArgIsZero = false;
+    bool falseLoopArgIsZero = false;
+    auto trueOrigin =
+        findZeroInitOp(selOp.getTrueValue(), forOp, trueLoopArgIsZero);
+    auto falseOrigin =
+        findZeroInitOp(selOp.getFalseValue(), forOp, falseLoopArgIsZero);
+    if (!trueOrigin && !falseOrigin && trueLoopArgIsZero &&
+        falseLoopArgIsZero) {
+      loopArgIsZero = true;
+      return std::nullopt;
+    }
+    // The asymmetric case is deliberately not propagated: one arm preserving
+    // the zero loop arg says nothing about the other, so the select as a whole
+    // is not zero-preserving. Discarding the per-arm flags and falling through
+    // to the scalar-condition path below is the conservative choice.
+
+    // Rewriting a conditional zero into a scalar use-accumulator flag requires
+    // a scalar condition.  Tensor conditions are nevertheless safe in the
+    // both-arms-preserve-zero case handled above because the condition itself
+    // does not affect first-iteration initialization.
     if (!selOp.getCondition().getType().isInteger(1))
       return std::nullopt;
     if (isConstantZeroTensor(selOp.getTrueValue()) ||
@@ -189,8 +279,161 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
       return std::make_pair(ifOp, resultIndex);
     }
   }
+  if (isMulOp(defOp)) {
+    auto output1 = findZeroInitOp(defOp->getOperand(0), forOp, loopArgIsZero);
+    if (output1.has_value()) {
+      return output1;
+    }
+    return findZeroInitOp(defOp->getOperand(1), forOp, loopArgIsZero);
+  }
+  // Handle values that just propagate the value without changing
+  // data when its all zeros.
+  auto firstOperandDataPreserving = [](Operation *op) {
+    return isa<ConvertLayoutOp, ReshapeOp, TransOp, BroadcastOp, ExpandDimsOp,
+               SplitOp>(op);
+  };
+  // Values that require all operands to be 0.
+  auto allOperandDataPreserving = [](Operation *op) { return isa<JoinOp>(op); };
+  if (firstOperandDataPreserving(defOp)) {
+    return findZeroInitOp(defOp->getOperand(0), forOp, loopArgIsZero);
+  }
+  if (allOperandDataPreserving(defOp)) {
+    std::optional<std::pair<Operation *, int>> output = std::nullopt;
+    for (auto &op : defOp->getOpOperands()) {
+      auto argOutput = findZeroInitOp(op.get(), forOp, loopArgIsZero);
+      if (argOutput.has_value()) {
+        if (output.has_value()) {
+          // We only support a single initialization right now.
+          // TODO: Relax this constraint.
+          if (output != argOutput) {
+            return std::nullopt;
+          }
+        } else {
+          output = argOutput.value();
+        }
+      } else {
+        return std::nullopt;
+      }
+    }
+    return output;
+  }
   return std::nullopt;
 }
+
+// Coalesce two chained accumulating MMAv5 ops that target one logical
+// accumulator into a single in-place accumulation. The pattern matches the
+// SECOND accumulator's TMEM tile (`t2`), whose init value is (through
+// single-use, layout-preserving ops) the TMEM read-out of the FIRST MMA's tile
+// (`t1`). It repoints the second MMA (and its read-out) at `t1` and deletes the
+// intermediate tile + read-out, so both MMAs accumulate into one TMEM tile.
+//
+// This is the shape produced when a kernel chains two accumulating dots into
+// the same value, e.g. `dk = tl.dot(a0, b0, dk); dk = tl.dot(a1, b1, dk)`:
+// AccelerateMatmul lowers each dot into its own `tmem_alloc + mma + tmem_load`,
+// threading the accumulator through registers. Left alone, HoistTMEMAlloc turns
+// that register hand-off into a TMEM<->TMEM load/store bridge across two
+// persistent tiles, which later blocks TMEM slot reuse (the WSCodePartition
+// reuse-order check aborts on the two co-live tiles sharing one buffer.id).
+class ChainAccumulatorInPlace
+    : public OpRewritePattern<triton::nvidia_gpu::TMEMAllocOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::nvidia_gpu::TMEMAllocOp t2,
+                                PatternRewriter &rewriter) const override {
+    Value init2 = t2.getSrc();
+    if (!init2)
+      return failure();
+
+    // t2's memdesc is used by exactly one accumulator-writing MMAv5 (mma2) and
+    // at most one tmem_load (load2).
+    triton::nvidia_gpu::MMAv5OpInterface mma2 = nullptr;
+    triton::nvidia_gpu::TMEMLoadOp load2 = nullptr;
+    for (Operation *u : t2.getResult().getUsers()) {
+      if (auto m = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(u)) {
+        if (mma2)
+          return failure();
+        mma2 = m;
+      } else if (auto l = dyn_cast<triton::nvidia_gpu::TMEMLoadOp>(u)) {
+        if (load2)
+          return failure();
+        load2 = l;
+      } else {
+        return failure();
+      }
+    }
+    if (!mma2 || mma2.getAccumulator() != t2.getResult() ||
+        mma2->getParentRegion() != t2->getParentRegion())
+      return failure();
+    // mma2 must accumulate onto its (chained) init with a constant-true flag;
+    // fusing a use_acc=false MMA would drop the first MMA's contribution.
+    auto useAcc2 = getBoolFromConstant(mma2.useAccumulator());
+    if (!useAcc2 || *useAcc2 == false)
+      return failure();
+
+    // Walk init2 back through single-use layout conversions to a tmem_load.
+    // The rewrite erases this chain, so every op in it must be elementwise
+    // identity -- only `convert_layout` qualifies. The wider list used by
+    // `findZeroInitOp` preserves all-zeros, not values, and the tile-type
+    // check below does not catch a square-tile `tt.trans`.
+    SmallVector<Operation *> chain;
+    Value v = init2;
+    while (Operation *d = v.getDefiningOp()) {
+      if (isa<triton::nvidia_gpu::TMEMLoadOp>(d))
+        break;
+      if (!v.hasOneUse() || !isa<ConvertLayoutOp>(d))
+        return failure();
+      chain.push_back(d);
+      v = d->getOperand(0);
+    }
+    auto load1 = v.getDefiningOp<triton::nvidia_gpu::TMEMLoadOp>();
+    // load1's read-out must feed only this chain, and be a plain
+    // (non-reduction) load whose tensor result is what we traced.
+    if (!load1 || !v.hasOneUse() || load1.getRed() || load1.getResult() != v)
+      return failure();
+
+    // load1 reads t1 (the first MMA's tile), written by mma1 before mma2 in the
+    // same region; t1 and t2 must be the same TMEM tile type.
+    Value t1 = load1.getSrc();
+    Value dep = load1.getDep();
+    if (!dep)
+      return failure();
+    auto mma1 = dep.getDefiningOp<triton::nvidia_gpu::MMAv5OpInterface>();
+    if (!mma1 || mma1.getAccumulator() != t1 ||
+        mma1->getParentRegion() != mma2->getParentRegion() ||
+        !mma1->isBeforeInBlock(mma2))
+      return failure();
+    if (t1.getType() != t2.getResult().getType())
+      return failure();
+    // t1's only accesses may be mma1 (write) and load1 (read); an intervening
+    // access would make accumulating mma2 in place after mma1 unsafe.
+    for (Operation *u : t1.getUsers())
+      if (u != mma1.getOperation() && u != load1.getOperation())
+        return failure();
+
+    // Rewrite: mma2 accumulates into t1 in place (reading mma1's result via
+    // mma1's completion token); load2 reads t1.
+    Value mma1Token = mma1.getToken();
+    rewriter.modifyOpInPlace(mma2, [&]() {
+      mma2.setAccumulator(t1);
+      mma2.getAccDepMutable().assign(mma1Token);
+    });
+    if (load2)
+      rewriter.modifyOpInPlace(load2,
+                               [&]() { load2.getSrcMutable().assign(t1); });
+    // Any consumer of load1's read token is re-anchored on mma1's write token.
+    if (Value readTok = load1.getToken())
+      rewriter.replaceAllUsesWith(readTok, mma1Token);
+
+    // The intermediate tile, the layout-preserving chain, and the read-out are
+    // now dead; erase from the t2 end back to load1 so uses drop first.
+    rewriter.eraseOp(t2);
+    for (Operation *op : chain)
+      rewriter.eraseOp(op);
+    rewriter.eraseOp(load1);
+    return success();
+  }
+};
 
 } // namespace
 
@@ -326,7 +569,8 @@ public:
 
     // Cleanup unused init values in tmem allocs
     mlir::RewritePatternSet patterns(m.getContext());
-    patterns.add<TMEMAllocWithUnusedInit>(m.getContext());
+    patterns.add<TMEMAllocWithUnusedInit, ChainAccumulatorInPlace>(
+        m.getContext());
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();
   }

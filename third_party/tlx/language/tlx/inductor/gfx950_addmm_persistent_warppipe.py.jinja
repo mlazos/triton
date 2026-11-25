@@ -1,0 +1,148 @@
+from triton.language.extra.tlx.inductor.gfx950_addmm_warppipe_core import (
+    gfx950_addmm_compute_register,
+    gfx950_addmm_warppipe_compute_async,
+)
+
+
+{{def_kernel("A", "B")}}
+    # Persistent TLX warp-pipelined addmm for AMD (MI350X / gfx950).
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    if M * N == 0:
+        return
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+    # >= 0, not > 0: a size-1 or broadcast dim gets a literal 0 stride, and a false assume
+    # makes the whole kernel unreachable (it compiles to a lone s_trap).
+    tl.assume(stride_am >= 0)
+    tl.assume(stride_ak >= 0)
+    tl.assume(stride_bk >= 0)
+    tl.assume(stride_bn >= 0)
+
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    num_tiles = grid_m * grid_n
+    num_work_items = num_tiles * SPLIT_K
+    width = GROUP_M * grid_n
+    offs_k = tl.arange(0, BLOCK_K).to(INDEX_DTYPE)
+
+{% if USE_ASYNC %}
+    K_ITERS = K // BLOCK_K
+    smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
+    smem_b = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(B), NUM_BUFFERS)
+{% endif %}
+
+    start_pid = tl.program_id(0).to(INDEX_DTYPE)
+    XCD_CHUNK: tl.constexpr = 4
+    aligned = (num_tiles // (NUM_XCDS * XCD_CHUNK)) * (NUM_XCDS * XCD_CHUNK)
+
+    for work_id in tl.range(start_pid, num_work_items, NUM_SMS):
+{% if SPLIT_K > 1 %}
+        split_id = (work_id % SPLIT_K).to(INDEX_DTYPE)
+        pid = work_id // SPLIT_K
+{% else %}
+        pid = work_id
+{% endif %}
+        if pid < aligned:
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            pid = (local_pid // XCD_CHUNK) * (NUM_XCDS * XCD_CHUNK) + xcd * XCD_CHUNK + (local_pid % XCD_CHUNK)
+
+        group_id = pid // width
+        group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+        pid_m = group_id * GROUP_M + (pid % group_size)
+        pid_n = (pid % width) // group_size
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)) % M
+        offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)) % N
+        a_base = offs_m[:, None] * stride_am
+        b_base = offs_n * stride_bn
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+        idx_m = rm[:, None]
+        idx_n = rn[None, :]
+        mask = (idx_m < M) & (idx_n < N)
+
+{% if USE_ASYNC %}
+{% if SPLIT_K > 1 %}
+        base = K_ITERS // SPLIT_K
+        rem = K_ITERS - base * SPLIT_K
+        k_lo = split_id * base + tl.minimum(split_id, rem)
+        n_iters = base + (split_id < rem).to(INDEX_DTYPE)
+{% else %}
+        k_lo = 0
+        n_iters = K_ITERS
+{% endif %}
+        k_tail = K_ITERS * BLOCK_K
+{% if SPLIT_K > 1 %}
+        tail_width = (K - k_tail) * (split_id == SPLIT_K - 1).to(INDEX_DTYPE)
+{% else %}
+        tail_width = K - k_tail
+{% endif %}
+{% if SPLIT_K == 1 %}
+        {{prefetch_epilogue(("idx_m", "idx_n"), mask="mask", key="gemm_drain", max_operands=1, val_shape=("BLOCK_M", "BLOCK_N"), fallback_ptr="A", indent_width=8)}}
+        acc, tlx_prefetched_gemm_drain = gfx950_addmm_warppipe_compute_async(
+{% else %}
+        acc, _tlx_unused_prefetch = gfx950_addmm_warppipe_compute_async(
+{% endif %}
+            A,
+            B,
+            smem_a,
+            smem_b,
+            a_base,
+            b_base,
+            offs_k,
+            k_lo,
+            n_iters,
+            k_tail,
+            tail_width,
+            stride_ak,
+            stride_bk,
+{% if SPLIT_K == 1 %}
+            tlx_predrain_ptr_gemm_drain,
+            tlx_predrain_mask_gemm_drain,
+            tlx_predrain_enabled_gemm_drain,
+{% else %}
+            A,
+            False,
+            False,
+{% endif %}
+            ALLOW_TF32,
+            ACC_TYPE,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_BUFFERS,
+            DRAIN_PIPELINE={{ TLX_REDUCTION_EPILOGUE }},
+        )
+{% else %}
+        acc = gfx950_addmm_compute_register(
+            A,
+            B,
+            a_base,
+            b_base,
+            offs_k,
+            K,
+            stride_ak,
+            stride_bk,
+            ALLOW_TF32,
+            ACC_TYPE,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+        )
+{% endif %}
+
+{% if SPLIT_K > 1 %}
+        keep_out_ptr = {{output_ptr()}}  # noqa: F841
+        ws_off = split_id * (M * N) + idx_m * N + idx_n
+        tl.store(split_k_ws + ws_off, acc, mask=mask)
+{% else %}
+        # Generated epilogues must remain inside the persistent tile loop.
+        {{reduction_store_output(("idx_m", "idx_n"), "acc", "mask", partial_index="pid_n", partial_columns="BLOCK_N", val_shape=("BLOCK_M", "BLOCK_N"), indent_width=8, prefetched_epilogue="gemm_drain")}}
+{% endif %}

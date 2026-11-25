@@ -4,9 +4,11 @@ import itertools
 import re
 import triton
 import triton.language as tl
+import triton.language.extra.tlx as tlx
 from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
 from triton._filecheck import filecheck_test, run_filecheck_test, run_parser
+from triton._C.libtriton import ir
+from triton.backends.compiler import GPUTarget
 from triton.compiler.code_generator import CodeGenerator
 from triton.runtime.jit import MockTensor
 from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
@@ -126,18 +128,6 @@ def test_store_int_to_bool():
         tl.store(output_ptr, value)
 
     run_filecheck_test(kernel, args=(MockTensor(tl.int1), 256))
-
-
-@pytest.mark.parametrize("flag", [False, True])
-def test_bool_parameter_annotation(flag):
-
-    @triton.jit
-    def kernel(out, flag: bool):
-        # CHECK: arith.select %arg1,
-        tl.store(out, tl.where(flag, 7.0, 9.0))
-        tl.static_assert(flag.dtype == tl.int1)
-
-    run_filecheck_test(kernel, args=(MockTensor(tl.float32), flag))
 
 
 @pytest.mark.parametrize("dtype",
@@ -516,6 +506,16 @@ def test_bfloat16_promotion_reduction(op, return_indices, tie_break_left):
     run_parser(kernel, args=(op, return_indices, tie_break_left))
 
 
+@filecheck_test
+@triton.jit
+def test_operand_buffer_depth_loop_options():
+    # CHECK: scf.for
+    # CHECK: } {tt.lhs_buffer_depth = 3 : i32
+    # CHECK-SAME: tt.rhs_buffer_depth = 2 : i32
+    for i in tl.range(0, 4, warp_specialize=True, lhs_buffer_depth=3, rhs_buffer_depth=2):
+        anchor(i)
+
+
 @triton.aggregate
 class Pair:
     first: tl.tensor
@@ -799,11 +799,11 @@ def add_rhs_constexpr(agg):
 @triton.jit
 def test_aggregate_with_constexpr():
     # CHECK-LABEL: test_aggregate_with_constexpr
-    # CHECK: tt.call @"test_frontend.add_rhs_constexpr__test_frontend.AggregateWithConstexpr<i32S4S, c42>
+    # CHECK: tt.call @"test_frontend.add_rhs_constexpr__test_frontend.AggregateWithConstexpr<i32S4S, constexpr_type[42]>
     agg = AggregateWithConstexpr.create(tl.arange(0, 4))
     add_rhs_constexpr(agg)
 
-    # CHECK: tt.func private @"test_frontend.add_rhs_constexpr__test_frontend.AggregateWithConstexpr<i32S4S, c42>
+    # CHECK: tt.func private @"test_frontend.add_rhs_constexpr__test_frontend.AggregateWithConstexpr<i32S4S, constexpr_type[42]>
     # CHECK: %cst = arith.constant dense<42> : tensor<4xi32>
     # CHECK: arith.addi %arg0, %cst : tensor<4xi32>
 
@@ -827,10 +827,10 @@ def pass_tuple_aggregate(agg):
 @triton.jit
 def test_aggregate_with_tuple():
     # CHECK-LABEL: test_aggregate_with_tuple
-    # CHECK: tt.call @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>"
+    # CHECK: tt.call @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>__"
     agg = AggregateWithTuple.create(tl.arange(0, 4))
     pass_tuple_aggregate(agg)
-    # CHECK: tt.func private @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>"
+    # CHECK: tt.func private @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>__"
 
 
 @triton.constexpr_function
@@ -1274,13 +1274,13 @@ class AggregateWithConstexprFunction:
 @triton.jit
 def test_aggregate_constexpr_function():
     agg = AggregateWithConstexprFunction(4)
-    # CHECK: call @{{.*}}anchor{{.*}}c4
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_4_
     anchor(agg.val)
 
-    # CHECK: call @{{.*}}anchor{{.*}}c16
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_16_
     anchor(agg.val_squared)
 
-    # CHECK: call @{{.*}}anchor{{.*}}c16
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_16_
     anchor(agg.square_val())
 
 
@@ -1298,7 +1298,7 @@ def function_taking_list(arg):
 @triton.jit
 def test_constexpr_function_taking_list():
     a: tl.constexpr = function_taking_list(make_list(4, 8, 16))
-    # CHECK: call @{{.*}}anchor{{.*}}c8
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_8_
     anchor(a)
 
 
@@ -1306,19 +1306,19 @@ def test_constexpr_function_taking_list():
 @triton.jit
 def test_constexpr_min_max():
     a: tl.constexpr = min(1, 2)
-    # CHECK: call @{{.*}}anchor{{.*}}c1
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_1_
     anchor(a)
 
     b: tl.constexpr = min(1, 2, -3)
-    # CHECK: call @{{.*}}anchor{{.*}}c-3
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_-3_
     anchor(b)
 
     c: tl.constexpr = max(3, 4)
-    # CHECK: call @{{.*}}anchor{{.*}}c4
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_4_
     anchor(c)
 
     d: tl.constexpr = max(3, 4, 5)
-    # CHECK: call @{{.*}}anchor{{.*}}c5
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_5_
     anchor(d)
 
 
@@ -1359,36 +1359,6 @@ def test_for_loop_iv_modification():
         i += 1
         # CHECK: anchor{{.*}}%[[I2]]
         anchor(i)
-
-
-@pytest.mark.parametrize("jit", [triton.jit, gluon.jit])
-@pytest.mark.parametrize("operand", ["lower", "upper", "step"])
-@pytest.mark.parametrize("src_dtype", [tl.int1, tl.int8, tl.uint8, tl.int16, tl.uint16], ids=str)
-@pytest.mark.parametrize("iv_dtype", [tl.int32, tl.uint32, tl.int64, tl.uint64], ids=str)
-def test_for_loop_operand_extension(jit, operand, src_dtype, iv_dtype):
-    language = tl if jit is triton.jit else gl
-
-    @jit
-    def kernel(X, IV_DTYPE: tl.constexpr, OPERAND: tl.constexpr):
-        value = language.load(X)
-        lower = language.full((), 0, IV_DTYPE)
-        upper = language.full((), 10, IV_DTYPE)
-        step = language.full((), 1, IV_DTYPE)
-        if OPERAND == "lower":
-            lower = value
-        elif OPERAND == "upper":
-            upper = value
-        else:
-            step = value
-        for i in range(lower, upper, step):
-            language.store(X, i)
-
-    module = run_parser(kernel, args=(MockTensor(src_dtype), iv_dtype, operand))
-    widths = f"i{src_dtype.int_bitwidth} to i{iv_dtype.int_bitwidth}"
-    extensions = [line for line in module.str_nodebug().splitlines() if "arith.ext" in line and widths in line]
-    assert len(extensions) == 1
-    expected_op = "arith.extsi" if src_dtype in (tl.int8, tl.int16) else "arith.extui"
-    assert expected_op in extensions[0]
 
 
 @pytest.mark.interpreter
@@ -1935,18 +1905,6 @@ def test_dot_fp16_accumulator():
     run_parser(fp16_acc_kernel)
 
 
-def test_dot_acc_dtype_mismatch():
-
-    @triton.jit
-    def kernel():
-        c = tl.zeros([32, 32], dtype=tl.float32)
-        a = tl.full([32, 32], 1, dtype=tl.int8)
-        tl.dot(a, a, c)
-
-    with pytest.raises(CompilationError, match="expected accumulator dtype int32"):
-        run_parser(kernel)
-
-
 # ===-----------------------------------------------------------------------===#
 # Loop-carried variable lowering
 # ===-----------------------------------------------------------------------===#
@@ -2138,6 +2096,93 @@ def test_const_ptr_is_constant_addrspace():
     run_filecheck_test(kernel, args=(MockTensor(tl.float32), MockTensor(tl.float32), 8, 128))
 
 
+def test_amd_wmma_layout_pins_dot_scaled_layout():
+    import triton.language.extra.tlx as tlx
+    from triton.backends.compiler import GPUTarget
+
+    @triton.jit
+    def kernel():
+        mma: tl.constexpr = tlx.amd_wmma_layout([[0, 2], [2, 0]], [[0, 1], [1, 0]], instr_shape=(16, 16, 128))
+        a = tlx.require_layout(tl.full((64, 128), 1.0, tl.float8e4nv), tlx.dot_operand_layout(0, mma, 16))
+        b = tlx.require_layout(tl.full((128, 64), 1.0, tl.float8e4nv), tlx.dot_operand_layout(1, mma, 16))
+        acc = tlx.require_layout(tl.zeros((64, 64), tl.float32), mma)
+        scale_a = tl.full((64, 4), 127, tl.uint8)
+        scale_b = tl.full((64, 4), 127, tl.uint8)
+        acc = tl.dot_scaled(a, scale_a, "e4m3", b, scale_b, "e4m3", acc)
+        out = tlx.local_alloc((64, 64), tl.float32, 1)
+        tlx.local_store(tlx.local_view(out, 0), acc)
+
+    module = run_parser(kernel, kwargs={"num_warps": 4}, target=GPUTarget("hip", "gfx1250", 32))
+    text = module.str_nodebug()
+    assert "tt.dot_scaled" in text
+    assert ("#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = [[0, 1], [1, 0]], "
+            "warp = [[0, 2], [2, 0]]}, instrShape = [16, 16, 128]}>") in text
+    assert "-> tensor<64x64xf32, #tlx.no_verify_layout<#shared1>>" in text
+    assert "#shared1 = #tlx.user_layout<#mma>" in text
+
+
+def test_amd_wmma_layout_constexpr_cache_identity():
+    import triton.language.extra.tlx as tlx
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(LAYOUT: tl.constexpr):
+        pass
+
+    def cache_key(layout):
+        return ASTSource(kernel, {"LAYOUT": "constexpr"}, {"LAYOUT": layout}).hash()
+
+    assert cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]])) == cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]]))
+    assert cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]])) != cache_key(tlx.amd_wmma_layout([[0, 1], [1, 0]]))
+
+
+@triton.jit
+def _marker_ordering_add(lhs, rhs):
+    return lhs + rhs
+
+
+@triton.jit
+def _marker_ordering_kernel(OP: tl.constexpr, MARKED: tl.constexpr, ORDER: tl.constexpr):
+    x = tl.arange(0, 32).to(tl.float32)
+    if OP == "reduce":
+        value = tl.reduce(x, 0, _marker_ordering_add, multi_cta=MARKED, reduction_ordering=ORDER)
+    elif OP == "sum":
+        value = tl.sum(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    elif OP == "max":
+        value = tl.max(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    else:
+        value = tl.min(x, 0, multi_cta=MARKED, reduction_ordering=ORDER)
+    anchor(value)
+
+
+@pytest.mark.parametrize("op", ["reduce", "sum", "max", "min"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("marked", [False, True])
+def test_multi_cta_default_ordering(op, strict, marked):
+    with triton.knobs.language.scope():
+        triton.knobs.language.strict_reduction_ordering = strict
+        module = run_parser(_marker_ordering_kernel, args=(op, marked, None))
+    text = module.str_nodebug()
+    assert ("tt.multi_cta" in text) == marked
+    assert ('reduction_ordering = "inner_tree"' in text) == (strict and not marked)
+
+
+@pytest.mark.parametrize("op", ["reduce", "sum", "max", "min"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_multi_cta_rejects_explicit_ordering(op, strict):
+    with triton.knobs.language.scope():
+        triton.knobs.language.strict_reduction_ordering = strict
+        with pytest.raises(CompilationError) as exc_info:
+            run_parser(_marker_ordering_kernel, args=(op, True, tl.ReductionOrdering.INNER_TREE))
+        error = exc_info.value
+        while error.__cause__ is not None:
+            error = error.__cause__
+        assert isinstance(error, ValueError)
+        assert str(error) == "multi_cta reductions require ReductionOrdering.UNORDERED"
+        module = run_parser(_marker_ordering_kernel, args=(op, True, tl.ReductionOrdering.UNORDERED))
+    assert "tt.multi_cta" in module.str_nodebug()
+
+
 def test_cache_policy_ir_attrs():
 
     @triton.jit
@@ -2149,3 +2194,115 @@ def test_cache_policy_ir_attrs():
         tl.store(Out + offsets, value, cache_modifier=".wt", eviction_policy="evict_last")
 
     run_filecheck_test(kernel, args=(MockTensor(tl.float32), MockTensor(tl.float32), 128))
+
+
+def test_amd_partitioned_layout_constexpr_cache_identity():
+    import triton.language.extra.tlx as tlx
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(LAYOUT: tl.constexpr):
+        pass
+
+    def cache_key(layout):
+        return ASTSource(kernel, {"LAYOUT": "constexpr"}, {"LAYOUT": layout}).hash()
+
+    piece0 = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [128, 128])
+    piece1 = tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], [128, 128])
+    assert cache_key(piece0) != cache_key(piece1)
+    assert cache_key(tlx.partitioned_shared_layout_encoding(2, 1, 0, piece0)) == cache_key(
+        tlx.partitioned_shared_layout_encoding(2, 1, 0, piece0))
+    assert cache_key(tlx.partitioned_shared_layout_encoding(2, 1, 0, piece0)) != cache_key(
+        tlx.partitioned_shared_layout_encoding(2, 1, 0, piece1))
+    row_major = tlx.swizzled_shared_layout_encoding.make_default(2)
+    column_major = tlx.swizzled_shared_layout_encoding.make_default(2)
+    column_major.order = [0, 1]
+    assert cache_key(tlx.partitioned_shared_layout_encoding(2, 1, 0, row_major)) != cache_key(
+        tlx.partitioned_shared_layout_encoding(2, 1, 0, column_major))
+
+
+def test_amd_tdm_load_partitioned_destination():
+    import triton.language.extra.tlx as tlx
+    from triton.backends.compiler import GPUTarget
+
+    @triton.jit
+    def kernel():
+        ptr = tl.full((), 0, tl.int64).to(tl.pointer_type(tl.float16))
+        desc = tl.make_tensor_descriptor(ptr, [256, 256], [256, 1], [256, 256])
+        piece: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], [128, 256])
+        shared: tl.constexpr = tlx.partitioned_shared_layout_encoding(2, 1, 0, piece)
+        buf = tlx.local_alloc((256, 256), tl.float16, 1, layout=shared)
+        tlx.async_amd_descriptor_load(desc, tlx.local_view(buf, 0))
+
+    text = run_parser(kernel, kwargs={"num_warps": 8}, target=GPUTarget("hip", "gfx1250", 32)).str_nodebug()
+    assert "#ttg.partitioned_shared" in text
+    assert "amdg.async_tdm_copy_global_to_local" in text
+
+
+def test_stochastic_rounding_generic_cast_requires_entropy():
+
+    @triton.jit
+    def kernel():
+        anchor(tl.full((), 1.5, tl.float32).to(tl.bfloat16, fp_downcast_rounding="rs"))
+
+    with pytest.raises(CompilationError, match="requires explicit random bits"):
+        run_parser(kernel)
+
+
+@pytest.mark.parametrize("arch, dtype", [
+    ("gfx942", tl.float8e4b8),
+    ("gfx942", tl.float8e5b16),
+    ("gfx950", tl.bfloat16),
+    ("gfx950", tl.float16),
+    ("gfx950", tl.float8e4nv),
+    ("gfx950", tl.float8e5),
+    ("gfx1250", tl.bfloat16),
+    ("gfx1250", tl.float16),
+    ("gfx1250", tl.float8e4nv),
+    ("gfx1250", tl.float8e5),
+], ids=str)
+def test_stochastic_rounding_amd_legacy_conversion(arch, dtype):
+
+    @triton.jit
+    def kernel(Input, Output, DTYPE: tl.constexpr):
+        index = tl.arange(0, 32)
+        value = tl.load(Input + index)
+        entropy = tl.full((32, ), 0x12345678, tl.uint32)
+        tl.store(Output + index, tlx.stoch_round(value, DTYPE, entropy))
+
+    target = GPUTarget("hip", arch, 32 if arch == "gfx1250" else 64)
+    module = run_parser(kernel, args=(MockTensor(tl.float32), MockTensor(dtype), dtype), target=target)
+    assert "rounding = rs" in module.str_nodebug()
+    module.validate_stochastic_rounding("hip")
+
+
+@pytest.mark.parametrize("backend", ["cpu", "tileir"])
+def test_stochastic_rounding_legacy_conversion_unsupported_backend(backend):
+
+    @triton.jit
+    def kernel(Input, Output):
+        index = tl.arange(0, 32)
+        value = tl.load(Input + index)
+        entropy = tl.full((32, ), 0x12345678, tl.uint32)
+        tl.store(Output + index, tlx.stoch_round(value, tl.bfloat16, entropy))
+
+    module = run_parser(kernel, args=(MockTensor(tl.float32), MockTensor(tl.bfloat16)))
+    with pytest.raises(RuntimeError, match="unsupported stochastic rounding target"):
+        module.validate_stochastic_rounding(backend)
+
+
+def test_stochastic_rounding_amd_annotated_conversion_rejected(tmp_path):
+    source = tmp_path / "annotated_sr.ttir"
+    source.write_text("""
+module {
+  tt.func @annotated_sr(%value: tensor<32xf32>, %entropy: tensor<32xi32>) {
+    %rounded = tt.fp_to_fp %value, rbits = %entropy : tensor<32xi32>, rounding = rs {sr_ieee} : tensor<32xf32> -> tensor<32xbf16>
+    tt.return
+  }
+}
+""")
+    context = ir.context()
+    ir.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    with pytest.raises(RuntimeError, match="unsupported stochastic rounding target"):
+        module.validate_stochastic_rounding("hip")

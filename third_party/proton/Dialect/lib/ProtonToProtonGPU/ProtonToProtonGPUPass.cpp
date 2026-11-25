@@ -104,14 +104,15 @@ void lowerEvent(OpBuilder &builder, Operation *op, Value targetSegment,
     int scopeId = scopeInfo.getOpScopeId(record);
     gpu::CircularStoreOp::create(builder, record.getLoc(), targetSegment,
                                  counter, Value(), record.getIsStart(),
-                                 builder.getI32IntegerAttr(scopeId));
+                                 builder.getI32IntegerAttr(scopeId),
+                                 record.getPredicate());
     record.erase();
     return;
   }
   if (auto event = dyn_cast<proton::EventOp>(op)) {
     gpu::CircularStoreOp::create(builder, event.getLoc(), targetSegment,
                                  counter, event.getEvent(), event.getIsStart(),
-                                 IntegerAttr());
+                                 IntegerAttr(), Value());
     event.erase();
   }
 }
@@ -361,7 +362,6 @@ public:
     if (hasOperator<Operation, triton::gpu::WarpSpecializeOp>(
             func.getOperation()))
       gpu::InitCtxOp::create(builder, loc, profileMem);
-
     instrumentWarpSpecializeOps(func, buffer, profileMem);
 
     if (failed(replaceProtonRecordOp(builder, func, segment, metricType,

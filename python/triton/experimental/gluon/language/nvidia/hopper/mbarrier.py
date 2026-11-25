@@ -8,6 +8,7 @@ __all__ = [
     "init",
     "invalidate",
     "MBarrierLayout",
+    "sync_cluster_init",
     "wait",
 ]
 

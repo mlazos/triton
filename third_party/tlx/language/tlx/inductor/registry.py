@@ -1,0 +1,4729 @@
+"""Inductor template heuristics for the torchTLX templates.
+
+This module owns shape-to-config selection (``get_heuristic_config``, the
+candidate table and its scorer), the Inductor heuristic classes that feed those
+configs to autotuning, and a layer of monkey-patches over Inductor internals.
+
+Two things it deliberately no longer owns:
+
+- **Architecture detection** lives in ``tlx.hw.target``. Query
+  ``current_target()`` rather than reading ``torch.version.hip`` or
+  ``gcnArchName`` here.
+- **Hardware facts and on-chip memory models** live in ``tlx.hw.resources``:
+  one arch class per part, and one resource model per template family
+  (``BLACKWELL_WS_GEMM``, ``AMD_WARP_PIPE``). The validators below are thin
+  wrappers over those; do not re-derive an SMEM/TMEM formula in this file.
+
+Both live outside this subpackage so the standalone tutorial kernels can share
+them without importing torch._inductor.
+"""
+
+import contextlib
+import dataclasses
+import functools
+import itertools
+import logging
+import math as _math
+import os
+import re
+import statistics
+import time
+from typing import Any, Generator
+
+import sympy
+import torch
+from torch._inductor import config
+from torch._inductor.codegen.common import IndentedBuffer
+from torch._inductor.codegen.multi_kernel import MultiKernel, MultiKernelCall
+from torch._inductor.codegen.triton import (
+    BlockPtrOptions,
+    DeferredLine,
+    TensorDescriptorOptions,
+    TritonScheduling,
+)
+from torch._inductor.ir import MultiTemplateBuffer
+from torch._inductor.kernel_inputs import KernelInputs, MMKernelInputs
+from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+from torch._inductor.scheduler import Scheduler
+from torch._inductor.select_algorithm import (
+    AlgorithmSelectorCache,
+    ExternKernelCaller,
+    TritonTemplate,
+    TritonTemplateCaller,
+    TritonTemplateKernel,
+)
+from torch._inductor.template_heuristics.registry import register_template_heuristic
+from torch._inductor.template_heuristics.triton import (
+    CUDAConfigHeuristic,
+    GemmConfig,
+    ROCmMMTemplateConfigHeuristic,
+    TMATemplateConfigMixin,
+)
+from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
+from torch._inductor.utils import can_use_tma, get_num_sms
+from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
+
+from ..hw import resources
+from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
+from ..hw.target import current_target, is_rocm
+from . import tlx_config
+from .codegen import codegen_async_tma_store
+from .fusion import _is_tlx_choice
+from .mm_templates import (
+    amd_bmm_shared_a_template,
+    blackwell_gemm_ws_template,
+    hopper_gemm_small_k_template,
+    hopper_gemm_ws_template,
+    gfx942_addmm_template,
+    gfx942_mm_template,
+    gfx950_addmm_interwave_template,
+    gfx950_addmm_persistent_warppipe_template,
+    gfx950_addmm_warppipe_template,
+    gfx950_bmm_warppipe_template,
+    gfx950_mm_cached_b_template,
+    gfx950_mm_extern,
+    gfx950_mm_fragmented_m_template,
+    gfx950_mm_hybrid_n160_extern,
+    gfx950_mm_interwave_template,
+    gfx950_mm_m192n256_extern,
+    gfx950_mm_ragged_n_extern,
+    gfx950_mm_streamk_extern,
+    gfx950_mm_fragmented_register_template,
+    gfx950_mm_lds_template,
+    gfx950_mm_wave_grid_template,
+    gfx950_mm_local_split_u_template,
+    gfx950_mm_persistent_template,
+    gfx950_mm_register_template,
+    gfx950_mm_row_major_direct_template,
+    gfx950_mm_short_k_template,
+)
+from .reduction_epilogue import install as install_reduction_epilogue
+from .scheduling.local_buffer_retention import (
+    create_kernel_choices as _tlx_create_kernel_choices_impl, )
+from .sdpa_to_flex import register_sdpa_to_flex
+
+try:
+    from torch._inductor.utils import tma_inner_dim
+except ImportError:
+
+    def tma_inner_dim(strides):
+        from torch._inductor.virtualized import V
+
+        inner = [i for i, stride in enumerate(strides) if V.graph.sizevars.statically_known_equals(stride, 1)]
+        return inner[0] if len(inner) == 1 else None
+
+
+log = logging.getLogger(__name__)
+
+# IS_ROCM was dropped from torch._inductor.template_heuristics.triton on newer
+# nightlies (the module now branches on ``torch.version.hip`` inline). Derive it
+# locally so the fork loads across torch versions; matches torch's own definition
+# (CUDA vs ROCm keyed on torch.version.hip). ``is_rocm()`` does not touch the
+# device, so this stays safe to evaluate at import time.
+IS_ROCM = is_rocm()
+
+try:
+    from torch._inductor.utils import get_default_kpack
+except ImportError:
+    # get_default_kpack is absent from some torch nightlies (notably ROCm
+    # wheels). Mirror torch's own definition so the fork loads across versions:
+    # 0 on CUDA; on AMD, kpack keyed on arch/block_k.
+    def get_default_kpack(block_k: int = 16) -> int:
+        return current_target().default_kpack(block_k)
+
+
+def _sizevar_hint(sizevars, expr, fallback):
+    # ``optimization_hint`` is the newer name; older torch (e.g. the current ROCm
+    # wheel) exposes ``size_hint`` with the same fallback semantics (example-input
+    # hint, ``fallback`` when unbacked/symbolic). Use whichever exists.
+    fn = getattr(sizevars, "optimization_hint", None) or sizevars.size_hint
+    return fn(expr, fallback=fallback)
+
+
+def _storage_span_elems(shape, stride):
+    """Element span of a tensor view: its max flat offset + 1.
+
+    Correct only for nonneg strides; callers prove that separately. Callers
+    needing bytes scale the result by itemsize.
+    """
+    if len(shape) != len(stride):
+        return None
+    return 1 + sum((dim - 1) * step for dim, step in zip(shape, stride))
+
+
+def _guard_int32_spans(sizevars, spans, strides) -> bool:
+    """Admit only when every element span fits int32: static proof or recompile guard.
+
+    The backend performs no verification of the explicit ``.to(tl.int32)``
+    truncations in the templates, so an unguarded hint-sized check admits
+    shapes whose true span wraps at runtime (P2561566366). This helper never
+    consults optimization hints.
+    """
+    int32_max = torch.iinfo(torch.int32).max
+    if not sizevars.statically_known_true(sympy.And(*(sympy.Ge(step, 0) for step in strides))):
+        return False
+    bound = sympy.And(*(sympy.Le(span, int32_max) for span in spans))
+    if sizevars.statically_known_true(bound):
+        return True
+    return bool(sizevars.guard_or_false(bound))
+
+
+def _warppipe_operands_fit_int32(kernel_inputs, *, per_batch: bool) -> bool:
+    """Stride-aware int32 gate for the warp-pipe templates (P2561566366).
+
+    Every load offset in the warp-pipe bodies is unconditionally narrowed with
+    ``.to(tl.int32)``, so admission requires the true max element offset --
+    ``(M-1)*stride + (K-1)*stride``, not ``M*K`` -- to fit int32. For bmm only
+    the within-batch span is gated; the batch advance stays int64 in the template.
+    """
+    from torch._inductor.virtualized import V
+
+    shapes = kernel_inputs.shapes_symbolic()
+    strides = kernel_inputs.strides_symbolic()
+    a_shape = shapes[kernel_inputs._mat1_idx]
+    a_stride = strides[kernel_inputs._mat1_idx]
+    b_shape = shapes[kernel_inputs._mat2_idx]
+    b_stride = strides[kernel_inputs._mat2_idx]
+    if per_batch:
+        if len(a_shape) != 3 or len(b_shape) != 3:
+            return False
+        a_shape, a_stride = a_shape[1:], a_stride[1:]
+        b_shape, b_stride = b_shape[1:], b_stride[1:]
+    elif len(a_shape) != 2 or len(b_shape) != 2:
+        return False
+    a_span = _storage_span_elems(a_shape, a_stride)
+    b_span = _storage_span_elems(b_shape, b_stride)
+    if a_span is None or b_span is None:
+        return False
+    return _guard_int32_spans(V.graph.sizevars, (a_span, b_span), (*a_stride, *b_stride))
+
+
+def _mm_allow_tf32(kernel_inputs: MMKernelInputs) -> bool:
+    """Whether Inductor runs this FP32 GEMM as TF32, as its own templates decide."""
+    try:
+        from torch._inductor.template_heuristics.triton import mm_allow_tf32
+    except ImportError:
+        return torch.backends.cuda.matmul.allow_tf32
+    m, n, k = kernel_inputs.mnk_symbolic()
+    return mm_allow_tf32(m, n, k, kernel_inputs.device_type)
+
+
+@dataclasses.dataclass
+class TlxGemmConfig(GemmConfig):
+    """
+    Gemm configuration for TLX templates with TLX-specific parameters.
+    """
+
+    group_size_m: int = dataclasses.field(kw_only=True, default=8)
+    smem_num: int = dataclasses.field(kw_only=True, default=3)
+    tmem_num: int = dataclasses.field(kw_only=True, default=2)
+    epilogue_subtile: int = dataclasses.field(kw_only=True, default=1)
+    num_mma_groups: int = dataclasses.field(kw_only=True, default=1)
+    num_ctas: int = dataclasses.field(kw_only=True, default=1)
+    split_k: int = dataclasses.field(kw_only=True, default=1)
+    interleave_epilogue: int = dataclasses.field(kw_only=True, default=0)
+
+
+# ---------------------------------------------------------------------
+# Heuristic config selection (matches tlx_matmul_ws behavior)
+# Implemented directly in Python to avoid dependency on YAML rule engine files
+# ---------------------------------------------------------------------
+
+
+def _amd_num_xcds() -> int:
+    """Number of XCDs (chiplets) on the current ROCm GPU, for the L2 swizzle.
+
+    AMD only: the NVIDIA arch classes do not declare ``num_xcds`` at all, so
+    calling this on a CUDA target is an AttributeError rather than a silent 1.
+    Both callers are ROCm-registered heuristics. Counts live on the arch
+    classes in ``tlx.hw.resources``.
+    """
+    return current_target().num_xcds
+
+
+def _is_gfx950() -> bool:
+    if not torch.version.hip:
+        return False
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except (AssertionError, AttributeError, RuntimeError):
+        return False
+
+
+@functools.cache
+def _gfx950_benchmark_shape_keys():
+    from triton.tlx.ops.kernels.mm._shapes import FOCUS
+
+    return frozenset((
+        shape.m,
+        shape.n,
+        shape.k,
+        shape.a_strides,
+        shape.b_strides,
+        shape.dtype,
+    ) for shape in FOCUS.resolved_shapes("gfx950_all"))
+
+
+def _gfx950_mm_extern_is_supported(kernel_inputs):
+    if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx950():
+        return False
+    dtype = kernel_inputs.dtype(kernel_inputs._mat1_idx)
+    if (dtype not in (torch.float16, torch.bfloat16) or kernel_inputs.dtype(kernel_inputs._mat2_idx) != dtype
+            or kernel_inputs.out_dtype() != dtype):
+        return False
+
+    m, n, k = kernel_inputs.mnk_symbolic()
+    strides = kernel_inputs.strides_hinted()
+    a_strides = strides[kernel_inputs._mat1_idx][-2:]
+    b_strides = strides[kernel_inputs._mat2_idx][-2:]
+    values = (m, n, k, *a_strides, *b_strides)
+    if not all(isinstance(value, (int, sympy.Integer)) for value in values):
+        return False
+    m, n, k, stride_am, stride_ak, stride_bk, stride_bn = (int(value) for value in values)
+    if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
+        return False
+
+    dtype_name = "fp16" if dtype == torch.float16 else "bf16"
+    key = (
+        m,
+        n,
+        k,
+        (stride_am, stride_ak),
+        (stride_bk, stride_bn),
+        dtype_name,
+    )
+    if key in _gfx950_benchmark_shape_keys():
+        return True
+
+    from triton.tlx.ops.kernels.mm.gfx950 import heuristic_config
+
+    return (heuristic_config(
+        m,
+        n,
+        k,
+        dtype,
+        torch.finfo(dtype).bits // 8,
+        (stride_am, stride_ak),
+        (stride_bk, stride_bn),
+    ) is not None)
+
+
+def _is_gfx942() -> bool:
+    """Whether the live device is MI300X/CDNA3."""
+    if not torch.version.hip:
+        return False
+    return current_target().is_gfx942
+
+
+#: Per-arch warp-pipe tile pools, keyed by ``current_target().key``. An arch
+#: absent here falls back to the heuristic's own ``WARPPIPE_CONFIGS`` (tuned on
+#: gfx950), which is safe rather than merely permissive: every tile still goes
+#: through :func:`_warppipe_tile_fits` against the live LDS budget, so an
+#: unlisted arch offers the subset that fits instead of emitting candidates the
+#: backend will reject. Adding a tuned pool for a new arch -- gfx1250 next -- is
+#: a row here, not a change to the selector or to either heuristic.
+#:
+#: gfx942 (MI300X) has 64KB of LDS against gfx950's 160KB, and the generated
+#: kernel allocates more than the operand tiles alone (see
+#: _AMD_LDS_SAFETY_MARGIN_BY_ARCH), so none of the gfx950 tiles are usable. These are
+#: BLOCK_K=32-dominant tiles whose estimate stays at or under 32KB, i.e. inside
+#: the budget once the margin is charged. Sized for feasibility, not perf-tuned.
+ADDMM_WARPPIPE_CONFIGS_BY_ARCH: dict[str, list[tuple[int, int, int, int, int, int]]] = {
+    "gfx942": [
+        (64, 64, 32, 8, 8, 2),
+        (64, 64, 32, 8, 8, 3),
+        (128, 64, 32, 8, 8, 2),
+        (64, 128, 32, 8, 8, 2),
+        (128, 128, 32, 8, 8, 2),
+        (64, 64, 64, 8, 8, 2),
+    ],
+}
+
+#: bmm equivalent. Without a pool of its own gfx942 would drop to zero async
+#: candidates -- the smallest gfx950 bmm tile is 48KB, which the margin pushes
+#: over budget -- leaving only the register path.
+BMM_WARPPIPE_CONFIGS_BY_ARCH: dict[str, list[tuple[int, int, int, int, int, int]]] = {
+    "gfx942": [
+        (256, 256, 16, 8, 8, 2),
+        (256, 128, 16, 8, 8, 2),
+        (128, 128, 32, 8, 8, 2),
+        (128, 64, 32, 8, 8, 2),
+        (64, 128, 32, 8, 8, 2),
+        (64, 64, 32, 8, 8, 2),
+        (64, 64, 32, 8, 8, 3),
+    ],
+}
+
+
+def _warppipe_configs_for(heuristic) -> list[tuple[int, int, int, int, int, int]]:
+    """Tile pool for the live target.
+
+    Shared by the addmm and bmm heuristics so a new arch pool cannot be wired
+    into one loop and missed in the other.
+    """
+    return heuristic.WARPPIPE_CONFIGS_BY_ARCH.get(current_target().key, heuristic.WARPPIPE_CONFIGS)
+
+
+#: AMD_WARP_PIPE.estimate_smem charges only the two multi-buffered operand
+#: tiles. The generated kernel also stages the epilogue (and, for the persistent
+#: variant, loop state), which on gfx942 was measured to push a 48KB tile to an
+#: 81920-byte allocation -- so the tile estimate alone lets configs through that
+#: the backend then rejects. Mirrors _SMEM_SAFETY_MARGIN on the Blackwell path,
+#: sized from the largest measured gap on MI300X.
+#:
+#: Charged per arch, and only where that gap was actually measured. gfx950 is
+#: deliberately absent: its pool is the tuned production pool, validated on
+#: MI350 hardware, and charging gfx942's margin against gfx950's 160KB budget
+#: drops five (tile, dtype) combinations that estimate 147456B -- inside the
+#: raw budget and demonstrably runnable. An arch with no entry is still checked
+#: against its raw budget, which is what removes tiles the backend cannot run.
+_AMD_LDS_SAFETY_MARGIN_BY_ARCH: dict[str, int] = {"gfx942": 32768}
+
+#: Extra LDS the *persistent* warp-pipe variant needs beyond the tile estimate,
+#: charged only for async persistent candidates. Measured 37376B gap on the
+#: persistent (128, 256, 64, NB3) fp16 tile (147456B estimate vs 184832B actual,
+#: P2561566366 S2); rounded up for headroom.
+_AMD_LDS_PERSISTENT_OVERHEAD: int = 40960
+
+
+def _warppipe_tile_fits(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_buffers: int,
+    *,
+    elem_bytes: int,
+    use_async: bool,
+    persistent: bool = False,
+) -> bool:
+    """Whether a warp-pipe tile fits the *live* target's LDS budget.
+
+    The gfx950_* heuristics register for all of ROCm (``register=IS_ROCM``), so a
+    tile sized for gfx950's 160KB reaches gfx942's 64KB unchanged. Without this
+    check the oversized candidates are still emitted and the Triton backend then
+    rejects them with "out of resource: shared memory", which silently drops TLX
+    out of autotune altogether instead of narrowing it to the tiles that fit.
+    """
+    cfg = resources.AmdWarpPipeConfig(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_buffers=num_buffers,
+        use_async=use_async,
+        elem_bytes=elem_bytes,
+    )
+    margin = _AMD_LDS_SAFETY_MARGIN_BY_ARCH.get(current_target().key, 0)
+    if persistent and use_async:
+        margin += _AMD_LDS_PERSISTENT_OVERHEAD
+    return resources.AMD_WARP_PIPE.validate(cfg, smem_margin=margin)
+
+
+def _is_config_valid(
+    config: dict[str, Any],
+    tma_epilogue_store: bool = False,
+    smem_margin: int = 0,
+    elem_bytes: int = resources.OPERAND_ELEM_BYTES,
+) -> bool:
+    """Check if a config is valid based on hardware constraints.
+
+    The epilogue staging buffer is charged only for the TMA store path; see
+    ``resources.estimate_smem``.
+    """
+    return validate_config(
+        dataclasses.replace(BlackwellWSGemmConfig.from_dict(config), elem_bytes=elem_bytes),
+        charge_epilogue=tma_epilogue_store,
+        split_k=config.get("SPLIT_K", 1),
+        smem_margin=smem_margin,
+    )
+
+
+def _fix_config_if_needed(config: dict[str, Any], tma_epilogue_store: bool = False) -> dict[str, Any] | None:
+    """
+    Return the config if it fits the hardware, else None.
+
+    Despite the name this does not modify the config -- there is no repair
+    step. It is a pass/reject gate, and every rejection falls through to the
+    candidate scorer in get_heuristic_config.
+    """
+    if _is_config_valid(config, tma_epilogue_store=tma_epilogue_store):
+        return config
+    # Config overflows SMEM (e.g., split-K fp32 workspace overhead).
+    # Return None so get_heuristic_config falls through to the candidate
+    # scorer, and ultimately to the autotuning pool if no scorer config fits.
+    return None
+
+
+def _select_split_k(K: int, block_k: int) -> int:
+    """Select split-K factor for undersaturated shapes.
+
+    Tries split factors in order [4, 2, 8]; picks the first where each split
+    has at least 4 K-tiles.  Returns 1 if no split factor is suitable.
+    """
+    k_tiles = _math.ceil(K / block_k)
+    for sk in [4, 2, 8]:
+        k_tiles_per_split = _math.ceil(k_tiles / sk)
+        if k_tiles_per_split * (sk - 1) >= k_tiles:
+            continue  # last split would be empty
+        if k_tiles // sk >= 4:
+            return sk
+    return 1
+
+
+def get_heuristic_config(
+    M: int,
+    N: int,
+    K: int,
+    num_sms: int | None = None,
+    tma_epilogue_store: bool = False,
+) -> dict[str, Any] | None:
+    """
+    Select optimal GEMM config based on problem shape characteristics.
+
+    This implements heuristic rules for TLX Blackwell GEMM kernel configuration.
+    Rules are evaluated in order (first match wins). Rules 1b (AI <= 1.5), 3, 4
+    and 7 come from tlx.ops ``sm100.get_heuristic_config``; the rest are torchTLX
+    overlays on it.
+
+    Heuristic Rules Index:
+    ----------------------
+    Rule 0: Fallback (Candidate Scoring)
+        - Condition: Block size or resource validation fails
+        - Config: Selected via _candidate_scorer_evaluate()
+        - Use case: Edge cases and shapes not covered by explicit rules
+
+    Rule 1a: Tall-M, alt-tiling, moderate M (torchTLX extension)
+        - Condition: is_tall_m AND gpu_saturated AND use_alt_tiling AND m_tiles <= num_sms//2
+        - Config: (128, 256, 64), 1-CTA, 3 SMEM buffers
+        - Use case: Shapes where BN=256 wastes tiles (N<=256, N unaligned, low tile count)
+
+    Rule 1b: Tall-M Low-AI (or alt-tiling fallback)
+        - Condition: is_tall_m AND gpu_saturated AND (AI <= 1.5 OR use_alt_tiling)
+        - Config: (256, 128, 128), 2-CTA, 2 SMEM buffers, INTERLEAVE=1
+        - Use case: Memory-bound tall-M shapes
+
+    Rule 3: Tall-M High-AI, K > N*2
+        - Condition: is_tall_m AND gpu_saturated AND AI > 1.5 AND K > N*2
+        - Config: (256, 256, 128), 2-CTA, 2 SMEM buffers, EPILOGUE_SUBTILE=4
+        - Use case: Compute-bound tall-M with large K relative to N
+
+    Rule 4: Tall-M High-AI, K <= N*2
+        - Condition: is_tall_m AND gpu_saturated AND AI > 1.5 AND K <= N*2
+        - Config: (256, 256, 64), 2-CTA, 4 SMEM buffers, EPILOGUE_SUBTILE=4, INTERLEAVE=1
+        - Use case: Compute-bound tall-M with K similar to or smaller than N
+
+    Rule 5: Undersaturated Large-Output
+        - Condition: undersaturated AND MN >= 1M
+        - Config: (256, 128, 64), 4 SMEM buffers, EPILOGUE_SUBTILE=8
+        - Use case: Large output matrices that don't saturate GPU
+
+    Rule 6: Undersaturated Small-Output
+        - Condition: undersaturated AND MN < 1M
+        - Config: (128, 64, 128), 4 SMEM buffers
+        - Use case: Small output matrices that don't saturate GPU
+
+    Rule 7: GPU-Saturated General (Wide-N)
+        - Condition: gpu_saturated AND NOT is_tall_m
+        - Config: (256, 256, 64), 1-CTA, 3 SMEM buffers, EPILOGUE_SUBTILE=4, INTERLEAVE=1
+        - Use case: GPU-saturated shapes with balanced or wide-N dimensions
+
+    Args:
+        M, N, K: GEMM dimensions (A is MxK, B is KxN, C is MxN)
+        num_sms: Number of SMs on the GPU. Defaults to the current target's
+            SM count (148 on B200, and on a host with no visible device).
+
+    Returns:
+        dict: Configuration parameters for the TLX GEMM kernel,
+        or None if no valid config can be determined.
+    """
+    from triton.tlx.ops.kernels.mm import sm100
+
+    if num_sms is None:
+        num_sms = current_target().num_sms
+
+    # --- Compute derived features ---
+    mn_ratio = M / max(N, 1)
+    is_tall_m = mn_ratio > 4
+    is_tall_n = mn_ratio < 0.25
+
+    # Reference block sizes for tile counting
+    ref_bm = 256 if is_tall_m else (128 if is_tall_n else 256)
+    ref_bn = 128 if is_tall_m else (256 if is_tall_n else 256)
+
+    num_mn_tiles = _math.ceil(M / ref_bm) * _math.ceil(N / ref_bn)
+    gpu_saturated = num_mn_tiles >= num_sms
+    undersaturated = num_mn_tiles < num_sms
+    mn_product = M * N
+    is_large_output = mn_product >= 1000000
+
+    config = None
+
+    # --- Rule matching (first match wins) ---
+
+    # Characteristic 1: Tall-M saturated shapes
+    if is_tall_m and gpu_saturated:
+        arithmetic_intensity = K / max(min(M, N), 1)
+
+        # Check if the default high-AI path (Rule 3: BM=256 BN=256) would
+        # be suboptimal.  Three triggers:
+        #   1. N <= 256: BN=256 >= N, config would be rejected downstream
+        #   2. Few total tiles at BN=256: poor wave efficiency
+        #   3. N < 1024 and N not aligned to 256: significant tile waste
+        use_alt_tiling = False
+        if arithmetic_intensity > 1.5:
+            tiles_bn256 = _math.ceil(M / 256) * _math.ceil(N / 256)
+            if N <= 256:
+                use_alt_tiling = True
+            elif tiles_bn256 < 4 * num_sms:
+                use_alt_tiling = True
+            elif N < 1024 and N % 256 != 0:
+                use_alt_tiling = True
+
+        # Rule 1a/1b: high-AI with suboptimal BN=256. AI <= 1.5 is tlx.ops Rule 1b.
+        if use_alt_tiling:
+            m_tiles_256 = _math.ceil(M / 256)
+            # Rule 1a: Moderate-M — use BM=128 1-CTA to avoid 2-CTA
+            # coordination overhead and improve tile granularity.
+            if m_tiles_256 <= num_sms // 2:
+                config = {
+                    "BLOCK_SIZE_M": 128,
+                    "BLOCK_SIZE_N": 256,
+                    "BLOCK_SIZE_K": 64,
+                    "NUM_SMEM_BUFFERS": 3,
+                    "NUM_TMEM_BUFFERS": 2,
+                    "NUM_MMA_GROUPS": 1,
+                    "EPILOGUE_SUBTILE": 2,
+                    "NUM_CTAS": 1,
+                    "SPLIT_K": 1,
+                    "INTERLEAVE_EPILOGUE": 0,
+                }
+            # Rule 1b: Large-M — BM=256 2-CTA streams A efficiently.
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 256,
+                    "BLOCK_SIZE_N": 128,
+                    "BLOCK_SIZE_K": 128,
+                    "NUM_SMEM_BUFFERS": 2,
+                    "NUM_TMEM_BUFFERS": 2,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 1,
+                    "NUM_CTAS": 2,
+                    "SPLIT_K": 1,
+                    "INTERLEAVE_EPILOGUE": 1,
+                }
+
+    # Characteristic 2: Undersaturated shapes — use split-K to improve parallelism.
+    # The template writes fp32 partials to a workspace; a separate reduction
+    # kernel sums the partials after the main GEMM.
+    #
+    # Note: upstream only returns Rule 5/6 when split_k > 1 and falls through
+    # to the candidate scorer otherwise.  torchTLX intentionally returns the
+    # config even with split_k=1 to provide a deterministic tile size for
+    # undersaturated shapes (the candidate scorer may pick a suboptimal config
+    # for these shapes since its wave-efficiency scoring doesn't account for
+    # the tile shape preferences encoded in Rules 5/6).
+    elif undersaturated and is_large_output:
+        block_k = 64
+        split_k = _select_split_k(K, block_k)
+        # Rule 5: Undersaturated Large-Output
+        config = {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": block_k,
+            "NUM_SMEM_BUFFERS": 4,
+            "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": 8,
+            "NUM_CTAS": 1,
+            "SPLIT_K": split_k,
+            "INTERLEAVE_EPILOGUE": 1,
+        }
+    elif undersaturated and not is_large_output:
+        block_k = 128
+        split_k = _select_split_k(K, block_k)
+        # Rule 6: Undersaturated Small-Output
+        config = {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": block_k,
+            "NUM_SMEM_BUFFERS": 4,
+            "NUM_TMEM_BUFFERS": 3,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": 1,
+            "NUM_CTAS": 1,
+            "SPLIT_K": split_k,
+            "INTERLEAVE_EPILOGUE": 1,
+        }
+
+    # Rules 1b (AI <= 1.5), 3, 4 and 7: every remaining shape is saturated, so
+    # tlx.ops returns one of these rules and never reaches its own scorer.
+    if config is None:
+        config = sm100.get_heuristic_config(M, N, K, num_sms)
+        if config is None:
+            return None
+        config.pop("pre_hook", None)
+
+    # Validate block sizes don't exceed problem dimensions
+    block_n = config["BLOCK_SIZE_N"]
+    block_k = config["BLOCK_SIZE_K"]
+
+    if block_n >= N or block_k >= K:
+        config = _candidate_scorer_evaluate(M, N, K, num_sms)
+        if config is None:
+            return None
+        if config["BLOCK_SIZE_N"] >= N or config["BLOCK_SIZE_K"] >= K:
+            return None
+
+    # Validate and fix config if needed
+    config = _fix_config_if_needed(config, tma_epilogue_store=tma_epilogue_store)
+    if config is None:
+        config = _candidate_scorer_evaluate(M, N, K, num_sms)
+        if config is not None:
+            config = _fix_config_if_needed(config, tma_epilogue_store=tma_epilogue_store)
+        if config is None:
+            return None
+
+    # Post-process: add GROUP_SIZE_M and ctas_per_cga
+    block_m = config["BLOCK_SIZE_M"]
+    num_ctas = config["NUM_CTAS"]
+    # A multiple of NUM_CTAS, so paired CTAs in a cluster map to the same pid_n.
+    config["GROUP_SIZE_M"] = sm100.select_group_size_m(M, N, block_m, num_ctas)
+    config["ctas_per_cga"] = (num_ctas, 1, 1) if num_ctas > 1 else None
+
+    return config
+
+
+# --- Candidate scoring (fallback when rules don't match) ---
+
+_CANDIDATES = [
+    {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "NUM_CTAS": 2,
+        "NUM_SMEM_BUFFERS": 2,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 2,
+        "EPILOGUE_SUBTILE": 1,
+    },
+    {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 3,
+        "NUM_TMEM_BUFFERS": 1,
+        "NUM_MMA_GROUPS": 2,
+        "EPILOGUE_SUBTILE": 4,
+    },
+    {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 4,
+        "NUM_TMEM_BUFFERS": 3,
+        "NUM_MMA_GROUPS": 2,
+        "EPILOGUE_SUBTILE": 1,
+    },
+    {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 2,
+        "NUM_SMEM_BUFFERS": 5,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 2,
+        "EPILOGUE_SUBTILE": 4,
+    },
+    {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 2,
+        "NUM_SMEM_BUFFERS": 4,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 2,
+    },
+    {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "NUM_CTAS": 2,
+        "NUM_SMEM_BUFFERS": 5,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 2,
+        "EPILOGUE_SUBTILE": 4,
+    },
+    {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "NUM_CTAS": 2,
+        "NUM_SMEM_BUFFERS": 5,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 2,
+        "EPILOGUE_SUBTILE": 1,
+    },
+    {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 5,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 2,
+        "EPILOGUE_SUBTILE": 8,
+    },
+    {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 3,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 2,
+    },
+    {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 4,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 2,
+    },
+    {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 3,
+        "NUM_TMEM_BUFFERS": 1,
+        "NUM_MMA_GROUPS": 2,
+        "EPILOGUE_SUBTILE": 2,
+    },
+    {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 5,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 1,
+    },
+    {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 5,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 1,
+    },
+    {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "NUM_CTAS": 1,
+        "NUM_SMEM_BUFFERS": 6,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 1,
+    },
+]
+
+
+def _candidate_scorer_evaluate(M: int, N: int, K: int, num_sms: int) -> dict[str, Any] | None:
+    """Score candidates by wave efficiency and return best."""
+    best_config = None
+    best_score = float("inf")
+    best_waves = float("inf")
+
+    for cfg in _CANDIDATES:
+        tile = BlackwellWSGemmConfig.from_dict(cfg)
+        bm = tile.block_m
+        bn = tile.block_n
+        bk = tile.block_k
+        num_ctas = tile.num_ctas
+
+        # Resource + structural validity. The epilogue staging buffer is
+        # charged unconditionally here: the scorer runs before the store path
+        # is known, so the conservative estimate is the right one.
+        #
+        # ``check_tile_rules`` also rejects pair-CTA candidates with fewer than
+        # 128 rows per MMA group. The scorer used to skip that check while
+        # ``_is_config_valid`` enforced it, so such a candidate would win here
+        # and then be rejected downstream -- and because both of
+        # get_heuristic_config's retry paths re-run this same deterministic
+        # scorer, the retries returned the identical config and the whole
+        # lookup fell through to ``None``.
+        if not validate_config(tile, charge_epilogue=True):
+            continue
+
+        # Block sizes must be strictly less than problem dimensions for correctness
+        if bn >= N or bk >= K:
+            continue
+
+        if bm > M * 2:
+            continue
+
+        # Wave efficiency scoring
+        ctas_m = (M + bm - 1) // bm
+        ctas_n = (N + bn - 1) // bn
+        ctas_m = ((ctas_m + num_ctas - 1) // num_ctas) * num_ctas
+        total_ctas = ctas_m * ctas_n
+
+        if total_ctas == 0:
+            continue
+
+        waves = (total_ctas + num_sms - 1) // num_sms
+        fractional_waves = total_ctas / num_sms
+        score = waves - fractional_waves
+
+        # Consider split-K for undersaturated shapes
+        split_k = 1
+        num_tiles_m = _math.ceil(M / bm)
+        num_tiles_n = _math.ceil(N / bn)
+        num_mn_tiles = num_tiles_m * num_tiles_n
+
+        if num_mn_tiles < num_sms:
+            k_tiles = _math.ceil(K / bk)
+            for sk in [8, 4, 2]:
+                k_tiles_per_split = _math.ceil(k_tiles / sk)
+                if k_tiles_per_split * (sk - 1) >= k_tiles:
+                    continue  # last split would be empty
+                if k_tiles >= sk and k_tiles // sk >= 4:
+                    sk_ctas_m = ((num_tiles_m + num_ctas - 1) // num_ctas) * num_ctas
+                    sk_total_ctas = sk_ctas_m * num_tiles_n * sk
+                    sk_waves = (sk_total_ctas + num_sms - 1) // num_sms
+                    sk_frac = sk_total_ctas / num_sms
+                    sk_score = sk_waves - sk_frac
+                    if sk_score < score or (sk_score == score and sk_total_ctas > total_ctas):
+                        score, total_ctas, waves, split_k = (
+                            sk_score,
+                            sk_total_ctas,
+                            sk_waves,
+                            sk,
+                        )
+                    break
+
+        # Selection
+        score_slack = 0.1
+        if (score < best_score - score_slack or (score < best_score + score_slack and waves < best_waves)
+                or (score < best_score + score_slack and waves == best_waves and num_ctas > 1)):
+            best_score = score
+            best_waves = waves
+            best_config = dict(cfg)
+            best_config["SPLIT_K"] = split_k
+            best_config["INTERLEAVE_EPILOGUE"] = 0
+
+    return best_config
+
+
+def _host_tma_operands(kernel_inputs) -> dict[str, bool]:
+    """Which of A's and B's TMA descriptors the launcher builds on the host.
+
+    A device-built descriptor costs every CTA a descriptor write and fence before
+    its first load. The Python launcher builds host descriptors from integer dims
+    and from dynamic sizes the kernel takes as args (A's M under a dynamic batch),
+    read at launch. The C++ wrapper (AOTInductor) builds
+    them in the kernel's call wrapper, which takes those sizes as parameters, but
+    only when kernels are autotuned at compile time: the lazy-compile wrapper
+    cannot take a template's host-side descriptor. Any other operand is passed as
+    a plain pointer and its descriptor is built on the device.
+    """
+    if V.graph.cpp_wrapper and config.triton.autotune_at_compile_time is False:
+        return {"HOST_SIDE_TMA": False, "HOST_TMA_A": False, "HOST_TMA_B": False}
+    dim_types = (int, sympy.Integer, sympy.Symbol)
+    a_host, b_host = (all(isinstance(dim, dim_types) for dim in (*mat.get_size(), *mat.get_stride()))
+                      for mat in kernel_inputs.mat1mat2())
+    return {"HOST_SIDE_TMA": a_host or b_host, "HOST_TMA_A": a_host, "HOST_TMA_B": b_host}
+
+
+@register_template_heuristic(hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="mm")
+class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
+    """Reuse the SM90 TLX ops configuration space for Inductor."""
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if not current_target().is_hopper or not isinstance(inputs, MMKernelInputs):
+            return False
+        if config.triton.tlx_mode not in ("allow", "force"):
+            return False
+        if any(mat.get_name() in V.graph.unaligned_buffers for mat in inputs.mat1mat2()):
+            return False
+        strides = inputs.strides_hinted()
+        for idx in (inputs._mat1_idx, inputs._mat2_idx):
+            if inputs.dtype(idx) not in (torch.float16, torch.bfloat16):
+                return False
+            inner = tma_inner_dim(strides[idx])
+            if inner is None or strides[idx][1 - inner] % 8:
+                return False
+        return inputs.dtype(inputs._mat1_idx) == inputs.dtype(inputs._mat2_idx)
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        from triton.tlx.ops.kernels.mm import sm90
+
+        m, n, k = kernel_inputs.mnk_hinted()
+        if min(m, n, k) <= 0:
+            return
+        strides = kernel_inputs.strides_hinted()
+        a_row_major = tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1
+        b_row_major = tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1
+        allow = config.triton.tlx_mode == "allow"
+        if not allow and sm90._use_small_k(m, n, k, "heuristic"):
+            # As tlx.ops.mm's heuristic, leave a few-K-step shape to the small-K
+            # template: autotuning cannot tell few-microsecond kernels apart.
+            return
+        # Skinny M runs swap-AB, as in tlx.ops.mm: the kernel computes C^T with
+        # the problem's N as its M.
+        swap_ab = m <= sm90._SWAP_AB_MAX_M
+        if swap_ab:
+            configs = (sm90._prune_swap_configs(sm90._swap_configs(), {"M": n, "N": m, "K": k})
+                       if allow else sm90._swap_heuristic_config(m, n, k, invariance=sm90._FIXED_SPEC))
+        else:
+            configs = (sm90._prune_full_configs(sm90.CONFIGS(), {"M": m, "N": n, "K": k}, B_ROW_MAJOR=b_row_major)
+                       if allow else sm90.heuristic_config(m, n, k, b_row_major, invariance=sm90._FIXED_SPEC))
+        # Whole-K only (the heuristic is asked for its best whole-K tile). Split-K
+        # tuned at one sample M runs at every M in an AOTI package: on the H100
+        # OneFeed merge net it was at best on par with cuBLAS and lost 1.2-1.5x in
+        # serving.
+        if allow:
+            configs = [conf for conf in configs if conf.kwargs["SPLIT_K"] == 1]
+        else:
+            configs = [self._whole_k(sm90, conf) for conf in configs]
+        host_tma = _host_tma_operands(kernel_inputs)
+        # Non-power-of-two tiles run only as two equal-subtile pieces (192, 96).
+        configs = [
+            conf for conf in configs
+            if sm90._is_pow2(conf.kwargs["BN"]) or (sm90._npot_subtile(conf.kwargs["BN"]) and not b_row_major)
+        ]
+        for conf in configs:
+            meta = conf.kwargs
+            n_tail = sm90._n_piece(meta["BN"], 1)
+            split_k = meta["SPLIT_K"]
+            yield {
+                "BLOCK_M": meta["BM"],
+                "BLOCK_N": meta["BN"],
+                "BLOCK_K": meta["BK"],
+                "BLOCK_M_SPLIT": meta["BM"] // meta["NUM_MMA_GROUPS"],
+                "slice_size": n_tail // 2 if n_tail else meta["BN"] // 4,
+                "N_TAIL": n_tail,
+                "SWAP_AB": swap_ab,
+                "SPLIT_K": split_k,
+                "GROUP_SIZE_M": meta["GROUP_SIZE_M"],
+                "NUM_STAGES": meta["NUM_STAGES"],
+                "NUM_MMA_GROUPS": meta["NUM_MMA_GROUPS"],
+                "NUM_SMS": get_num_sms(),
+                # Under swap-AB the kernel's A is B^T and its B is A^T.
+                "A_ROW_MAJOR": (not b_row_major) if swap_ab else a_row_major,
+                "B_ROW_MAJOR": (not a_row_major) if swap_ab else b_row_major,
+                # A few N tiles reuse each A panel back to back; under swap-AB
+                # the kernel's A is B, streamed once.
+                "A_EVICTION": repr("evict_last" if n <= 1024 and not swap_ab else ""),
+                # Split-K stores partials through pointers; the reducer writes C.
+                "TMA_EPILOGUE_STORE": int(n % 8 == 0 and split_k == 1),
+                # A and B descriptors built on the host, as tlx.ops.mm does,
+                # rather than by every CTA before its first load.
+                **host_tma,
+                "num_stages": conf.num_stages,
+                "num_warps": conf.num_warps,
+                "ACC_TYPE": "tl.float32",
+            }
+
+    @staticmethod
+    def _whole_k(sm90, conf):
+        meta = conf.kwargs
+        if meta["SPLIT_K"] == 1:
+            return conf
+        if meta["SWAP_AB"]:
+            stages = sm90._deepest_ring(meta["BM"], meta["BN"], meta["BK"], 1)
+            return sm90._config(meta["BM"], meta["BN"], stages, meta["GROUP_SIZE_M"], 1, meta["BK"], True)
+        return sm90._config(meta["BM"], meta["BN"], meta["NUM_STAGES"], meta["GROUP_SIZE_M"])
+
+
+@register_template_heuristic(hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="addmm")
+class HopperGemmWSAddMMConfigHeuristic(AddMMConfigMixin, HopperGemmWSConfigHeuristic):
+    """addmm on the SM90 WS template; the bias rides the template's epilogue."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        # The bias is loaded through the same per-slice SMEM scratch as a fused
+        # epilogue input, which the deepest rings (e.g. 128x256 at 4 stages) do
+        # not leave room for: they fail to launch with OutOfResources.
+        for meta in super()._get_template_configs_impl(kernel_inputs, op_name):
+            if meta["SPLIT_K"] == 1:
+                meta["NUM_STAGES"] = _hopper_ws_fused_epilogue_stages(meta)
+            yield meta
+
+
+@register_template_heuristic(hopper_gemm_small_k_template.uid, "cuda", register=not IS_ROCM, op_name="mm")
+class HopperGemmSmallKConfigHeuristic(HopperGemmWSConfigHeuristic):
+    """tlx.ops.mm's small-K kernel, offered where tlx.ops.mm would consider it."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        from triton.tlx.ops.kernels.mm import sm90
+
+        m, n, k = kernel_inputs.mnk_hinted()
+        if min(m, n, k) <= 0:
+            return
+        if config.triton.tlx_mode == "allow":
+            if not sm90._small_k_candidate(m, n, k, "full"):
+                return
+            configs = sm90._prune_small_k_configs(sm90._small_k_configs(), {"M": m, "N": n, "K": k})
+        else:
+            if not sm90._use_small_k(m, n, k, "heuristic"):
+                return
+            configs = sm90._small_k_heuristic_config(m, n, k)
+        strides = kernel_inputs.strides_hinted()
+        host_tma = _host_tma_operands(kernel_inputs)
+        for conf in configs:
+            meta = conf.kwargs
+            if meta["SPLIT_K"] > 1:
+                continue
+            yield {
+                "BLOCK_M": meta["BM"],
+                "BLOCK_N": meta["BN"],
+                "BLOCK_K": meta["BK"],
+                "GROUP_SIZE_M": meta["GROUP_SIZE_M"],
+                "A_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1,
+                "B_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1,
+                **host_tma,
+                "num_stages": conf.num_stages,
+                "num_warps": conf.num_warps,
+                "ACC_TYPE": "tl.float32",
+            }
+
+
+@register_template_heuristic(hopper_gemm_small_k_template.uid, "cuda", register=not IS_ROCM, op_name="addmm")
+class HopperGemmSmallKAddMMConfigHeuristic(AddMMConfigMixin, HopperGemmSmallKConfigHeuristic):
+    """addmm on the SM90 small-K template; the bias rides the template's epilogue."""
+
+
+class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
+    """Mixin for TLX Matmul WS template with TLX-specific parameters and config validation."""
+
+    # Blackwell resource limits, re-exported as class attributes for callers
+    # that read them directly. Sourced from the shared arch model rather than
+    # respelled here -- see tlx.hw.resources.
+    MAX_SHARED_MEMORY = BLACKWELL_LIMITS.on_chip_bytes
+    MAX_TMEM_COLUMNS = BLACKWELL_LIMITS.tmem_columns
+    MBARRIER_SIZE = resources.MBARRIER_BYTES
+
+    @staticmethod
+    def _tile(
+        block_m: int,
+        block_n: int,
+        block_k: int,
+        num_smem_buffers: int,
+        num_tmem_buffers: int,
+        num_mma_groups: int,
+        num_ctas: int,
+        epilogue_subtile: int,
+    ) -> BlackwellWSGemmConfig:
+        """Adapt the flat positional signature the validators expose."""
+        return BlackwellWSGemmConfig(
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            num_smem_buffers=num_smem_buffers,
+            num_tmem_buffers=num_tmem_buffers,
+            num_mma_groups=num_mma_groups,
+            num_ctas=num_ctas,
+            epilogue_subtile=epilogue_subtile,
+        )
+
+    @staticmethod
+    def _is_valid_config(
+        block_m: int,
+        block_n: int,
+        block_k: int,
+        num_smem_buffers: int,
+        num_tmem_buffers: int,
+        num_mma_groups: int,
+        num_ctas: int,
+        epilogue_subtile: int,
+    ) -> bool:
+        """
+        Check if config is valid based on hardware constraints.
+        Based on preprocess_configs from tritonbench/operators/gemm/tlx_matmul.py
+
+        Prunes the autotuning pool, where the store path is not yet known, so
+        the epilogue staging buffer is charged unconditionally.
+
+        Returns:
+            True if config is valid, False if should be pruned.
+        """
+        return validate_config(
+            BlackwellGemmWSConfigMixin._tile(
+                block_m,
+                block_n,
+                block_k,
+                num_smem_buffers,
+                num_tmem_buffers,
+                num_mma_groups,
+                num_ctas,
+                epilogue_subtile,
+            ),
+            charge_epilogue=True,
+        )
+
+    # Safety margin (bytes) added to the static SMEM estimate to account for
+    # epilogue fusion overhead (alignment padding, extra barriers, etc.) that
+    # can push the actual kernel SMEM past the hardware limit at launch time.
+    _SMEM_SAFETY_MARGIN = 8192
+
+    @classmethod
+    def _is_valid_config_with_margin(
+        cls,
+        block_m: int,
+        block_n: int,
+        block_k: int,
+        num_smem_buffers: int,
+        num_tmem_buffers: int,
+        num_mma_groups: int,
+        num_ctas: int,
+        epilogue_subtile: int,
+        elem_bytes: int = resources.OPERAND_ELEM_BYTES,
+    ) -> bool:
+        """Validate the final tile's structural rules and SMEM with a safety margin."""
+        return validate_config(
+            dataclasses.replace(
+                cls._tile(
+                    block_m,
+                    block_n,
+                    block_k,
+                    num_smem_buffers,
+                    num_tmem_buffers,
+                    num_mma_groups,
+                    num_ctas,
+                    epilogue_subtile,
+                ),
+                elem_bytes=elem_bytes,
+            ),
+            charge_epilogue=True,
+            smem_margin=cls._SMEM_SAFETY_MARGIN,
+            check_tmem=False,
+        )
+
+    @staticmethod
+    def _row_major_kwargs(kernel_inputs: KernelInputs) -> dict[str, bool]:
+        """A_ROW_MAJOR/B_ROW_MAJOR, spelled exactly as TMATemplateConfigMixin does."""
+        assert isinstance(kernel_inputs, MMKernelInputs), "Expect MMKernelInputs"
+        strides = kernel_inputs.strides_hinted()
+        mat1_inner_dim = tma_inner_dim(strides[kernel_inputs._mat1_idx])
+        mat2_inner_dim = tma_inner_dim(strides[kernel_inputs._mat2_idx])
+        assert mat1_inner_dim is not None and mat2_inner_dim is not None
+        return {
+            "A_ROW_MAJOR": mat1_inner_dim == 1,
+            "B_ROW_MAJOR": mat2_inner_dim == 1,
+        }
+
+    @staticmethod
+    def _has_unsupported_fp32_operands(kernel_inputs: KernelInputs) -> bool:
+        """FP32 runs as TF32, and tcgen05.mma rejects transposed FP32 SMEM operands,
+        so FP32 needs TF32 allowed and K-inner A and B (the template loads operands as stored)."""
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            return False
+        idxs = (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
+        if all(kernel_inputs.dtype(idx) != torch.float32 for idx in idxs):
+            return False
+        if not _mm_allow_tf32(kernel_inputs):
+            return True
+        strides = kernel_inputs.strides_hinted()
+        return not (tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1
+                    and tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 0)
+
+    @staticmethod
+    def _has_unsupported_layout(kernel_inputs: KernelInputs) -> bool:
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            return False
+
+        strides = kernel_inputs.strides_hinted()
+        if any(tma_inner_dim(strides[idx]) is None for idx in (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)):
+            return True
+
+        return not can_use_tma(
+            *kernel_inputs.mat1mat2(),
+            output_layout=kernel_inputs.output_layout(flexible=False),
+        )
+
+    def _get_template_configs_impl(
+        self,
+        kernel_inputs: KernelInputs,
+        op_name: str,
+    ) -> Generator[dict[str, Any], None, None]:
+        """
+        Generate TLX template configs with TLX-specific parameters,
+        adjusting NUM_CTAS based on problem size.
+
+        Behavior by mode:
+        - "force": yields a single heuristic config (if available), no autotuning
+        - "allow": yields heuristic config + additional autotuning configs from
+          self.mm_configs, so TLX competes via autotuning with cublas/triton
+        """
+        import math
+
+        # Get M, N, K from kernel inputs for compatibility check
+        assert isinstance(kernel_inputs, MMKernelInputs), "Expect MMKernelInputs"
+        m, n, k = kernel_inputs.mnk_hinted()
+        num_sms = get_num_sms()
+        is_allow_mode = config.triton.tlx_mode == "allow"
+        # The config pool and the heuristic are sized for 2-byte operands.
+        elem_bytes = kernel_inputs.dtype(kernel_inputs._mat1_idx).itemsize
+        wide_operands = elem_bytes != resources.OPERAND_ELEM_BYTES
+
+        # Try heuristic config selection first (matches tlx_matmul_ws behavior).
+        # Always validate without TMA epilogue store, matching upstream TLX.
+        # TMA store adds SMEM overhead that would reject SMEM-tight heuristic
+        # configs (e.g. 256x256x64 3-buffer); _yield_tma_variants filters
+        # TMA=1 variants that don't fit in SMEM.
+        heuristic_config = (get_heuristic_config(m, n, k, num_sms, tma_epilogue_store=False)
+                            if tlx_config.use_heuristic_config else None)
+        if heuristic_config is not None:
+            # Convert config keys to template kwargs
+            template_kwargs: dict[str, Any] = {
+                "BLOCK_M": heuristic_config["BLOCK_SIZE_M"],
+                "BLOCK_N": heuristic_config["BLOCK_SIZE_N"],
+                "BLOCK_K": heuristic_config["BLOCK_SIZE_K"],
+                "GROUP_SIZE_M": heuristic_config["GROUP_SIZE_M"],
+                "NUM_SMEM_BUFFERS": heuristic_config["NUM_SMEM_BUFFERS"],
+                "NUM_TMEM_BUFFERS": heuristic_config["NUM_TMEM_BUFFERS"],
+                "NUM_MMA_GROUPS": heuristic_config["NUM_MMA_GROUPS"],
+                "EPILOGUE_SUBTILE": heuristic_config["EPILOGUE_SUBTILE"],
+                "BLOCK_M_SPLIT": heuristic_config["BLOCK_SIZE_M"] // heuristic_config["NUM_MMA_GROUPS"],
+                "slice_size": heuristic_config["BLOCK_SIZE_N"] // heuristic_config["EPILOGUE_SUBTILE"],
+                "NUM_CTAS": heuristic_config["NUM_CTAS"],
+                "SPLIT_K": heuristic_config.get("SPLIT_K", 1),
+                "INTERLEAVE_EPILOGUE": heuristic_config.get("INTERLEAVE_EPILOGUE", 0),
+                "num_stages": 1,
+                "num_warps": 4,
+                "NUM_SMS": num_sms,
+                # This config is hand-built rather than routed through
+                # TMATemplateConfigMixin, so it has to carry the layout flags itself;
+                # the autotuning pool below picks them up from super().
+                **self._row_major_kwargs(kernel_inputs),
+            }
+
+            # Check NUM_CTAS=2 compatibility
+            BLOCK_M = template_kwargs["BLOCK_M"]
+            BLOCK_N = template_kwargs["BLOCK_N"]
+            NUM_CTAS = template_kwargs["NUM_CTAS"]
+
+            if NUM_CTAS == 2:
+                num_tiles_m = math.ceil(m / BLOCK_M)
+                num_tiles_n = math.ceil(n / BLOCK_N)
+                ctas_compatible = (num_tiles_m % 2 == 0 and (num_tiles_m * num_tiles_n) % 2 == 0)
+                if not ctas_compatible:
+                    template_kwargs["NUM_CTAS"] = 1
+                    NUM_CTAS = 1
+
+            # In allow mode, validate SMEM with margin before yielding heuristic
+            # config — autotuning configs provide fallback if this is skipped.
+            # In force mode, always yield since it's the only config.
+            BLOCK_K = template_kwargs["BLOCK_K"]
+            # A wide-operand heuristic config that cannot launch falls through to
+            # the pool in force mode too.
+            skip_heuristic = (is_allow_mode or wide_operands) and not self._is_valid_config_with_margin(
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                heuristic_config["NUM_SMEM_BUFFERS"],
+                heuristic_config["NUM_TMEM_BUFFERS"],
+                heuristic_config["NUM_MMA_GROUPS"],
+                NUM_CTAS,
+                heuristic_config["EPILOGUE_SUBTILE"],
+                elem_bytes,
+            )
+            heuristic_yielded = False
+            if skip_heuristic:
+                log.debug(
+                    "Heuristic config (%d,%d,%d) exceeds SMEM with margin, skipping",
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_K,
+                )
+            else:
+                # Add ctas_per_cga for NUM_CTAS=2 mode
+                if NUM_CTAS == 2:
+                    template_kwargs["ctas_per_cga"] = (2, 1, 1)
+
+                SPLIT_K = template_kwargs.get("SPLIT_K", 1)
+                if SPLIT_K > 1:
+                    # Split-K writes fp32 partials to workspace via its own TMA path;
+                    # TMA_EPILOGUE_STORE controls the non-split-K output store path.
+                    template_kwargs["TMA_EPILOGUE_STORE"] = 0
+                    yield template_kwargs
+                    heuristic_yielded = True
+                else:
+                    for tma_kwargs in self._yield_tma_variants(template_kwargs, elem_bytes):
+                        yield tma_kwargs
+                        heuristic_yielded = True
+
+            # In force mode, return after yielding the heuristic config.
+            # Fall through to autotuning if heuristic was skipped (e.g.
+            # config exceeds SMEM with TMA epilogue buffers).
+            if not is_allow_mode and heuristic_yielded:
+                return
+
+        # Yield autotuning configs from self.mm_configs via the base class pipeline
+        for template_kwargs in super()._get_template_configs_impl(
+                kernel_inputs,
+                op_name,
+        ):
+            # Add TLX-specific defaults, allowing override from config
+            template_kwargs = {
+                **template_kwargs,
+                "GROUP_SIZE_M": template_kwargs.get("GROUP_SIZE_M", 8),
+                "NUM_SMEM_BUFFERS": template_kwargs.get("NUM_SMEM_BUFFERS", 3),
+                "NUM_TMEM_BUFFERS": template_kwargs.get("NUM_TMEM_BUFFERS", 2),
+                "EPILOGUE_SUBTILE": template_kwargs.get("EPILOGUE_SUBTILE", 1),
+                "NUM_MMA_GROUPS": template_kwargs.get("NUM_MMA_GROUPS", 1),
+                "NUM_CTAS": template_kwargs.get("NUM_CTAS", 1),
+                "SPLIT_K": template_kwargs.get("SPLIT_K", 1),
+                "INTERLEAVE_EPILOGUE": template_kwargs.get("INTERLEAVE_EPILOGUE", 0),
+            }
+            template_kwargs["BLOCK_M_SPLIT"] = (template_kwargs["BLOCK_M"] // template_kwargs["NUM_MMA_GROUPS"])
+            template_kwargs["slice_size"] = (template_kwargs["BLOCK_N"] // template_kwargs["EPILOGUE_SUBTILE"])
+
+            BLOCK_M = template_kwargs["BLOCK_M"]
+            BLOCK_N = template_kwargs["BLOCK_N"]
+            BLOCK_K = template_kwargs["BLOCK_K"]
+            NUM_CTAS = template_kwargs["NUM_CTAS"]
+
+            # Skip configs where block sizes >= problem dimensions (causes accuracy issues)
+            if BLOCK_N >= n or BLOCK_K >= k:
+                continue
+
+            # Interleaved epilogue hardcodes two MMA groups (buf_idx_0/1).
+            if (template_kwargs["INTERLEAVE_EPILOGUE"] and template_kwargs["NUM_MMA_GROUPS"] != 2):
+                continue
+
+            # 2-CTA cluster configs cause illegal memory access during
+            # autotuning for tall-M shapes.  The heuristic path selects
+            # 2-CTA with shape guards; the autotuning pool uses 1-CTA.
+            if NUM_CTAS == 2:
+                template_kwargs = {**template_kwargs, "NUM_CTAS": 1}
+                NUM_CTAS = 1
+
+            # Re-validate SMEM with actual NUM_CTAS (may have changed above).
+            # Use a safety margin to account for epilogue fusion overhead that
+            # the static estimate doesn't capture (alignment, extra barriers).
+            NUM_SMEM_BUFFERS = template_kwargs["NUM_SMEM_BUFFERS"]
+            NUM_TMEM_BUFFERS = template_kwargs["NUM_TMEM_BUFFERS"]
+            NUM_MMA_GROUPS = template_kwargs["NUM_MMA_GROUPS"]
+            EPILOGUE_SUBTILE = template_kwargs["EPILOGUE_SUBTILE"]
+            if not self._is_valid_config_with_margin(
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_K,
+                    NUM_SMEM_BUFFERS,
+                    NUM_TMEM_BUFFERS,
+                    NUM_MMA_GROUPS,
+                    NUM_CTAS,
+                    EPILOGUE_SUBTILE,
+                    elem_bytes,
+            ):
+                continue
+
+            # Add ctas_per_cga for NUM_CTAS=2 mode
+            if NUM_CTAS == 2:
+                template_kwargs = {
+                    **template_kwargs,
+                    "ctas_per_cga": (2, 1, 1),
+                }
+
+            # Yield TMA epilogue store variant(s)
+            yield from self._yield_tma_variants(template_kwargs, elem_bytes)
+
+    @staticmethod
+    def _yield_tma_variants(
+        template_kwargs: dict[str, Any],
+        elem_bytes: int = resources.OPERAND_ELEM_BYTES,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Yield TMA_EPILOGUE_STORE=1 (preferred) or TMA=0 fallback.
+
+        Upstream TLX always uses TMA descriptor stores for the epilogue.
+        tl.store is incompatible with NUM_CTAS=2 (MultiCTAReduction pass
+        can't distribute direct stores across CTAs), so 2-CTA configs
+        must use TMA and are skipped if they don't fit in SMEM.
+
+        For 1-CTA configs, fall back to TMA=0 (tl.store) when TMA=1
+        exceeds SMEM — this can happen when epilogue fusion adds SMEM
+        for fused tensors (e.g. bias) beyond what the base estimate covers."""
+        config_dict = {
+            "BLOCK_SIZE_M": template_kwargs["BLOCK_M"],
+            "BLOCK_SIZE_N": template_kwargs["BLOCK_N"],
+            "BLOCK_SIZE_K": template_kwargs["BLOCK_K"],
+            "NUM_SMEM_BUFFERS": template_kwargs["NUM_SMEM_BUFFERS"],
+            "NUM_TMEM_BUFFERS": template_kwargs["NUM_TMEM_BUFFERS"],
+            "NUM_MMA_GROUPS": template_kwargs["NUM_MMA_GROUPS"],
+            "EPILOGUE_SUBTILE": template_kwargs["EPILOGUE_SUBTILE"],
+            "NUM_CTAS": template_kwargs["NUM_CTAS"],
+            "SPLIT_K": template_kwargs.get("SPLIT_K", 1),
+        }
+        num_ctas = template_kwargs.get("NUM_CTAS", 1)
+        if num_ctas == 1:
+            # For 1-CTA, use a margin to account for epilogue fusion SMEM
+            # (e.g. bias buffer ~4-5KB) that the base formula doesn't capture.
+            # Without this, TMA=1 compiles OK during benchmarking (no fusion)
+            # but can fail after fusion adds SMEM in the final codegen.
+            _TMA_SMEM_MARGIN = 8192
+            if _is_config_valid(config_dict, tma_epilogue_store=True, smem_margin=_TMA_SMEM_MARGIN,
+                                elem_bytes=elem_bytes):
+                yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
+            else:
+                yield {**template_kwargs, "TMA_EPILOGUE_STORE": 0}
+        else:
+            # 2-CTA requires TMA (tl.store incompatible with MultiCTAReduction)
+            if _is_config_valid(config_dict, tma_epilogue_store=True, elem_bytes=elem_bytes):
+                yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
+
+
+def _gfx950_static_problem(kernel_inputs, dtypes):
+    if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx950():
+        return None
+    dtype = kernel_inputs.dtype(kernel_inputs._mat1_idx)
+    if dtype not in dtypes or kernel_inputs.dtype(kernel_inputs._mat2_idx) != dtype:
+        return None
+
+    m, n, k = kernel_inputs.mnk_symbolic()
+    strides = kernel_inputs.strides_hinted()
+    a_strides = strides[kernel_inputs._mat1_idx]
+    b_strides = strides[kernel_inputs._mat2_idx]
+    values = (m, n, k, *a_strides[-2:], *b_strides[-2:])
+    if not all(isinstance(value, (int, sympy.Integer)) for value in values):
+        return None
+
+    m, n, k, stride_am, stride_ak, stride_bk, stride_bn = (int(value) for value in values)
+    if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
+        return None
+    if stride_ak != 1:
+        return None
+
+    out_dtype = kernel_inputs.out_dtype()
+    int32_max = torch.iinfo(torch.int32).max
+    # `tt.pointer_range=32` is a byte-range promise for A, B, and the
+    # contiguous output, not merely a bound on their element offsets.
+    a_span = _storage_span_elems((m, k), (stride_am, stride_ak))
+    b_span = _storage_span_elems((k, n), (stride_bk, stride_bn))
+    if a_span is None or b_span is None:
+        return None
+    a_span_bytes = a_span * dtype.itemsize
+    b_span_bytes = b_span * dtype.itemsize
+    c_span_bytes = m * n * out_dtype.itemsize
+    if max(a_span_bytes, b_span_bytes, c_span_bytes) > int32_max:
+        return None
+    return (
+        m,
+        n,
+        k,
+        dtype,
+        out_dtype,
+        (stride_am, stride_ak),
+        (stride_bk, stride_bn),
+    )
+
+
+def _gfx950_static_tn_problem(kernel_inputs, dtypes):
+    problem = _gfx950_static_problem(kernel_inputs, dtypes)
+    if problem is None or problem[6][0] != 1:
+        return None
+    m, n, k, _, out_dtype, _, _ = problem
+    return m, n, k, out_dtype
+
+
+def _gfx950_static_dispatch(kernel_inputs):
+    problem = _gfx950_static_problem(
+        kernel_inputs,
+        (torch.float16, torch.bfloat16),
+    )
+    if problem is None:
+        return None
+    m, n, k, dtype, _, a_strides, b_strides = problem
+    from triton.tlx.ops.kernels.mm.gfx950 import (
+        _dispatch_plan,
+        _optimized_geometry_config,
+        _persistent_plan_for_shape,
+        _ROW_MAJOR_DIRECT_PLANS,
+        _ROW_MAJOR_WAVE_GRID_PLANS,
+        heuristic_config,
+    )
+
+    args = (
+        m,
+        n,
+        k,
+        dtype,
+        torch.finfo(dtype).bits // 8,
+        a_strides,
+        b_strides,
+    )
+    optimized = _optimized_geometry_config(*args)
+    if optimized is not None:
+        return optimized
+    if dtype == torch.bfloat16:
+        return heuristic_config(*args)
+    if b_strides[1] == 1:
+        persistent = _persistent_plan_for_shape(m, n, k, dtype)
+        if persistent is not None:
+            return "persistent", persistent
+        wave_grid = _ROW_MAJOR_WAVE_GRID_PLANS.get((m, n, k))
+        if wave_grid is not None:
+            return "wave_grid", wave_grid
+        direct = _ROW_MAJOR_DIRECT_PLANS.get((m, n, k))
+        if direct is not None:
+            return "row_major_direct", direct
+    # `_dispatch_plan` is the dense-TN selector. Other B layouts retain the
+    # stride-aware public heuristic used by `tlx.ops.mm`.
+    if b_strides[0] != 1:
+        return heuristic_config(*args)
+    return _dispatch_plan(
+        m,
+        n,
+        k,
+        dtype,
+        torch.finfo(dtype).bits // 8,
+    )
+
+
+class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Feed the gfx942 tlx.ops heuristic into an Inductor GEMM template."""
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if config.triton.tlx_mode in ("allow", "force"):
+            return _is_gfx942()
+        return super().should_run(inputs)
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx942():
+            return
+        dtype = kernel_inputs.dtype(kernel_inputs._mat1_idx)
+        if dtype not in (torch.float16, torch.bfloat16):
+            return
+        if kernel_inputs.dtype(kernel_inputs._mat2_idx) != dtype:
+            return
+
+        m, n, k = kernel_inputs.mnk_symbolic()
+        strides = kernel_inputs.strides_hinted()
+        a_strides = strides[kernel_inputs._mat1_idx]
+        b_strides = strides[kernel_inputs._mat2_idx]
+        values = (m, n, k, *a_strides[-2:], *b_strides[-2:])
+        if not all(isinstance(value, (int, sympy.Integer)) for value in values):
+            return
+        m, n, k, stride_am, stride_ak, stride_bk, stride_bn = (int(value) for value in values)
+        if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
+            return
+
+        # Share the measured shape policy, with layout/dtype guards for the
+        # split-K workspace path. Special local split paths use other grids.
+        from triton.tlx.ops.kernels.mm.gfx942 import torchtlx_heuristic_config
+
+        scalars = getattr(kernel_inputs, "_scalars", None) or {}
+        for candidate in torchtlx_heuristic_config(
+                m,
+                n,
+                k,
+                dtype=dtype,
+                out_dtype=kernel_inputs.out_dtype(),
+                a_strides=(stride_am, stride_ak),
+                b_strides=(stride_bk, stride_bn),
+                alpha=scalars.get("alpha", 1),
+                beta=scalars.get("beta", 1),
+        ):
+            meta = dict(candidate.kwargs)
+            if meta.pop("SPLIT_M_128_64", False) or meta.pop("USE_LOCAL_SPLIT_U", False):
+                continue
+            meta.setdefault("SPLIT_M_128_32", False)
+            meta.setdefault("SPLIT_M_256_64", False)
+            meta.setdefault("SPLIT_K", 1)
+            meta.setdefault("SPLIT_ORDER_CHUNK", 1)
+            meta.setdefault("LAUNCH_XCD_CHUNK", 0)
+            meta.setdefault("PACKED_K_LOADS", False)
+            meta.setdefault("matrix_instr_nonkdim", 16)
+            triton_config = self.triton_config(
+                candidate.num_stages,
+                candidate.num_warps,
+                **meta,
+            )
+            yield self._convert_config_to_template_kwargs(
+                triton_config,
+                m,
+                n,
+                k,
+                kernel_inputs.out_dtype(),
+            )
+
+
+@register_template_heuristic(
+    gfx942_mm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx942MMTemplateConfigHeuristic(_Gfx942MMTemplateConfigHeuristic):
+    """MI300X TorchTLX MM using the gfx942 tlx.ops shape heuristic."""
+
+
+@register_template_heuristic(
+    gfx942_addmm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class Gfx942AddMMTemplateConfigHeuristic(AddMMConfigMixin, _Gfx942MMTemplateConfigHeuristic):
+    """MI300X TorchTLX AddMM using the gfx942 tlx.ops shape heuristic."""
+
+
+_GFX950_REGISTER_BLOCK_M = 256
+_GFX950_REGISTER_BLOCK_K = 64
+_GFX950_REGISTER_NUM_CU = 256
+_GFX950_REGISTER_MIN_KTILES_PER_SPLIT = 16
+
+
+def _gfx950_register_cdiv(value, divisor):
+    return (value + divisor - 1) // divisor
+
+
+def _gfx950_register_split_k_for(grid_mn, k):
+    min_ks = (_GFX950_REGISTER_MIN_KTILES_PER_SPLIT * _GFX950_REGISTER_BLOCK_K)
+    best = 1
+    for split_k in range(2, _GFX950_REGISTER_NUM_CU // grid_mn + 1):
+        split_size = k // split_k
+        if (k % split_k == 0 and split_size >= min_ks and split_size % _GFX950_REGISTER_BLOCK_K == 0):
+            best = split_k
+    return best
+
+
+def _gfx950_register_default_lds_block_m(m, n, k):
+    large_grid = _gfx950_register_cdiv(m, 256) * _gfx950_register_cdiv(n, 256)
+    large_fill = large_grid * _gfx950_register_split_k_for(large_grid, k)
+    if large_fill >= _GFX950_REGISTER_NUM_CU // 2:
+        return 256
+    small_grid = _gfx950_register_cdiv(m, 128) * _gfx950_register_cdiv(n, 128)
+    small_fill = small_grid * _gfx950_register_split_k_for(small_grid, k)
+    return 128 if small_fill > large_fill else 256
+
+
+def _gfx950_register_full_grid_config(m, n, k):
+    small_grid = _gfx950_register_cdiv(m, 128) * _gfx950_register_cdiv(n, 128)
+    large_grid = _gfx950_register_cdiv(m, 256) * _gfx950_register_cdiv(n, 256)
+    if not (k > 512 and k % _GFX950_REGISTER_BLOCK_K == _GFX950_REGISTER_BLOCK_K // 2
+            and large_grid < _GFX950_REGISTER_NUM_CU <= small_grid):
+        return None
+    return {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_M": 8,
+        "NUM_XCDS": 8,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 0,
+        "kpack": 1,
+        "num_warps": 4,
+        "num_stages": 4,
+    }
+
+
+def _gfx950_register_intermediate_config(m, n, k):
+    if n >= 2 * k:
+        block_m, block_n, block_k = 128, 128, 128
+        group_m, num_warps, num_stages = 16, 8, 2
+    elif (k >= 2 * n and 4 * m < 3 * _gfx950_register_cdiv(m, 128) * 128):
+        block_m, block_n, block_k = 64, 32, 128
+        group_m, num_warps, num_stages = 8, 4, 2
+    elif k >= 2 * n:
+        block_m, block_n, block_k = 128, 64, 128
+        group_m, num_warps, num_stages = 4, 8, 3
+    else:
+        block_m, block_n, block_k = 128, 64, 64
+        group_m, num_warps, num_stages = 4, 4, 3
+    grid_mn = _gfx950_register_cdiv(m, block_m) * _gfx950_register_cdiv(n, block_n)
+    return {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "GROUP_M": group_m,
+        "NUM_XCDS": 8 if grid_mn >= _GFX950_REGISTER_NUM_CU else 1,
+        "matrix_instr_nonkdim": 16 if block_m == 64 else 32,
+        "waves_per_eu": 0,
+        "kpack": 1,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
+def _gfx950_register_plan_for(m, n, k):
+    config = _gfx950_register_full_grid_config(m, n, k)
+    if config is not None:
+        return config
+
+    block_m = _gfx950_register_default_lds_block_m(m, n, k)
+    padded_m = _gfx950_register_cdiv(m, block_m) * block_m
+    is_intermediate_m = (_GFX950_REGISTER_BLOCK_M // 4 < m < 4 * _GFX950_REGISTER_BLOCK_M)
+    has_high_m_padding = 4 * m < 3 * padded_m
+    if not is_intermediate_m or (block_m == _GFX950_REGISTER_BLOCK_M and not has_high_m_padding):
+        return None
+    return _gfx950_register_intermediate_config(m, n, k)
+
+
+class _Gfx950TLXModeMixin:
+    """Run on gfx950 whenever torchTLX is enabled.
+
+    torchTLX is independent of max_autotune; the ROCm GEMM base heuristic would
+    otherwise offer these templates only under it.
+    """
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if config.triton.tlx_mode in ("allow", "force"):
+            return _is_gfx950()
+        return super().should_run(inputs)
+
+
+class _Gfx950InterWaveTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
+    """Shared config gate for the gfx950 a16w16 inter-wave kernel.
+
+    The reference kernel consumes row-major A directly and relies on a fixed
+    two-buffer, four-quadrant LDS layout. It accepts either row-major B or the
+    column-major B view produced by nn.Linear weights.
+    """
+
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, waves_per_eu, NUM_XCDS)
+    INTERWAVE_CONFIGS = [
+        (256, 256, 64, 4, 8, 0, 8),
+        (256, 256, 64, 4, 8, 0, 1),
+        (128, 256, 64, 1, 8, 0, 1),
+        (128, 128, 64, 4, 8, 0, 8),
+        (128, 128, 64, 1, 4, 0, 1),
+        (128, 128, 64, 1, 4, 1, 1),
+        (128, 128, 64, 8, 4, 0, 1),
+        (128, 128, 64, 16, 4, 0, 1),
+    ]
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx950():
+            return
+        if kernel_inputs.dtype(kernel_inputs._mat1_idx) not in (
+                torch.float16,
+                torch.bfloat16,
+        ):
+            return
+
+        m, n, k = kernel_inputs.mnk_symbolic()
+        strides = kernel_inputs.strides_hinted()
+        a_strides = strides[kernel_inputs._mat1_idx]
+        b_strides = strides[kernel_inputs._mat2_idx]
+        static_values = (n, k, *a_strides[-2:], *b_strides[-2:])
+        if not all(isinstance(value, (int, sympy.Integer)) for value in static_values):
+            return
+
+        sizevars = V.graph.sizevars
+        m_is_static = isinstance(m, (int, sympy.Integer))
+        m_int = _sizevar_hint(sizevars, m, -1)
+        if m_int <= 0:
+            return
+        n_int, k_int, stride_am, stride_ak, stride_bk, stride_bn = (int(value) for value in static_values)
+        b_is_row_major = stride_bn == 1
+        b_is_col_major = stride_bk == 1
+        if stride_ak != 1 or not (b_is_row_major or b_is_col_major):
+            return
+
+        itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
+        b_row_stride = stride_bk if b_is_row_major else stride_bn
+        if stride_am * itemsize % 16 != 0 or b_row_stride * itemsize % 16 != 0:
+            return
+
+        # B's span is static, so only A's dynamic-M span can install a guard.
+        a_span = _storage_span_elems((m, k_int), (stride_am, stride_ak))
+        b_span = _storage_span_elems((k_int, n_int), (stride_bk, stride_bn))
+        if a_span is None or b_span is None or not _guard_int32_spans(
+                sizevars,
+            (a_span, b_span),
+            (stride_am, stride_ak, stride_bk, stride_bn),
+        ):
+            return
+
+        out_dtype = kernel_inputs.out_dtype()
+        from triton.tlx.ops.kernels.mm.gfx950 import heuristic_config
+
+        dispatch = heuristic_config(
+            m_int,
+            n_int,
+            k_int,
+            kernel_inputs.dtype(kernel_inputs._mat1_idx),
+            itemsize,
+            (stride_am, stride_ak),
+            (stride_bk, stride_bn),
+        )
+        if dispatch is not None and dispatch[0] == "inter_wave" and dispatch[1]:
+            plan = dispatch[1]
+            block_m, block_n = plan.get("TILE", (256, 256))
+            if plan.get("SPLIT_K", 1) == 1:
+                warps_m, warps_n = plan.get("WARP_GRID", (2, 4))
+                group_m = plan.get("GROUP_M_OVERRIDE")
+                if group_m is None:
+                    group_m = (4 if m_int == n_int and k_int >= 8192 else 2 if m_int <= 1024 and n_int >= 16384 else 8)
+                num_xcds = plan.get("NUM_XCDS_OVERRIDE")
+                if num_xcds is None:
+                    num_xcds = 1 if m_int == n_int and k_int >= 8192 else 8
+                triton_config = self.triton_config(
+                    1,
+                    warps_m * warps_n,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=64,
+                    GROUP_M=group_m,
+                    NUM_XCDS=num_xcds,
+                    B_COL_MAJOR=b_is_col_major and not b_is_row_major,
+                    HAS_M_TAIL=not m_is_static or m_int % block_m != 0,
+                    HAS_REGISTER_TAIL=k_int % 128 != 0,
+                    matrix_instr_nonkdim=plan.get("MATRIX_INSTR_NONKDIM", 16),
+                    waves_per_eu=plan.get("WAVES_PER_EU", 0),
+                    kpack=get_default_kpack(64),
+                    reverse_local_assignment=plan.get("REVERSE_LOCAL_ASSIGNMENT", False),
+                    sink_insts_to_avoid_spills=plan.get("SINK_INSTS_TO_AVOID_SPILLS", False),
+                    regclass_priority_trumps_globalness=plan.get("REGCLASS_PRIORITY", False),
+                    disable_unclustered_high_rp_reschedule=plan.get("DISABLE_HIGH_RP_RESCHEDULE", False),
+                    enable_sched_group_barrier_scheduler=True,
+                    sched_group_barrier_mfma_per_dwordx4=plan.get("SCHED_MFMA_PER_DWORDX4", 4),
+                )
+                yield self._convert_config_to_template_kwargs(
+                    triton_config,
+                    m,
+                    n,
+                    k,
+                    out_dtype,
+                )
+                return
+        for (
+                block_m,
+                block_n,
+                block_k,
+                group_m,
+                num_warps,
+                waves_per_eu,
+                config_num_xcds,
+        ) in self.INTERWAVE_CONFIGS:
+            if n_int % block_n != 0 or k_int < 2 * block_k:
+                continue
+
+            selected_group_m = (4 if m_int == n_int and k_int >= 8192 else
+                                (2 if m_int <= 1024 and n_int >= 16384 else group_m))
+            num_xcds = 1 if m_int == n_int and k_int >= 8192 else config_num_xcds
+            triton_config = self.triton_config(
+                1,
+                num_warps,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                GROUP_M=selected_group_m,
+                NUM_XCDS=num_xcds,
+                B_COL_MAJOR=b_is_col_major and not b_is_row_major,
+                HAS_M_TAIL=not m_is_static or m_int % block_m != 0,
+                HAS_REGISTER_TAIL=k_int % (2 * block_k) != 0,
+                matrix_instr_nonkdim=16,
+                waves_per_eu=waves_per_eu,
+                kpack=get_default_kpack(block_k),
+            )
+            yield self._convert_config_to_template_kwargs(triton_config, m, n, k, out_dtype)
+
+
+@register_template_heuristic(
+    gfx950_mm_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMExternConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Offer the trusted ``tlx.ops.mm`` dispatch as an autotuning candidate."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm" or not _gfx950_mm_extern_is_supported(kernel_inputs):
+            return
+        dispatch = _gfx950_static_dispatch(kernel_inputs)
+        if dispatch is not None and dispatch[0] in (
+                "streamk",
+                "ragged_n",
+                "m192n256",
+                "hybrid_n160",
+        ):
+            return
+        yield {}
+
+
+class _Gfx950MMFamilyExternConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    FAMILY = ""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        dispatch = _gfx950_static_dispatch(kernel_inputs)
+        if dispatch is not None and dispatch[0] == self.FAMILY:
+            yield {}
+
+
+@register_template_heuristic(
+    gfx950_mm_streamk_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMStreamKExternConfigHeuristic(_Gfx950MMFamilyExternConfigHeuristic):
+    FAMILY = "streamk"
+
+
+@register_template_heuristic(
+    gfx950_mm_ragged_n_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMRaggedNExternConfigHeuristic(_Gfx950MMFamilyExternConfigHeuristic):
+    FAMILY = "ragged_n"
+
+
+@register_template_heuristic(
+    gfx950_mm_m192n256_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMM192N256ExternConfigHeuristic(_Gfx950MMFamilyExternConfigHeuristic):
+    FAMILY = "m192n256"
+
+
+@register_template_heuristic(
+    gfx950_mm_hybrid_n160_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMHybridN160ExternConfigHeuristic(_Gfx950MMFamilyExternConfigHeuristic):
+    FAMILY = "hybrid_n160"
+
+
+@register_template_heuristic(
+    gfx950_mm_cached_b_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMCachedBTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror the trusted short-K cached-B LDS dispatch exactly."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(
+            kernel_inputs,
+            (torch.float16, torch.bfloat16),
+        )
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        from triton.tlx.ops.kernels.mm.gfx950 import _optimized_geometry_config
+
+        dispatch = _optimized_geometry_config(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        if dispatch is None or dispatch[0] != "cached_b_lds":
+            return
+        plan = dispatch[1]
+        triton_config = self.triton_config(
+            1,
+            2 * plan["WARPS_M"],
+            BLOCK_M=16 * plan["WARPS_M"] * plan["MI_WAVE_TILE_M"],
+            BLOCK_N=32 * plan["MI_WAVE_TILE_N"],
+            BLOCK_K=64,
+            K_BLOCKS=k // 64,
+            MI_WAVE_TILE_M=plan["MI_WAVE_TILE_M"],
+            MI_WAVE_TILE_N=plan["MI_WAVE_TILE_N"],
+            WARPS_M=plan["WARPS_M"],
+            PROGRAM_COUNT=plan["PROGRAM_COUNT"],
+            NUM_PROGRAMS=plan["PROGRAM_COUNT"],
+            GROUP_M=plan["GROUP_M"],
+            MANUAL_OUTPUT=True,
+            WIDE=True,
+            matrix_instr_nonkdim=16,
+            regclass_priority_trumps_globalness=True,
+            reverse_local_assignment=True,
+            sink_insts_to_avoid_spills=True,
+            disable_unclustered_high_rp_reschedule=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_lds_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMLDSTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror the trusted split-K LDS dispatch and reduction exactly."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(
+            kernel_inputs,
+            (torch.float16, torch.bfloat16),
+        )
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        if a_strides[0] % 16 or b_strides[1] % 16:
+            return
+
+        from triton.tlx.ops.kernels.mm.gfx950 import (
+            _LDS_DISABLE_SCHEDULER_SHAPES,
+            _lds_grid_mapping,
+            _optimized_geometry_config,
+            heuristic_config,
+        )
+
+        args = (
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        dispatch = _optimized_geometry_config(*args) or heuristic_config(*args)
+        if dispatch is None or dispatch[0] != "lds":
+            return
+        block_m, block_n, split_k = dispatch[1]
+        if split_k <= 1 or k % split_k:
+            return
+        group_m, num_xcds = _lds_grid_mapping(m, n, k, dtype)
+        split_size = k // split_k
+        triton_config = self.triton_config(
+            1,
+            4 if block_m == 128 else 8,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=64,
+            GROUP_M=group_m,
+            NUM_XCDS=num_xcds,
+            SPLIT_K=split_k,
+            HAS_REGISTER_TAIL=split_size % 128 != 0,
+            HAS_M_TAIL=m % block_m != 0,
+            HAS_N_TAIL=n % block_n != 0,
+            matrix_instr_nonkdim=16,
+            enable_sched_group_barrier_scheduler=((m, n, k, dtype) not in _LDS_DISABLE_SCHEDULER_SHAPES),
+            inductor_32bit_pointer_range=(
+                "arg_A",
+                "arg_B",
+                "out_ptr*",
+                "split_k_ws",
+            ),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_wave_grid_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMWaveGridTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror exact regular and transposed MI16/MI32 wave-grid plans."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(
+            kernel_inputs,
+            (torch.float16, torch.bfloat16),
+        )
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        from triton.tlx.ops.kernels.mm.gfx950 import (
+            _optimized_geometry_config,
+            _regular_wave_grid_options,
+            heuristic_config,
+        )
+
+        args = (
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        dispatch = _optimized_geometry_config(*args) or heuristic_config(*args)
+        if dispatch is None or dispatch[0] not in (
+                "wave_grid",
+                "transposed_wave_grid",
+        ):
+            return
+        plan = dispatch[1]
+        kind = plan.get("kind")
+        if (kind not in (
+                "register_mi16_wave_grid",
+                "regular_mi16_wave_grid",
+                "regular_mi32_wave_grid",
+        ) or plan.get("split_k", 1) != 1 or plan.get("streamk_tail_split", 0)
+                or plan.get("persistent_program_count", 0)):
+            return
+
+        if kind == "regular_mi16_wave_grid":
+            meta = _regular_wave_grid_options(plan, 1)
+            num_warps = meta.pop("num_warps")
+            num_stages = meta.pop("num_stages")
+            meta["DOT_MODE"] = repr(meta["DOT_MODE"])
+            if meta["llvm_fn_attrs"] == "":
+                meta["llvm_fn_attrs"] = ()
+            instr_m = 16
+        elif kind == "regular_mi32_wave_grid":
+            num_warps = plan["num_warps"]
+            num_stages = 1
+            meta = {
+                "MI_WAVE_TILE_M": plan["mi_wave_tile_m"],
+                "MI_WAVE_TILE_N": plan["mi_wave_tile_n"],
+                "WARPS_M": plan["warps_m"],
+                "WARPS_N": plan["warps_n"],
+                "BLOCK_K": 64,
+                "GROUP_M": 8,
+                "TILES_PER_PROGRAM": 1,
+                "DIRECT_TO_LDS": plan.get("direct_to_lds", False),
+                "DIRECT_CHUNK": plan.get("direct_chunk", 32),
+                "matrix_instr_nonkdim": 32,
+                "regclass_priority_trumps_globalness": True,
+                "reverse_local_assignment": plan.get("reverse_local_assignment", True),
+                "sink_insts_to_avoid_spills": plan.get("sink_insts_to_avoid_spills", False),
+                "disable_unclustered_high_rp_reschedule": plan.get("disable_unclustered_high_rp_reschedule", False),
+            }
+            instr_m = 32
+        else:
+            num_warps = plan["num_warps"]
+            num_stages = 1
+            meta = {
+                "MI_WAVE_TILE_M": plan["mi_wave_tile_m"],
+                "MI_WAVE_TILE_N": plan["mi_wave_tile_n"],
+                "WARPS_M": plan["warps_m"],
+                "WARPS_N": plan["warps_n"],
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+                "TILES_PER_PROGRAM": 1,
+                "PREFETCH_NEXT": plan.get("prefetch_next", True),
+                "matrix_instr_nonkdim": 16,
+                "reverse_local_assignment": plan.get("reverse_local_assignment", True),
+                "disable_unclustered_high_rp_reschedule": plan.get("disable_unclustered_high_rp_reschedule", False),
+            }
+            instr_m = 16
+        block_m = instr_m * plan["mi_wave_tile_m"] * plan["warps_m"]
+        block_n = instr_m * plan["mi_wave_tile_n"] * plan["warps_n"]
+        meta.update({
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "INSTR_M": instr_m,
+            "REGISTER_WAVE": kind == "register_mi16_wave_grid",
+            "MI32": kind == "regular_mi32_wave_grid",
+            "TRANSPOSED": dispatch[0] == "transposed_wave_grid",
+            "MANUAL_OUTPUT": True,
+            "inductor_32bit_pointer_range": (
+                "arg_A",
+                "arg_B",
+                "out_ptr*",
+            ),
+        })
+        triton_config = self.triton_config(
+            num_stages,
+            num_warps,
+            **meta,
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_interwave_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMInterWaveTemplateConfigHeuristic(_Gfx950InterWaveTemplateConfigHeuristic):
+    """Plain-MM heuristic for the gfx950 inter-wave kernel."""
+
+
+@register_template_heuristic(
+    gfx950_mm_local_split_u_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMLocalSplitUTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
+    """Mirror the trusted ``tlx.ops.mm`` LocalSplitU dispatch exactly."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(
+            kernel_inputs,
+            (torch.float16, ),
+        )
+        if problem is None or problem[6][0] != 1:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+
+        from triton.tlx.ops.kernels.mm.gfx950 import heuristic_config
+
+        dispatch = heuristic_config(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        if dispatch is None or dispatch[0] != "local_split_u":
+            return
+        plan = dispatch[1]
+        tile_m = plan.tile_m
+        tile_n = plan.tile_n
+        local_split_u = plan.local_split_u
+        wave_k = plan.wave_k
+        k_width = plan.k_width
+        triton_config = self.triton_config(
+            1,
+            local_split_u,
+            BLOCK_M=tile_m,
+            BLOCK_N=tile_n,
+            BLOCK_K=wave_k,
+            TILE_M=tile_m,
+            TILE_N=tile_n,
+            LOCAL_SPLIT_U=local_split_u,
+            WAVE_K=wave_k,
+            K_WIDTH=k_width,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=0,
+            kpack=1,
+            sink_insts_to_avoid_spills=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_short_k_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMShortKTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror the one-K64 BF16 direct-register family."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(kernel_inputs, (torch.bfloat16, ))
+        if problem is None:
+            return
+        m, n, k, _, out_dtype, _, _ = problem
+        from triton.tlx.ops.kernels.mm.gfx950 import _supports_short_k_register
+
+        if not _supports_short_k_register(m, n, k, torch.bfloat16):
+            return
+        triton_config = self.triton_config(
+            1,
+            1,
+            BLOCK_M=64,
+            BLOCK_N=64,
+            BLOCK_K=64,
+            GROUP_M=1,
+            matrix_instr_nonkdim=32,
+            waves_per_eu=0,
+            MANUAL_OUTPUT=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_row_major_direct_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMRowMajorDirectTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror measured dense row-major-B direct-to-LDS plans."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(kernel_inputs, (torch.float16, ))
+        if problem is None or problem[6][1] != 1:
+            return
+        m, n, k, _, out_dtype, _, _ = problem
+        from triton.tlx.ops.kernels.mm.gfx950 import _ROW_MAJOR_DIRECT_PLANS
+
+        plan = _ROW_MAJOR_DIRECT_PLANS.get((m, n, k))
+        if plan is None:
+            return
+        tiles = ((m + plan["BLOCK_M"] - 1) // plan["BLOCK_M"]) * ((n + plan["BLOCK_N"] - 1) // plan["BLOCK_N"])
+        triton_config = self.triton_config(
+            1,
+            plan["num_warps"],
+            BLOCK_M=plan["BLOCK_M"],
+            BLOCK_N=plan["BLOCK_N"],
+            BLOCK_K=plan["BLOCK_K"],
+            GROUP_M=1,
+            NUM_BUFFERS=plan["NUM_BUFFERS"],
+            TILES_PER_PROBLEM=tiles,
+            PROGRAM_COUNT=tiles,
+            NUM_PROGRAMS=tiles,
+            A_BASES=plan["A_BASES"],
+            B_BASES=plan["B_BASES"],
+            MANUAL_OUTPUT=True,
+            matrix_instr_nonkdim=plan["matrix_instr_nonkdim"],
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_fragmented_register_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMFragmentedRegisterTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror exact two-fragment transposed register production plans."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(kernel_inputs, (torch.float16, ))
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        if b_strides[0] != 1:
+            return
+
+        from triton.tlx.ops.kernels.mm.gfx950 import _dispatch_plan
+
+        dispatch = _dispatch_plan(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+        )
+        if dispatch is None or dispatch[0] != "fragmented_register":
+            return
+        plan = dispatch[1]
+        triton_config = self.triton_config(
+            plan["num_stages"],
+            plan["num_warps"],
+            M_HEAD=plan["M_HEAD"],
+            M_TAIL=plan["M_TAIL"],
+            BLOCK_M=plan["M_HEAD"] + plan["M_TAIL"],
+            BLOCK_N=plan["BLOCK_N"],
+            BLOCK_K=plan["BLOCK_K"],
+            GROUP_M=1,
+            matrix_instr_nonkdim=plan["matrix_instr_nonkdim"],
+            MANUAL_OUTPUT=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_fragmented_m_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMFragmentedMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror two- and three-fragment register wave-grid plans."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(kernel_inputs, (torch.float16, ))
+        if problem is None:
+            return
+        m, n, k, _, out_dtype, _, _ = problem
+        dispatch = _gfx950_static_dispatch(kernel_inputs)
+        if dispatch is None or dispatch[0] not in (
+                "wave_grid",
+                "transposed_wave_grid",
+        ):
+            return
+        plan = dispatch[1]
+        if plan.get("kind") != "register_fragmented_m":
+            return
+        fragments = tuple(extent for _, extent in plan["m_fragments"])
+        if len(fragments) not in (2, 3):
+            return
+        triton_config = self.triton_config(
+            plan["num_stages"],
+            plan["num_warps"],
+            M0=fragments[0],
+            M1=fragments[1],
+            M2=fragments[2] if len(fragments) == 3 else 0,
+            FRAGMENT_COUNT=len(fragments),
+            BLOCK_M=sum(fragments),
+            BLOCK_N=plan["block_n"],
+            BLOCK_K=plan["block_k"],
+            GROUP_M=1,
+            TRANSPOSED=dispatch[0] == "transposed_wave_grid",
+            MANUAL_OUTPUT=True,
+            matrix_instr_nonkdim=16,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_register_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMRegisterTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
+    """Mirror the trusted ``tlx.ops.mm`` register dispatch exactly."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(
+            kernel_inputs,
+            (torch.float16, torch.bfloat16),
+        )
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        # The production winner is a pair-balanced FP32 Split-K wave-grid plan;
+        # a single-kernel register template cannot express its reduction schedule.
+        if (m, n, k) == (128, 2688, 4416):
+            return
+
+        from triton.tlx.ops.kernels.mm.gfx950 import heuristic_config
+
+        dispatch = heuristic_config(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        transposed = dispatch is not None and dispatch[0] == "transposed_register"
+        if dispatch is not None and dispatch[0] in (
+                "register",
+                "range_register",
+                "transposed_register",
+        ):
+            plan = dict(dispatch[1])
+        else:
+            plan = _gfx950_register_plan_for(m, n, k)
+            if plan is None:
+                return
+
+        triton_config = self.triton_config(
+            plan["num_stages"],
+            plan["num_warps"],
+            BLOCK_M=plan["BLOCK_M"],
+            BLOCK_N=plan["BLOCK_N"],
+            BLOCK_K=plan["BLOCK_K"],
+            GROUP_M=plan["GROUP_M"],
+            NUM_XCDS=plan["NUM_XCDS"],
+            matrix_instr_nonkdim=plan["matrix_instr_nonkdim"],
+            waves_per_eu=plan["waves_per_eu"],
+            kpack=plan["kpack"],
+            CACHE_A_CG=plan.get("CACHE_A_CG", False),
+            CACHE_B_CG=plan.get("CACHE_B_CG", False),
+            TRANSPOSED=transposed,
+            llvm_fn_attrs=plan.get("llvm_fn_attrs", ()),
+            reverse_local_assignment=plan.get(
+                "reverse_local_assignment",
+                plan["BLOCK_K"] == 128 and plan["num_stages"] == 3,
+            ),
+            sink_insts_to_avoid_spills=plan.get("sink_insts_to_avoid_spills", False),
+            regclass_priority_trumps_globalness=plan.get("regclass_priority_trumps_globalness", False),
+            disable_unclustered_high_rp_reschedule=plan.get("disable_unclustered_high_rp_reschedule", False),
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_persistent_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMPersistentTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
+    """Offer the N160/N192 persistent kernels only for their tuned shapes."""
+
+    PERSISTENT_CONFIGS = {
+        (1024, 20480, 6144): 160,
+        (1024, 24576, 6144): 192,
+    }
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_tn_problem(
+            kernel_inputs,
+            (torch.float16, ),
+        )
+        if problem is None:
+            return
+        m, n, k, out_dtype = problem
+        block_n = self.PERSISTENT_CONFIGS.get((m, n, k))
+        if block_n is None:
+            return
+
+        triton_config = self.triton_config(
+            1,
+            4,
+            BLOCK_M=256,
+            BLOCK_N=block_n,
+            BLOCK_K=64,
+            NUM_PROGRAMS=256,
+            matrix_instr_nonkdim=16,
+            enable_sched_group_barrier_scheduler=True,
+            sched_group_barrier_mfma_per_dwordx4=1,
+            regclass_priority_trumps_globalness=True,
+            reverse_local_assignment=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_addmm_interwave_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class Gfx950AddMMInterWaveTemplateConfigHeuristic(AddMMConfigMixin, _Gfx950InterWaveTemplateConfigHeuristic):
+    """AddMM heuristic for the gfx950 inter-wave kernel."""
+
+
+@register_template_heuristic(gfx950_addmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="addmm")
+class Gfx950AddMMWarpPipeConfigHeuristic(AddMMConfigMixin, _Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
+    """TLX warp-pipelined addmm heuristic for ROCm (col-major B, MI350X/gfx950).
+
+    Hand-pipelined (num_stages=1): async-prefetches NUM_BUFFERS K-tiles into multi-buffered
+    LDS and overlaps the loads with the MFMA via tlx.warp_pipeline_stage. Configs are the
+    standalone MI350X winners. Correctness requires K_ITERS > NUM_BUFFERS, so a config is
+    emitted only when cdiv(K, BLOCK_K) > NUM_BUFFERS is statically known (also declines
+    dynamic/unknown K). The kernel needs col-major B; adjust_kernel_inputs enforces it
+    (the col-major prep that used to live in OSS tuned_addmm).
+    """
+
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
+    # BLOCK_N=256 tiles mirror the amd_addmm_glu tutorial winners for the M=1024
+    # regime; on gfx950 they beat the BLOCK_N<=128 tiles on large-N shapes (e.g.
+    # 1024x22272x1024 reaches ~98% of rocBLAS, up from ~92%). LDS: (128x256x64,NB2)
+    # = 96KB, (128x256x32,NB3) = 72KB -- both fit gfx950 (256x256x64 does not at
+    # NB3, where it needs 192KB; at NB2 it would fit).
+    # (128x256x64,NB3) = 144KB fits gfx950's 160KB (occupancy 1); it is the deeper-
+    # prefetch tile that won the standalone split-K sweep on low-occupancy large-K
+    # (e.g. 1024x6144x22272 at SK=4), which the NB=2 variant alone could not reach.
+    #
+    # These LDS figures are no longer hand-arithmetic only: resources.AMD_WARP_PIPE
+    # models the same allocation and reproduces all three, and
+    # test_every_shipped_warppipe_config_fits_gfx950 asserts no entry below
+    # exceeds the budget. Use resources.AMD_WARP_PIPE.estimate_smem when adding a
+    # config rather than recomputing by hand.
+    WARPPIPE_CONFIGS = [
+        (64, 64, 128, 8, 8, 3),
+        (64, 64, 64, 8, 8, 3),
+        (128, 128, 64, 8, 8, 2),
+        (64, 128, 64, 8, 8, 2),
+        (128, 256, 64, 8, 8, 2),
+        (128, 256, 64, 8, 8, 3),
+        (128, 256, 32, 8, 8, 3),
+    ]
+
+    WARPPIPE_CONFIGS_BY_ARCH = ADDMM_WARPPIPE_CONFIGS_BY_ARCH
+    _PREDRAIN_EPILOGUE_PREFETCH = True
+    _WARPPIPE_PERSISTENT = False
+
+    def adjust_kernel_inputs(self, kernel_inputs: KernelInputs, op_name: str) -> KernelInputs:
+        # Must never insert a copy: one dropped from the template signature at
+        # final render fails with NameError('B is not defined') (P2561566366 S1).
+        # The config gate requires col-major B statically, so this only freezes
+        # that layout. This replaces the require_stride_order that used to live
+        # in OSS tuned_addmm.
+        from torch._inductor.ir import ExternKernel
+
+        kernel_inputs = super().adjust_kernel_inputs(kernel_inputs, op_name)
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            return kernel_inputs
+        nodes = list(kernel_inputs.nodes())
+        mat2_idx = kernel_inputs._mat2_idx
+        nodes[mat2_idx] = ExternKernel.require_stride_order(nodes[mat2_idx], [0, 1])
+        return MMKernelInputs(
+            nodes,
+            scalars=kernel_inputs._scalars,
+            out_dtype=kernel_inputs.out_dtype(),
+            mat1_idx=kernel_inputs._mat1_idx,
+            mat2_idx=mat2_idx,
+        )
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        import sympy
+        from torch._inductor.virtualized import V
+
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            raise AssertionError(f"{self.__class__.__name__} requires MMKernelInputs")
+        # The warp-pipe win is on fp16/bf16 latency-bound addmm; skip other dtypes. dtype()
+        # defaults to input 0 = the bias for addmm, so check mat1 (the matrix operand) instead
+        # so an fp32 bias doesn't wrongly decline a bf16/fp16 addmm.
+        if kernel_inputs.dtype(kernel_inputs._mat1_idx) not in (
+                torch.float16,
+                torch.bfloat16,
+        ):
+            return
+        m, n, k = kernel_inputs.mnk_symbolic()
+        out_dtype = kernel_inputs.out_dtype()
+        sizevars = V.graph.sizevars
+        if not _warppipe_operands_fit_int32(kernel_inputs, per_batch=False):
+            return
+        # Col-major B only: a require_stride_order copy risks NameError at
+        # final render (P2561566366 S1; see adjust_kernel_inputs).
+        b_strides = kernel_inputs.strides_symbolic()[kernel_inputs._mat2_idx]
+        if not sizevars.statically_known_true(sympy.And(
+                sympy.Eq(b_strides[-2], 1),
+                sympy.Ge(b_strides[-1], 1),
+        )):
+            return
+        # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch), mirroring
+        # the bmm template: (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16) -> USE_ASYNC=1, the fast
+        # direct-to-LDS async_load warp-pipe (+ optional split-K). Otherwise (unaligned/odd/sliced/
+        # small or dynamic K, which the direct-to-LDS async_copy can't legalize on CDNA4) ->
+        # USE_ASYNC=0, the register-path fallback (tl.load->tl.dot, auto-pipelined, SPLIT_K=1) so
+        # those addmm shapes still get a Triton candidate instead of only aten (T280910119).
+        itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
+        use_async = sizevars.statically_known_true(sympy.Eq(sympy.Mod(k * itemsize, 16), 0))
+        num_xcds = _amd_num_xcds()
+        # split-K only helps grids that leave CUs idle. NUM_SMS is the device CU count
+        # (get_num_sms() maps to multi_processor_count = CUs on ROCm; 256 on gfx950/MI350X);
+        # a grid with fewer MN tiles than this is undersaturated and benefits from
+        # partitioning K across extra programs (summed by _reduce_k_kernel).
+        NUM_SMS = get_num_sms()
+        # split-K bypasses store_output's bias epilogue; the reduction re-adds only a
+        # plain bias (i.e. alpha*(A@B) + beta*bias with alpha=beta=1). Restrict split-K
+        # to that case -- unit-scalar addmm and plain mm both qualify. sympy Symbol == 1
+        # returns a plain False, so this stays safe for symbolic scalars.
+        scalars = getattr(kernel_inputs, "_scalars", None) or {}
+        # Split-K is opt-in via TORCHINDUCTOR_TLX_SPLIT_K=1 (default off). It was gated
+        # because autotune scored each addmm candidate on the GEMM kernel's own time only
+        # and excluded the separate reduce_k kernel, so a split-K TLX addmm could beat
+        # rocBLAS on the GEMM yet be net-slower e2e (HIM: split-K on 46.4K vs off 47.6K
+        # qps T2). TritonTemplateCaller.benchmark now charges every SPLIT_K > 1 candidate
+        # for its measured reducer (see _tlx_caller_benchmark and
+        # reduce_k.reduce_k_cost_ms), which removes that asymmetry -- the default flip is
+        # a follow-up so it can be A/B'd on its own. Correctness also requires
+        # alpha == beta == 1.
+        allow_split_k = (scalars.get("alpha", 1) == 1 and scalars.get("beta", 1) == 1
+                         and os.environ.get("TORCHINDUCTOR_TLX_SPLIT_K", "0") == "1")
+        m_hint = sizevars.optimization_hint(m, fallback=NUM_SMS)
+        n_hint = sizevars.optimization_hint(n, fallback=NUM_SMS)
+        for (
+                block_m,
+                block_n,
+                block_k,
+                group_m,
+                num_warps,
+                num_buffers,
+        ) in _warppipe_configs_for(self):
+            # MFMA requires block_m/block_n be multiples of matrix_instr_nonkdim (16).
+            if block_m % 16 != 0 or block_n % 16 != 0:
+                continue
+            if not _warppipe_tile_fits(
+                    block_m,
+                    block_n,
+                    block_k,
+                    num_buffers,
+                    elem_bytes=itemsize,
+                    use_async=use_async,
+                    persistent=self._WARPPIPE_PERSISTENT,
+            ):
+                continue
+            if use_async:
+                # async warp-pipeline correctness guard: K_ITERS > NUM_BUFFERS (well-formed
+                # prologue/drain). SPLIT_K=1 always; add split candidates for undersaturated grids
+                # only when each split still runs K_ITERS/SPLIT_K > NUM_BUFFERS iters (k > NB*BK*SK).
+                if not sizevars.statically_known_true(sympy.Gt(k, num_buffers * block_k)):
+                    continue
+                tiles = ((m_hint + block_m - 1) // block_m) * ((n_hint + block_n - 1) // block_n)
+                split_ks = [1]
+                if allow_split_k and tiles < NUM_SMS:
+                    for sk in (2, 4, 8):
+                        # Cap at ~4 waves (memory-bound large-K sweet spot is often >1 wave;
+                        # e.g. 1024x6144x22272 at SK=4 -> 768 wg / 3 waves).
+                        if tiles * sk > 4 * NUM_SMS:
+                            break
+                        # correctness: balanced K-partition gives each split base = K_ITERS // SK
+                        # iters; require base > NUM_BUFFERS (k > (NUM_BUFFERS+1)*BLOCK_K*SK).
+                        if sizevars.statically_known_true(sympy.Gt(k, (num_buffers + 1) * block_k * sk)):
+                            split_ks.append(sk)
+            else:
+                # register path: no prologue -> handles ANY K (odd/sliced/small/dynamic); no split-K
+                # (its reduction path is only wired for the async warp-pipe), so SPLIT_K=1 only.
+                split_ks = [1]
+            for split_k in split_ks:
+                triton_config = self.triton_config(
+                    # async is hand-pipelined (num_stages=1, auto software-pipelining off); the
+                    # register path relies on the auto-pipeliner (num_stages=3) to overlap tl.loads.
+                    1 if use_async else 3,
+                    num_warps,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=block_k,
+                    GROUP_M=group_m,
+                    NUM_BUFFERS=num_buffers,
+                    NUM_XCDS=num_xcds,
+                    SPLIT_K=split_k,
+                    USE_ASYNC=use_async,
+                    PREDRAIN_EPILOGUE_PREFETCH=int(self._PREDRAIN_EPILOGUE_PREFETCH),
+                    matrix_instr_nonkdim=16,
+                    waves_per_eu=0,
+                    kpack=get_default_kpack(block_k),
+                )
+                yield self._convert_config_to_template_kwargs(triton_config, m, n, k, out_dtype)
+
+
+@register_template_heuristic(gfx950_bmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="bmm")
+class Gfx950BMMWarpPipeConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
+    """TLX warp-pipelined bmm heuristic for ROCm (MI350X/gfx950).
+
+    Same warp-pipe core as the addmm (async_load prefetch into multi-buffered LDS + MFMA via
+    tlx.warp_pipeline_stage), plus a batch axis and a per-batch int64 base advance. No bias, no
+    col-major transpose (bmm B is [BATCH,K,N] row-major), no split-K -- a plain data-parallel
+    baseline for Inductor autotune iteration.
+
+    Dual path selected by K's 16-byte alignment (the template's USE_ASYNC constexpr):
+      * (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16): USE_ASYNC=1, the direct-to-LDS async_load
+        warp-pipe (needs K_ITERS = K // BLOCK_K >= NUM_BUFFERS for a well-formed prologue; the
+        K % BLOCK_K remainder is a sync-tail).
+      * otherwise (unaligned K -- the direct-to-LDS async_copy cannot legalize on CDNA4 -- or
+        dynamic K): USE_ASYNC=0, the register-path fallback (tl.load->tl.dot, auto-pipelined),
+        correct for ANY K (T280910119). Common gate (fp16/bf16 only): the
+        within-batch A/B element spans fit int32 (the within-batch offset is
+        int32 on both paths; the batch advance is int64).
+    """
+
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
+    WARPPIPE_CONFIGS = [
+        # BLOCK_K=32 tiles: the register-path (odd-K) winners. On the production
+        # compression bmm (1024x1195x2309, odd K -> register branch) the bare register
+        # prototype's autotune optimum is 256x256x32 (~0.80x hipBLASLt); the template
+        # previously offered only BLOCK_K in {64,128} and stalled at 256x256x64 (0.64x).
+        # Finer K granularity cuts the K%BLOCK_K tail waste and schedules the register
+        # path better. (NUM_BUFFERS is moot on the register path -- it allocates no LDS
+        # multi-buffer; matters only if the async branch selects these on an aligned-K
+        # shape, where LDS still fits gfx950's 160KB. resources.AMD_WARP_PIPE models
+        # both branches: AmdWarpPipeConfig(use_async=False) estimates 0 bytes.)
+        (256, 256, 32, 8, 8, 2),
+        (128, 256, 32, 8, 8, 2),
+        (256, 128, 32, 8, 8, 2),
+        (128, 128, 32, 8, 8, 3),
+        (256, 256, 64, 16, 8, 2),
+        (256, 128, 64, 8, 8, 2),
+        (128, 256, 64, 8, 8, 2),
+        (128, 128, 64, 8, 8, 3),
+        (128, 128, 128, 8, 8, 2),
+        (128, 64, 128, 8, 8, 3),
+        (64, 128, 64, 8, 8, 3),
+        (64, 64, 128, 8, 4, 3),
+        (64, 64, 64, 8, 4, 3),
+        (32, 128, 128, 4, 4, 3),
+        (32, 256, 128, 4, 4, 2),
+        (16, 256, 128, 4, 4, 3),
+    ]
+
+    WARPPIPE_CONFIGS_BY_ARCH = BMM_WARPPIPE_CONFIGS_BY_ARCH
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        import sympy
+        from torch._inductor.virtualized import V
+
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            raise AssertionError(f"{self.__class__.__name__} requires MMKernelInputs")
+        if kernel_inputs.dtype(kernel_inputs._mat1_idx) not in (
+                torch.float16,
+                torch.bfloat16,
+        ):
+            return
+        m, n, k = kernel_inputs.mnk_symbolic()
+        out_dtype = kernel_inputs.out_dtype()
+        sizevars = V.graph.sizevars
+        if not _warppipe_operands_fit_int32(kernel_inputs, per_batch=True):
+            return
+        # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch):
+        #  * (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16, 16-byte-aligned rows) -> USE_ASYNC=1, the
+        #    fast direct-to-LDS async_load warp-pipe.
+        #  * otherwise (e.g. odd K -- which the direct-to-LDS async_copy cannot legalize on CDNA4 --
+        #    or dynamic/unknown K, treated as unaligned) -> USE_ASYNC=0, the register-path fallback
+        #    (tl.load->registers->tl.dot, auto-pipelined; ~0.76x rocBLAS, T280910119). This is
+        #    correct for ANY K, so unaligned-K bmm still gets a Triton candidate rather than only aten.
+        itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
+        use_async = sizevars.statically_known_true(sympy.Eq(sympy.Mod(k * itemsize, 16), 0))
+        num_xcds = _amd_num_xcds()
+        for (
+                block_m,
+                block_n,
+                block_k,
+                group_m,
+                num_warps,
+                num_buffers,
+        ) in _warppipe_configs_for(self):
+            # MFMA requires block_m/block_n be multiples of matrix_instr_nonkdim (16).
+            if block_m % 16 != 0 or block_n % 16 != 0:
+                continue
+            if not _warppipe_tile_fits(
+                    block_m,
+                    block_n,
+                    block_k,
+                    num_buffers,
+                    elem_bytes=itemsize,
+                    use_async=use_async,
+            ):
+                continue
+            # async path only: its prologue prefetches NUM_BUFFERS full K-tiles, so require
+            # K_ITERS = K // BLOCK_K >= NB. The register path has no prologue -> it takes any K.
+            if use_async and not sizevars.statically_known_true(sympy.Ge(k, num_buffers * block_k)):
+                continue
+            triton_config = self.triton_config(
+                # async is hand-pipelined (num_stages=1, auto software-pipelining off); the register
+                # path relies on the auto-pipeliner (num_stages=3) to overlap its tl.loads.
+                1 if use_async else 3,
+                num_warps,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                GROUP_M=group_m,
+                NUM_BUFFERS=num_buffers,
+                NUM_XCDS=num_xcds,
+                USE_ASYNC=use_async,
+                matrix_instr_nonkdim=16,
+                waves_per_eu=0,
+                kpack=get_default_kpack(block_k),
+            )
+            yield self._convert_config_to_template_kwargs(triton_config, m, n, k, out_dtype)
+
+
+@register_template_heuristic(amd_bmm_shared_a_template.uid, "cuda", register=IS_ROCM, op_name="bmm")
+class ROCmBMMSharedATemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
+    """Validated gfx950 shared-LHS BMM configs.
+
+    This is deliberately a separate candidate from the general BMM warp-pipe.
+    It is only offered for row-major fp16 inputs whose mat1 batch stride is
+    zero, which is the shared-A contract the launch ordering relies on.
+    """
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        import sympy
+        from torch._inductor.virtualized import V
+
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            raise AssertionError(f"{self.__class__.__name__} requires MMKernelInputs")
+        if not _is_gfx950():
+            return
+        if (kernel_inputs.dtype(kernel_inputs._mat1_idx) != torch.float16
+                or kernel_inputs.dtype(kernel_inputs._mat2_idx) != torch.float16
+                or kernel_inputs.out_dtype() != torch.float16):
+            return
+
+        symbolic_shapes = kernel_inputs.shapes_symbolic()
+        symbolic_strides = kernel_inputs.strides_symbolic()
+        a_strides = symbolic_strides[kernel_inputs._mat1_idx]
+        b_strides = symbolic_strides[kernel_inputs._mat2_idx]
+        if (len(a_strides) != 3 or len(b_strides) != 3):
+            return
+
+        m, n, k = kernel_inputs.mnk_symbolic()
+        out_dtype = kernel_inputs.out_dtype()
+        sizevars = V.graph.sizevars
+        dense_shared_a_b = sympy.And(
+            sympy.Eq(a_strides[0], 0),
+            sympy.Eq(a_strides[1], k),
+            sympy.Eq(a_strides[2], 1),
+            sympy.Eq(b_strides[0], k * n),
+            sympy.Eq(b_strides[1], n),
+            sympy.Eq(b_strides[2], 1),
+        )
+        if not sizevars.statically_known_true(dense_shared_a_b):
+            return
+
+        # `tt.pointer_range=32` is what lets AMD lowering use buffer operations
+        # for the non-affine chip mapping below.  Match Inductor's own 32-bit
+        # indexing contract before adding that specialization: every logical
+        # input span and the contiguous output must fit in signed 32-bit bytes.
+        # Requiring a static proof also keeps dynamic/very-large batches on the
+        # generic BMM path rather than speculating from an example-size hint.
+        a_shape = symbolic_shapes[kernel_inputs._mat1_idx]
+        b_shape = symbolic_shapes[kernel_inputs._mat2_idx]
+        a_stride = a_strides
+        b_stride = b_strides
+        a_span = _storage_span_elems(a_shape, a_stride)
+        b_span = _storage_span_elems(b_shape, b_stride)
+        if a_span is None or b_span is None:
+            return
+        batch = a_shape[0]
+        int32_max = torch.iinfo(torch.int32).max
+        pointer_range_is_32bit = sympy.And(
+            *(sympy.Ge(step, 0) for step in (*a_stride, *b_stride)),
+            sympy.Le(2 * a_span, int32_max),
+            sympy.Le(2 * b_span, int32_max),
+            sympy.Le(2 * batch * m * n, int32_max),
+        )
+        if not sizevars.statically_known_true(pointer_range_is_32bit):
+            return
+
+        configs = (
+            # kind, M, N, K, BM, BN, BK, batch group, warps, MI non-K dim,
+            # scheduling enabled, dwordx4 cover, required region count,
+            # reverse local assignment, disable high-RP reschedule
+            # Inductor specializes sizes and strides into the template IR.
+            # Preserve the schedules measured on that shorter dependency graph
+            # instead of copying the standalone JIT schedules mechanically.
+            (40, 40, 256, 1956, 64, 256, 32, 64, 4, 32, False, 4, 0, False, False),
+            (262, 262, 256, 294, 144, 256, 32, 256, 4, 16, True, 6, 0, False, False),
+            (448, 448, 160, 931, 224, 160, 32, 256, 4, 16, True, 2, 0, False, False),
+            (1195, 1195, 256, 2309, 256, 256, 64, 64, 4, 16, True, 4, 4, True, True),
+        )
+        for (
+                kind,
+                expected_m,
+                expected_n,
+                expected_k,
+                block_m,
+                block_n,
+                block_k,
+                batch_group,
+                num_warps,
+                matrix_instr_nonkdim,
+                enable_schedule,
+                cover,
+                required_regions,
+                reverse_local_assignment,
+                disable_high_rp_reschedule,
+        ) in configs:
+            matches = sympy.And(
+                sympy.Eq(m, expected_m),
+                sympy.Eq(n, expected_n),
+                sympy.Eq(k, expected_k),
+            )
+            if not sizevars.statically_known_true(matches):
+                continue
+            triton_config = self.triton_config(
+                1,
+                num_warps,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                BATCH_GROUP=batch_group,
+                KERNEL_KIND=kind,
+                matrix_instr_nonkdim=matrix_instr_nonkdim,
+                waves_per_eu=0,
+                kpack=get_default_kpack(block_k),
+                enable_sched_group_barrier_scheduler=enable_schedule,
+                sched_group_barrier_mfma_per_dwordx4=cover,
+                sched_group_barrier_required_region_count=required_regions,
+                reverse_local_assignment=reverse_local_assignment,
+                sink_insts_to_avoid_spills=kind == 1195,
+                regclass_priority_trumps_globalness=kind == 1195,
+                disable_unclustered_high_rp_reschedule=disable_high_rp_reschedule,
+                inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+            )
+            yield self._convert_config_to_template_kwargs(triton_config, m, n, k, out_dtype)
+            return
+
+
+@register_template_heuristic(
+    gfx950_addmm_persistent_warppipe_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class Gfx950AddMMPersistentWarpPipeConfigHeuristic(Gfx950AddMMWarpPipeConfigHeuristic):
+    """Persistent variant of the AMD warp-pipe addmm heuristic (MI350X / gfx950).
+
+    Reuses the per-tile heuristic's col-major-B ``adjust_kernel_inputs``, the
+    fp16/bf16 + int32-offset gating, the ``K_ITERS > NUM_BUFFERS`` correctness guard,
+    and the tuned ``WARPPIPE_CONFIGS`` pool. The only delta is that the persistent
+    template's grid (``_persistent_mm_grid_split_k``) is capped at NUM_SMS, so NUM_SMS
+    must be threaded into the template kwargs (it becomes a constexpr; the kernel
+    strides over output tiles by it).
+    """
+
+    _WARPPIPE_PERSISTENT = True
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        num_sms = get_num_sms()
+        for template_kwargs in super()._get_template_configs_impl(kernel_inputs, op_name):
+            # Pre-drain prefetch currently fails WarpPipeliner validation for
+            # the three-buffer persistent schedule. Preserve that GEMM
+            # candidate but leave its epilogue load after the drain. The
+            # validated two-buffer path remains eligible for prefetching.
+            if template_kwargs["NUM_BUFFERS"] != 2:
+                template_kwargs["PREDRAIN_EPILOGUE_PREFETCH"] = 0
+            yield {**template_kwargs, "NUM_SMS": num_sms}
+
+
+@register_template_heuristic(
+    blackwell_gemm_ws_template.uid,
+    "cuda",
+    register=not IS_ROCM,
+)
+class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuristic):
+    """
+    Blackwell TLX Warp-Specialized GEMM template from tritonbench.
+
+    Uses MMA groups and persistent kernel for optimized performance on Blackwell GPUs.
+    """
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        """
+        Override to allow TLX templates to run without max_autotune when tlx_mode is set,
+        and to decline operands the template's TMA descriptors cannot describe.
+
+        The input descriptors and the contiguous output descriptor must satisfy
+        TMA's size, stride, and pointer alignment requirements.
+        """
+        if self._has_unsupported_layout(inputs):
+            log.debug("TLX blackwell_gemm_ws declined: unsupported TMA layout")
+            return False
+        if self._has_unsupported_fp32_operands(inputs):
+            log.debug("TLX blackwell_gemm_ws declined: FP32 operands need TF32 and K-major layouts")
+            return False
+        if config.triton.tlx_mode in ("allow", "force"):
+            return True
+        return super().should_run(inputs)
+
+    def _get_extra_config_key_and_kwargs(self, conf: GemmConfig) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        return get_tlx_config_key_and_kwargs(conf)
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Autotuning configs for "allow" mode: these compete alongside the heuristic
+        # config against cublas/triton. Selected via benchmarking on representative
+        # workloads — only configs that beat cublas for at least one shape are included.
+        # Tuple format: (BM, BN, BK, smem_num, tmem_num, num_mma_groups, epilogue_subtile, num_ctas)
+        # Upstream TLX candidate table — used as the autotuning pool.
+        # Format: (BM, BN, BK, smem_num, tmem_num, mma_groups, subtile, num_ctas)
+        _AUTOTUNE_CONFIGS = [
+            (256, 128, 128, 2, 2, 2, 1, 2),
+            (256, 256, 64, 3, 1, 2, 4, 1),
+            (128, 64, 128, 4, 3, 2, 1, 1),
+            (256, 128, 64, 5, 2, 2, 4, 2),
+            (128, 256, 64, 4, 2, 1, 2, 2),
+            (256, 64, 128, 5, 2, 2, 4, 2),
+            (128, 64, 128, 5, 2, 2, 1, 2),
+            (256, 64, 128, 5, 2, 2, 8, 1),
+            (128, 256, 64, 3, 2, 1, 2, 1),
+            (128, 128, 64, 4, 2, 1, 2, 1),
+            (256, 128, 64, 3, 1, 2, 2, 1),
+            (128, 64, 64, 5, 2, 1, 1, 1),
+            (64, 128, 64, 5, 2, 1, 1, 1),
+            (64, 64, 64, 6, 2, 1, 1, 1),
+        ]
+        self.mm_configs = [
+            TlxGemmConfig(
+                BM,
+                BN,
+                BK,
+                1,  # num_stages
+                4,  # num_warps
+                group_size_m=8,
+                smem_num=s,
+                tmem_num=t,
+                num_mma_groups=m,
+                epilogue_subtile=subtile,
+                num_ctas=num_ctas,
+                split_k=1,
+            )
+            for BM, BN, BK, s, t, m, subtile, num_ctas in _AUTOTUNE_CONFIGS
+            # Prune invalid configs based on hardware constraints
+            if BlackwellGemmWSConfigMixin._is_valid_config(
+                block_m=BM,
+                block_n=BN,
+                block_k=BK,
+                num_smem_buffers=s,
+                num_tmem_buffers=t,
+                num_mma_groups=m,
+                num_ctas=num_ctas,
+                epilogue_subtile=subtile,
+            )
+        ]
+
+
+# Export backend options owned by the optional TLX integration.
+tlx_only_cuda_options = ["ctas_per_cga"]
+tlx_only_hip_options = ["matrix_instr_nonkdim", "waves_per_eu", "kpack"]
+
+
+def get_tlx_config_key_and_kwargs(conf: GemmConfig, ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """
+    Extract TLX-specific key fields and kwargs from a TlxGemmConfig.
+
+    Returns:
+        A tuple of (key_fields, kwargs) where:
+        - key_fields: tuple of TLX-specific fields to add to deduplication key
+        - kwargs: dict of TLX-specific kwargs to add to TritonConfig
+
+    If the config is not a TlxGemmConfig, returns empty tuple and empty dict.
+    """
+    if not isinstance(conf, TlxGemmConfig):
+        return (), {}
+
+    key_fields = (
+        conf.group_size_m,
+        conf.smem_num,
+        conf.tmem_num,
+        conf.epilogue_subtile,
+        conf.num_mma_groups,
+        conf.num_ctas,
+        conf.split_k,
+        conf.interleave_epilogue,
+    )
+    kwargs = {
+        "GROUP_SIZE_M": conf.group_size_m,
+        "NUM_SMEM_BUFFERS": conf.smem_num,
+        "NUM_TMEM_BUFFERS": conf.tmem_num,
+        "EPILOGUE_SUBTILE": conf.epilogue_subtile,
+        "NUM_MMA_GROUPS": conf.num_mma_groups,
+        "NUM_CTAS": conf.num_ctas,
+        "SPLIT_K": conf.split_k,
+        "INTERLEAVE_EPILOGUE": conf.interleave_epilogue,
+    }
+    return key_fields, kwargs
+
+
+# Use a factory to defer the import of TLXInductorChoices, avoiding
+# circular import: template_heuristics/__init__ -> tlx -> choices ->
+# InductorChoices -> template_heuristics/__init__
+def _tlx_choices_factory():
+    from .choices import TLXInductorChoices
+
+    return TLXInductorChoices()
+
+
+config.inductor_choices_class = _tlx_choices_factory
+
+# ---------------------------------------------------------------------------
+# Override TritonTemplateKernel to support async TMA store (TLX-specific).
+#
+# async_tma_store is not exposed in OSS.  The TMA_EPILOGUE_STORE template
+# kwarg (set by _get_template_configs_impl above) flows through the meta
+# dict.  The overrides below extract it in __init__, set the store mode in
+# store_output, and dispatch to the TLX codegen in store.
+# ---------------------------------------------------------------------------
+
+# TritonTemplate renders every config kwarg as a source-level constexpr, but
+# these AMD controls are also backend options consumed by triton.compile.  They
+# therefore do not appear in the runtime Config.kwargs that upstream's generic
+# backend-option extraction sees.  Copy the values from Inductor's preserved
+# template config into the dedicated backend_options dictionary.
+_TLX_AMD_BACKEND_OPTIONS = (
+    "matrix_instr_nonkdim",
+    "waves_per_eu",
+    "kpack",
+    "enable_sched_group_barrier_scheduler",
+    "sched_group_barrier_mfma_per_dwordx4",
+    "sched_group_barrier_required_region_count",
+    "reverse_local_assignment",
+    "sink_insts_to_avoid_spills",
+    "regclass_priority_trumps_globalness",
+    "disable_unclustered_high_rp_reschedule",
+)
+
+
+def _update_tlx_amd_compile_meta(compile_meta, config_args, device_type):
+    backend_options = dict(compile_meta.get("backend_options", {}))
+    for name in _TLX_AMD_BACKEND_OPTIONS:
+        if name in config_args:
+            backend_options[name] = config_args[name]
+
+    pointer_range_args = config_args.get("inductor_32bit_pointer_range", ())
+    backend_options.pop("inductor_32bit_pointer_range", None)
+    compile_meta["backend_options"] = backend_options
+    if device_type != "hip" or not pointer_range_args:
+        return compile_meta
+
+    signature = compile_meta["signature"]
+    pointer_range_names = set()
+    for arg_pattern in pointer_range_args:
+        matches = ([name for name in signature if name.startswith(arg_pattern[:-1])]
+                   if arg_pattern.endswith("*") else [arg_pattern] if arg_pattern in signature else [])
+        if len(matches) != 1:
+            raise AssertionError(f"expected one signature argument for {arg_pattern}, got {matches}")
+        pointer_range_names.add(matches[0])
+
+    specialization = compile_meta["configs"][0]
+    for index, (name, ty) in enumerate(signature.items()):
+        if name not in pointer_range_names:
+            continue
+        if not isinstance(ty, str) or not ty.startswith("*"):
+            raise AssertionError(f"{name} must be a pointer argument, got {ty}")
+        attrs = specialization.setdefault((index, ), [])
+        if ["tt.pointer_range", 32] not in attrs:
+            attrs.append(["tt.pointer_range", 32])
+    return compile_meta
+
+
+if not hasattr(CachingAutotuner, "_tlx_amd_backend_options"):
+    _orig_create_compile_meta = CachingAutotuner._create_compile_meta
+
+    def _tlx_create_compile_meta(self, cfg):  # type: ignore[no-untyped-def]
+        compile_meta = _orig_create_compile_meta(self, cfg)
+        config_args = self.inductor_meta.get("config_args", {})
+        return _update_tlx_amd_compile_meta(compile_meta, config_args, self.device_props.type)
+
+    CachingAutotuner._create_compile_meta = _tlx_create_compile_meta
+    CachingAutotuner._tlx_amd_backend_options = True
+
+# -- generate: inject split-K workspace_arg via the standard mechanism ------
+# The workspace_arg must flow through generate() so the autotuning benchmark
+# allocates the workspace tensor.  Creating it in __init__ is too late —
+# generate() has already captured workspace_arg=None for the benchmark request.
+_orig_tt_generate = TritonTemplate.generate
+_WARNED_NO_REDUCE_K_HINT = False
+
+
+def _tlx_tt_generate(self, input_nodes, layout, *args, **kwargs):  # type: ignore[no-untyped-def]
+    split_k = int(kwargs.get("SPLIT_K", 1))
+    if split_k > 1:
+        from torch._inductor.codegen.common import WorkspaceArg, WorkspaceZeroMode
+
+        # SPLIT_K > 1 forces TMA_EPILOGUE_STORE=0, so the TMA descriptor
+        # workspace (ws_ptr) from TMAWorkspaceMixin is unused.  Replace it
+        # with the split-K fp32 partial-results workspace.
+        # UNINITIALIZED (no zero-fill): every valid output element is written exactly
+        # once -- one (tile, split) program per element, masked to [0,M)x[0,N) -- and
+        # _reduce_k_kernel reads with the same mask, so a zeroed workspace is
+        # unnecessary. ZERO_ON_CALL here would re-zero the full SPLIT_K*M*N fp32 buffer
+        # every call (tens of MB), which dominates and erased the split-K win.
+        kwargs["workspace_arg"] = WorkspaceArg(
+            count=split_k * layout.size[0] * layout.size[1],
+            zero_mode=WorkspaceZeroMode.UNINITIALIZED,
+            device=layout.device,
+            outer_name=WorkspaceArg.unique_name("workspace_split_k_"),
+            inner_name="split_k_ws",
+            dtype=torch.float32,
+        )
+    choice = _orig_tt_generate(self, input_nodes, layout, *args, **kwargs)
+    if choice is not None:
+        choice._tlx_row_partials = getattr(self, "tlx_row_partials", False)
+    if split_k > 1 and choice is not None:
+        # Tag the ChoiceCaller so benchmark() can add the reducer's cost to this
+        # candidate's score; see _tlx_caller_benchmark. optimization_hint (not int())
+        # because the layout dims can be symbolic under dynamic shapes -- autotune
+        # benchmarks at the hint, so the reducer is costed at the same shape.
+        choice._tlx_split_k = split_k
+        try:
+            from torch._inductor.virtualized import V
+
+            sizevars = V.graph.sizevars
+            choice._tlx_reduce_k_shape = (
+                int(sizevars.optimization_hint(layout.size[0])), int(sizevars.optimization_hint(layout.size[1])),
+                layout.dtype, len(input_nodes) >= 3,  # addmm carries a bias the reducer must add
+            )
+        except Exception as e:
+            # No usable hint -> leave the candidate uncharged rather than fail the
+            # lowering; it just keeps the old GEMM-only score. Warn once: there is one
+            # choice per tile config, so per-choice logging buries the message.
+            global _WARNED_NO_REDUCE_K_HINT
+            if not _WARNED_NO_REDUCE_K_HINT:
+                _WARNED_NO_REDUCE_K_HINT = True
+                log.warning(
+                    "split-K reducer costing disabled (candidates keep the old "
+                    "GEMM-kernel-only score): %s",
+                    e,
+                )
+            choice._tlx_reduce_k_shape = None
+    return choice
+
+
+TritonTemplate.generate = _tlx_tt_generate  # type: ignore[method-assign]
+
+# -- benchmark: charge split-K candidates for their reduce_k tail ------------
+# Autotune scores a template candidate on the GEMM kernel alone. A SPLIT_K > 1
+# candidate is not done when that kernel ends -- _reduce_k_kernel still has to sum
+# the fp32 partials, add the bias and write the output -- but it is compared against
+# SPLIT_K=1 candidates that have no such tail. That asymmetry is what let split-K win
+# selection while losing e2e (HIM: split-K on 46.4K vs off 47.6K qps T2, D114632771),
+# and is why the candidates were gated off by default. Adding the reducer here makes
+# the comparison apples-to-apples so the gate can default on.
+#
+# This is unconditional on purpose: the uncharged score is not a different policy, it
+# is a wrong number, so there is no configuration in which it is the one you want.
+# TORCHINDUCTOR_TLX_SPLIT_K=0 remains the kill switch -- it drops the split-K
+# candidates outright, which is the honest fallback if this costing ever misbehaves.
+_orig_caller_benchmark = TritonTemplateCaller.benchmark
+
+
+def _tlx_caller_benchmark(self, *args, out):  # type: ignore[no-untyped-def]
+    timing = _orig_caller_benchmark(self, *args, out=out)
+    split_k = getattr(self, "_tlx_split_k", 1)
+    shape = getattr(self, "_tlx_reduce_k_shape", None)
+    if split_k > 1 and shape is not None and _math.isfinite(timing):
+        from triton.language.extra.tlx.inductor.reduce_k import reduce_k_cost_ms
+
+        m, n, dtype, has_bias = shape
+        timing += reduce_k_cost_ms(m, n, split_k, dtype, has_bias)
+    return timing
+
+
+TritonTemplateCaller.benchmark = _tlx_caller_benchmark  # type: ignore[method-assign]
+
+# -- __init__: extract TMA_EPILOGUE_STORE from meta, set tma_store=True -----
+_orig_ttk_init = TritonTemplateKernel.__init__
+
+
+def _tlx_ttk_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+    meta = kwargs.get("meta", {})
+    async_tma_store = bool(meta.get("TMA_EPILOGUE_STORE", 0))
+    split_k = int(meta.get("SPLIT_K", 1))
+    if async_tma_store:
+        kwargs["tma_store"] = True
+
+    _orig_ttk_init(self, *args, **kwargs)
+    self.async_tma_store = async_tma_store
+    self._tlx_split_k = split_k
+    self._tlx_predrain_prefetches = {}
+    self._tlx_current_subgraph_name = None
+
+
+TritonTemplateKernel.__init__ = _tlx_ttk_init  # type: ignore[method-assign]
+
+# -- store_output: accept async_tma_store_buf_idx, set mode="async_tma" -----
+_orig_store_output = TritonTemplateKernel.store_output
+_orig_set_subgraph_body = TritonTemplateKernel.set_subgraph_body
+
+
+@contextlib.contextmanager
+def _tlx_set_subgraph_body(self, body_name):  # type: ignore[no-untyped-def]
+    """Restore TLX-specific state for one deferred store subgraph."""
+    previous_output_layout = getattr(self, "_tlx_output_layout", None)
+    previous_store_cache = getattr(self, "_tlx_store_cache", None)
+    previous_subgraph_name = getattr(self, "_tlx_current_subgraph_name", None)
+    self._tlx_current_subgraph_name = body_name
+    layouts = getattr(self, "_tlx_output_layout_by_subgraph", {})
+    if body_name in layouts:
+        self._tlx_output_layout = layouts[body_name]
+    store_caches = getattr(self, "_tlx_store_cache_by_subgraph", {})
+    if body_name in store_caches:
+        self._tlx_store_cache = store_caches[body_name]
+    try:
+        with _orig_set_subgraph_body(self, body_name):
+            # TritonTemplate's range tree is shared by store_output hooks. Keep
+            # the fix local to TLX stores carrying an explicit output layout:
+            # restore the coordinate names captured for this fragment before
+            # Inductor lowers its fused epilogue.
+            index_states = getattr(self, "_tlx_output_indices_by_subgraph", {})
+            if body_name in index_states:
+                names, lengths = index_states[body_name]
+                entries = self.range_trees[0].construct_entries(lengths)
+                if len(entries) != len(names):
+                    raise AssertionError("TLX output index rank does not match output rank")
+                for name, entry in zip(names, entries):
+                    old_symbol = entry.symbol()
+                    entry.set_name(name)
+                    if self.range_tree_nodes.get(old_symbol) is entry:
+                        del self.range_tree_nodes[old_symbol]
+                    self.range_tree_nodes[entry.symbol()] = entry
+            yield
+    finally:
+        self._tlx_output_layout = previous_output_layout
+        self._tlx_store_cache = previous_store_cache
+        self._tlx_current_subgraph_name = previous_subgraph_name
+
+
+TritonTemplateKernel.set_subgraph_body = _tlx_set_subgraph_body  # type: ignore[method-assign]
+
+
+def _tlx_store_output(  # type: ignore[no-untyped-def]
+    self,
+    *args,
+    async_tma_store_buf_idx=None,
+    output_layout=None,
+    store_cache=None,
+    prefetched_epilogue=None,
+    **kwargs,
+):
+    if getattr(self, "async_tma_store", False):
+        if async_tma_store_buf_idx is not None:
+            V.kernel.async_tma_store_buf_idx = async_tma_store_buf_idx
+        # Signal the store override to use async TMA mode instead of
+        # the regular TMA mode that OSS store_output will select.
+        self._tlx_async_tma_store_active = True
+    previous_output_layout = getattr(self, "_tlx_output_layout", None)
+    previous_store_cache = getattr(self, "_tlx_store_cache", None)
+    self._tlx_output_layout = output_layout
+    self._tlx_store_cache = store_cache
+    try:
+        if not hasattr(V.interpreter, "current_node") and hasattr(V.graph, "current_node"):
+            # Template choices can be materialized during GraphLowering, before
+            # the separate interpreter virtual is installed. CSEProxy still
+            # needs the active FX node while rendering the addmm epilogue.
+            with V.set_interpreter_handler(V.graph):
+                body_name = _orig_store_output(self, *args, **kwargs)
+        else:
+            body_name = _orig_store_output(self, *args, **kwargs)
+        if prefetched_epilogue is not None:
+            request = self._tlx_predrain_prefetches.get(prefetched_epilogue)
+            if request is not None:
+                request["subgraph_name"] = body_name
+                request["load_names"] = _tlx_eligible_predrain_loads(
+                    self,
+                    body_name,
+                    request["max_operands"],
+                )
+        if output_layout is not None:
+            layouts = getattr(self, "_tlx_output_layout_by_subgraph", None)
+            if layouts is None:
+                layouts = self._tlx_output_layout_by_subgraph = {}
+            layouts[body_name] = output_layout
+            block_indexing = kwargs.get("block_indexing", args[5] if len(args) > 5 else False)
+            if not block_indexing:
+                index_states = getattr(self, "_tlx_output_indices_by_subgraph", None)
+                if index_states is None:
+                    index_states = self._tlx_output_indices_by_subgraph = {}
+                index_states[body_name] = (
+                    tuple(self.template_indices),
+                    tuple(V.graph.sizevars.simplify(s) for s in self.output_node.get_size()),
+                )
+        if store_cache is not None:
+            store_caches = getattr(self, "_tlx_store_cache_by_subgraph", None)
+            if store_caches is None:
+                store_caches = self._tlx_store_cache_by_subgraph = {}
+            store_caches[body_name] = store_cache
+        return body_name
+    finally:
+        self._tlx_async_tma_store_active = False
+        self._tlx_output_layout = previous_output_layout
+        self._tlx_store_cache = previous_store_cache
+
+
+# Jinja template_env uses fn.__name__ to build the dict key — preserve it.
+_tlx_store_output.__name__ = "store_output"
+TritonTemplateKernel.store_output = _tlx_store_output  # type: ignore[method-assign]
+
+
+def _tlx_eligible_predrain_loads(self, subgraph_name, max_operands):  # type: ignore[no-untyped-def]
+    """Return conservative external tensor reads eligible for early issue."""
+    from torch._inductor.dependencies import MemoryDep
+
+    if (not self.meta.get("PREDRAIN_EPILOGUE_PREFETCH", 0) or getattr(self, "_tlx_split_k", 1) != 1
+            or max_operands != 1):
+        return ()
+
+    prefix = "<STORE_OUTPUT_"
+    if not (subgraph_name.startswith(prefix) and subgraph_name.endswith(">")):
+        return ()
+    subgraph_idx = int(subgraph_name[len(prefix):-1])
+    nodes = getattr(self, "_epilogue_nodes_by_subgraph", {}).get(subgraph_idx, ())
+    if not nodes:
+        return ()
+
+    produced = {self.output_node.get_name()}
+    writes = set()
+    for node in nodes:
+        ir_node = node.node
+        if getattr(ir_node, "get_reduction_type", lambda: None)() is not None:
+            return ()
+        if ir_node.get_mutation_names() or ir_node.get_inputs_that_alias_output():
+            return ()
+        produced.update(node.get_buffer_names())
+        writes.update(dep.name for dep in node.read_writes.writes)
+    produced.update(writes)
+
+    candidates = []
+    seen = set()
+    for node in nodes:
+        for dep in node.read_writes.reads:
+            if not isinstance(dep, MemoryDep) or dep.name in produced:
+                continue
+            if dep.name in seen:
+                # Multiple accesses to one operand can carry different indices;
+                # the initial contract admits exactly one pure load operation.
+                return ()
+            if (dep.mode is not None or dep.is_indirect() or dep.name in writes or dep.name in V.graph.mutated_buffers
+                    or len(dep.var_names) > 2):
+                return ()
+            seen.add(dep.name)
+            candidates.append(dep)
+
+    if len(candidates) != 1:
+        return ()
+
+    dep = candidates[0]
+    if V.graph.get_dtype(dep.name) not in (torch.float16, torch.bfloat16):
+        return ()
+    output_numel = V.graph.sizevars.optimization_hint(sympy.prod(self.output_node.get_size()), fallback=0)
+    accessed_numel = dep.numel_hint()
+    if not output_numel or not accessed_numel or accessed_numel > output_numel:
+        return ()
+
+    # Bound the worst-case live range to 128 fp32 values per lane. Broadcast
+    # operands consume fewer registers than this full-tile upper bound.
+    block_m = int(self.meta.get("BLOCK_M", 0))
+    block_n = int(self.meta.get("BLOCK_N", 0))
+    lanes = max(int(self.num_warps) * 64, 1)
+    if not block_m or not block_n or (block_m * block_n + lanes - 1) // lanes > 128:
+        return ()
+    return (dep.name, )
+
+
+def _tlx_prefetch_epilogue(  # type: ignore[no-untyped-def]
+    self,
+    indices,
+    *,
+    key,
+    max_operands=1,
+    mask=None,
+    val_shape=None,
+    fallback_ptr=None,
+    indent_width=4,
+):
+    """Register a pre-drain hook paired with a later ``store_output`` call."""
+    if not isinstance(key, str) or not key:
+        raise AssertionError("prefetch_epilogue key must be a non-empty string")
+    if key in self._tlx_predrain_prefetches:
+        raise AssertionError(f"duplicate prefetch_epilogue key: {key}")
+    if not isinstance(indices, (list, tuple)) or not isinstance(mask, (str, type(None))):
+        raise AssertionError("prefetch_epilogue requires template indices and an optional mask")
+    if val_shape is not None and not isinstance(val_shape, tuple):
+        raise AssertionError("prefetch_epilogue val_shape must be a tuple or None")
+    if not isinstance(fallback_ptr, str) or not fallback_ptr:
+        raise AssertionError("prefetch_epilogue requires a fallback pointer")
+
+    hook_name = f"<TLX_PREFETCH_EPILOGUE_{key}>"
+    request = {
+        "max_operands": max_operands,
+        "key": key,
+        "fallback_ptr": fallback_ptr,
+        "subgraph_name": None,
+        "load_names": (),
+        "ptr": None,
+        "mask": None,
+    }
+    self._tlx_predrain_prefetches[key] = request
+
+    def hook():
+        code = IndentedBuffer()
+        enabled = request["ptr"] is not None
+        if enabled:
+            subgraph = self.subgraph_bodies[request["subgraph_name"]]
+            xindex_lines = [
+                line for line in subgraph.body.getvalue().splitlines() if line.strip().startswith("xindex = ")
+            ]
+            if len(xindex_lines) != 1:
+                raise AssertionError("prefetched epilogue requires one output index assignment")
+            code.writeline(xindex_lines[0].strip())
+            code.writeline(f"# TorchTLX pre-drain epilogue prefetch: {key}")
+        code.writeline(f"tlx_predrain_ptr_{key} = "
+                       f"{request['ptr'] if enabled else request['fallback_ptr']}")
+        code.writeline(f"tlx_predrain_mask_{key} = {request['mask'] if enabled else 'False'}")
+        code.writeline(f"tlx_predrain_enabled_{key}: tl.constexpr = {enabled}")
+        result = code.getvalue().strip()
+        if indent_width:
+            result = "\n".join((" " * indent_width + line) if line else line for line in result.splitlines())
+        return result.strip()
+
+    return self._register_hook(hook_name, hook)
+
+
+_tlx_prefetch_epilogue.__name__ = "prefetch_epilogue"
+TritonTemplateKernel.prefetch_epilogue = _tlx_prefetch_epilogue  # type: ignore[attr-defined]
+
+_orig_tk_load = TritonTemplateKernel.load
+
+
+def _tlx_load(self, name, index):  # type: ignore[no-untyped-def]
+    """Route one eligible epilogue load into its paired pre-drain hook."""
+    subgraph_name = getattr(self, "_tlx_current_subgraph_name", None)
+    request = next(
+        (candidate for candidate in self._tlx_predrain_prefetches.values()
+         if candidate["subgraph_name"] == subgraph_name and name in candidate["load_names"]),
+        None,
+    )
+    if request is None:
+        return _orig_tk_load(self, name, index)
+
+    redirected = tuple(IndentedBuffer() for _ in range(4))
+    old_buffers = self.body, self.indexing_code, self.loads, self.compute
+    self.body, self.indexing_code, self.loads, self.compute = redirected
+    try:
+        result = _orig_tk_load(self, name, index)
+    finally:
+        self.body, self.indexing_code, self.loads, self.compute = old_buffers
+
+    emitted = [line.strip() for buffer in redirected for line in buffer.getvalue().splitlines() if line.strip()]
+    load_lines = [line for line in emitted if "= tl.load(" in line]
+    if len(emitted) != 1 or len(load_lines) != 1:
+        # The initial implementation only moves a single direct load. Restore
+        # anything more involved to the ordinary epilogue position.
+        for destination, source in zip(old_buffers, redirected):
+            destination.splice(source)
+        request["load_names"] = ()
+        return result
+
+    load_line = load_lines[0]
+    load_start = load_line.index("tl.load(") + len("tl.load(")
+    depth = 0
+    load_end = None
+    for offset, char in enumerate(load_line[load_start:], start=load_start):
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            if char == ")" and depth == 0:
+                load_end = offset
+                break
+            depth -= 1
+    if load_end is None:
+        for destination, source in zip(old_buffers, redirected):
+            destination.splice(source)
+        request["load_names"] = ()
+        return result
+
+    arguments = load_line[load_start:load_end]
+    parts = []
+    start = 0
+    depth = 0
+    for offset, char in enumerate(arguments):
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(arguments[start:offset].strip())
+            start = offset + 1
+    parts.append(arguments[start:].strip())
+    if len(parts) < 2 or parts[1].startswith(("other=", "eviction_policy=")):
+        for destination, source in zip(old_buffers, redirected):
+            destination.splice(source)
+        request["load_names"] = ()
+        return result
+
+    request["ptr"] = parts[0]
+    request["mask"] = parts[1].removeprefix("mask=")
+    self.loads.writeline(f"{result} = tlx_prefetched_{request['key']}")
+    return result
+
+
+TritonTemplateKernel.load = _tlx_load  # type: ignore[method-assign]
+
+# -- store: intercept TMA mode when async TMA is active --------------------
+_orig_tk_store = TritonTemplateKernel.store
+
+
+def _tlx_store(self, name, index, value, mode=None):  # type: ignore[no-untyped-def]
+    output_layout = getattr(self, "_tlx_output_layout", None)
+    if mode is None and output_layout is not None:
+        # Explicitly laid-out TLX accumulators (for example an AMD MFMA
+        # accumulator) cannot be stored through Inductor's default blocked
+        # pointer encoding.  Keep the normal store_output epilogue generation,
+        # then align its final pointer, value, and mask at the store boundary.
+        var = self.args.output(name)
+        indexing = self.indexing(
+            index,
+            dense_indexing=True,
+            block_ptr=False,
+            tma_compatibility_checker=None,
+        )
+        if not hasattr(indexing, "index_str"):
+            raise AssertionError("output_layout requires tensor indexing")
+        if self._has_stride1_on_rdim(indexing.index):
+            self.stores_with_contiguous_rdim.append(name)
+        if name in self.args.inplace_buffers and self.is_broadcasted(index):
+            self.stores.writeline(DeferredLine(name, "tl.debug_barrier()"))
+
+        ptr = (f"tlx.require_layout({var} + ({indexing.index_str}), "
+               f"{output_layout}, pin=False)")
+        stored_value = (f"tlx.require_layout({value}, {output_layout}, pin=False)")
+        mask = indexing.mask_str
+        if mask != "None":
+            mask = f"tlx.require_layout({mask}, {output_layout}, pin=False)"
+        store_cache = getattr(self, "_tlx_store_cache", None)
+        cache_arg = (f", cache_modifier={store_cache!r}" if store_cache is not None else "")
+        self.stores.writeline(DeferredLine(
+            name,
+            f"tl.store({ptr}, {stored_value}, {mask}{cache_arg})",
+        ))
+        if not self.inside_reduction:
+            self.outside_loop_vars.add(value)
+        return
+    if mode == "tma" and getattr(self, "_tlx_async_tma_store_active", False):
+        # Redirect from regular TMA store to async TMA store.
+        var = self.args.output(name)
+        original_index = index
+        dtype = V.graph.get_dtype(name)
+
+        tma_compatibility_checker = self.tma_compatibility_checker_cls(
+            self,
+            dtype,
+            for_store=True,
+            force=True,
+        )
+        indexing = self.indexing(
+            index,
+            dense_indexing=True,
+            block_ptr=False,
+            tma_compatibility_checker=tma_compatibility_checker,
+        )
+
+        if hasattr(indexing, "index") and self._has_stride1_on_rdim(indexing.index):
+            self.stores_with_contiguous_rdim.append(name)
+
+        is_inplace = name in self.args.inplace_buffers
+        is_broadcasted = self.is_broadcasted(original_index)
+        if is_inplace and is_broadcasted:
+            self.stores.writeline(DeferredLine(name, "tl.debug_barrier()"))
+
+        if not isinstance(indexing, (BlockPtrOptions, TensorDescriptorOptions)):
+            # Output indexing isn't TMA-compatible — fall back to regular store.
+            return _orig_tk_store(self, name, index, value, mode=mode)
+        block_descriptor, _other = self.codegen_block_ptr(name, var, indexing)
+        codegen_async_tma_store(self, name, indexing, block_descriptor, value)
+        return
+    return _orig_tk_store(self, name, index, value, mode=mode)
+
+
+TritonTemplateKernel.store = _tlx_store  # type: ignore[method-assign]
+
+# ---------------------------------------------------------------------------
+# compute_epilogue: run fused epilogue ops without emitting a store.
+#
+# When TMA_EPILOGUE_STORE is active, the template needs to:
+#   1. Run the fused epilogue (relu, bias add, etc.) to get the final value
+#   2. Manually TMA-store that value via tlx.async_descriptor_store
+#
+# The standard store_output can't do this because V.ops.store targets the
+# template's intermediate buffer (which is removed when fused), while the
+# epilogue nodes emit tl.store to the final buffer — bypassing TMA entirely.
+#
+# compute_epilogue solves this by:
+#   - Using the same index setup as store_output (tma_store=True path)
+#   - Running epilogue node codegen but redirecting stores to variable
+#     assignment ({result_name} = {value}) instead of tl.store
+#   - Returning the hook placeholder so the template can emit TMA store code
+#
+# output_ptr: resolves the correct output buffer for TMA descriptor creation.
+# When epilogue fusion is active, the TMA descriptor must point to the FINAL
+# output buffer (e.g., relu output), not the template's intermediate output
+# (e.g., raw mm result).
+# ---------------------------------------------------------------------------
+
+
+def _tlx_output_ptr(self):  # type: ignore[no-untyped-def]
+    """Get the output pointer for TMA descriptor creation.
+
+    When epilogue fusion is active, returns the final output buffer pointer
+    (set by codegen_template_body via _final_output_name) so TMA descriptors
+    write directly to the fused output.
+    """
+    name = getattr(self, "_final_output_name", self.output_node.get_name())
+    return self.args.output(name)
+
+
+_tlx_output_ptr.__name__ = "output_ptr"
+TritonTemplateKernel.output_ptr = _tlx_output_ptr  # type: ignore[method-assign]
+
+
+def _tlx_get_compute_epilogue_subgraph_name(self, i):  # type: ignore[no-untyped-def]
+    return f"<COMPUTE_EPILOGUE_{i}>"
+
+
+TritonTemplateKernel._get_compute_epilogue_subgraph_name = (  # type: ignore[method-assign]
+    _tlx_get_compute_epilogue_subgraph_name)
+
+
+def _tlx_get_compute_epilogue_count(self):  # type: ignore[no-untyped-def]
+    total = next(self._compute_epilogue_ctr)
+    self._compute_epilogue_ctr = itertools.count(start=total - 1, step=1)
+    return total
+
+
+TritonTemplateKernel._tlx_get_compute_epilogue_count = (  # type: ignore[method-assign]
+    _tlx_get_compute_epilogue_count)
+
+# Patch __init__ to add compute_epilogue counter
+_orig_ttk_init_for_ctr = TritonTemplateKernel.__init__
+
+
+def _tlx_ttk_init_with_ctr(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+    _orig_ttk_init_for_ctr(self, *args, **kwargs)
+    self._compute_epilogue_ctr = itertools.count()
+
+
+TritonTemplateKernel.__init__ = _tlx_ttk_init_with_ctr  # type: ignore[method-assign]
+
+
+def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
+        self,
+        indices,
+        val,
+        result_name="fused_result",
+        indent_width=4,
+        val_shape=None,
+):
+    """Apply epilogue fusion ops and assign result to result_name, without emitting a store.
+
+    Used by templates that handle the store themselves (e.g., TMA async store).
+    Same index setup as store_output with block_indexing=True, tma_store=True.
+    """
+    import sympy
+    from torch._inductor.codegen.common import OpOverrides
+    from torch._inductor.utils import triton_type_to_torch
+
+    subgraph_name = self._get_compute_epilogue_subgraph_name(next(self._compute_epilogue_ctr))
+    with self.create_subgraph_body(subgraph_name, clear_cse=True):
+        assert isinstance(indices, (list, tuple))
+        assert isinstance(val, str)
+        assert val_shape and len(val_shape) == 2, ("compute_epilogue requires a 2D val_shape")
+        assert self.template_mask is None
+
+        indices = list(map(OpOverrides.paren, indices))
+        index_symbols = [sympy.Symbol(x, integer=True) for x in indices]
+        lengths = [V.graph.sizevars.simplify(s) for s in self.output_node.get_size()]
+        assert len(indices) == len(lengths)
+
+        # Inductor drops a load's mask when the extent is a multiple of the
+        # largest block it could pick (a power of two, e.g. N = 2048 vs YBLOCK
+        # up to 1024). A non-power-of-two template tile (BLOCK_N = 192 or 96)
+        # still runs past such an extent, so its epilogue loads keep every mask.
+        if any(isinstance(v, int) and v > 0 and v & (v - 1) for k, v in self.meta.items() if k.startswith("BLOCK_")):
+            self.optimize_mask = False
+
+        self.template_out = val
+
+        # Use the tma_store index setup path (same as store_output with
+        # block_indexing=True and self.tma_store=True).
+        intermediate_lines: list[str] = []
+        epilogue_index_symbols: list[sympy.Symbol] = []
+        val_shape_copy = list(val_shape)
+        for i, range_tree in enumerate(self.range_trees[:-1]):
+            name = range_tree.name
+            symbol = range_tree.symbol()
+            epilogue_index_symbols.append(symbol)
+            lookup_output = range_tree.lookup(sympy.S.One, lengths[i])
+            old_name = lookup_output.symbol()
+            lookup_output.set_name(name)
+            range_tree.var_list[range_tree.var_list.index(old_name)] = symbol
+            range_val = range_tree.var_ranges[old_name]
+            del range_tree.var_ranges[old_name]
+            range_tree.var_ranges[symbol] = range_val
+            # Keep block-shape inference in sync with the renamed symbol, as
+            # store_output does; prefix-input loads (addmm bias) look it up.
+            if self.range_tree_nodes.get(old_name) is lookup_output:
+                del self.range_tree_nodes[old_name]
+            self.range_tree_nodes[symbol] = lookup_output
+            intermediate_lines.extend(
+                self._generate_index_from_tma_index(
+                    name,
+                    "xoffset" if name == "xindex" else "yoffset",
+                    index_symbols[i],
+                    val_shape[i],
+                    i,
+                    len(val_shape),
+                    block_name=f"{range_tree.prefix.upper()}BLOCK",
+                ))
+            intermediate_lines.append(
+                self._generated_mask_for_tma(
+                    name,
+                    self.size(None, i),
+                    "xmask" if name == "xindex" else "ymask",
+                ))
+            val_shape_copy[i] = f"{range_tree.prefix.upper()}BLOCK"
+        val_shape = tuple(val_shape_copy)
+
+        index_symbols = epilogue_index_symbols
+
+        for line in intermediate_lines:
+            self.body.writeline(line)
+
+        self.template_out_shape = val_shape
+        acc_dtype = (triton_type_to_torch(self.meta["ACC_TYPE"]) if "ACC_TYPE" in self.meta else torch.float32)
+        epilogue_args = [V.kernel.cse.namedvar(val, dtype=acc_dtype, shape=val_shape)]
+        for input_node in itertools.chain(
+                self.input_nodes[:self.prefix_args],
+                self.input_nodes[len(self.input_nodes) - self.suffix_args:],
+        ):
+            input_node.freeze_layout()
+            epilogue_arg = V.kernel.cse.generate(
+                self.compute,
+                input_node.make_loader()(index_symbols),
+                dtype=acc_dtype,
+                shape=input_node.get_size(),
+            )
+            epilogue_args.append(epilogue_arg)
+            self.frozen_layouts_cnt += 1
+
+        # Instead of V.ops.store, we store to the template output's CSE cache
+        # (for store-to-load forwarding) and emit a variable assignment for
+        # the final result.  Epilogue nodes codegen'd later into this subgraph
+        # will pick up the accumulator from store_cache and apply their ops.
+        # Their stores are redirected to assignments by _TLXComputeOnlyHandler.
+        fused = self.epilogue_fn(*epilogue_args)
+        V.kernel.cse.store_cache[self.output_node.get_name()] = fused
+        # Emit into compute, after the prefix-input loads that ``fused`` uses.
+        self.compute.writeline(f"{result_name} = {fused}")
+
+        # Mark that the template output buffer was "stored" for CSE purposes
+        self.store_buffer_names.add(self.output_node.get_name())
+
+        # Save result_name so epilogue node stores can be redirected
+        self._tlx_compute_epilogue_result_name = result_name
+        self.codegen_body()
+
+    return self._register_hook(subgraph_name, self._make_codegen_hook(subgraph_name, indent_width))
+
+
+_tlx_compute_epilogue.__name__ = "compute_epilogue"
+TritonTemplateKernel.compute_epilogue = _tlx_compute_epilogue  # type: ignore[method-assign]
+
+
+def _tlx_compute_reduce_epilogue(self):  # type: ignore[no-untyped-def]
+    """Codegen only downstream pointwise ops; reduce-k applies addmm bias itself."""
+    subgraph_name = self._get_compute_epilogue_subgraph_name(next(self._compute_epilogue_ctr))
+    with self.create_subgraph_body(subgraph_name, clear_cse=True):
+        fused = self.cse.namedvar("acc", dtype=torch.float32, shape=("BLOCK_SIZE_M", "BLOCK_SIZE_N"))
+        self.template_out = "acc"
+        self.template_out_shape = ("BLOCK_SIZE_M", "BLOCK_SIZE_N")
+        self.cse.store_cache[self.output_node.get_name()] = fused
+        self.body.writeline(f"fused_result = {fused}")
+        self.store_buffer_names.add(self.output_node.get_name())
+        self._tlx_compute_epilogue_result_name = "fused_result"
+        self.codegen_body()
+    return self._register_hook(subgraph_name, self._make_codegen_hook(subgraph_name, 4))
+
+
+TritonTemplateKernel.compute_reduce_epilogue = _tlx_compute_reduce_epilogue  # type: ignore[attr-defined]
+
+# -- codegen_template_body: wrap to set _final_output_name and handle
+#    COMPUTE_EPILOGUE subgraphs --
+# The epilogue-fusion codegen API below (codegen_template_body,
+# _emit_post_kernel_code, _compute_fusion_metadata, get_unfused_epilogues) only
+# exists on newer torch. On older wheels (e.g. the current ROCm nightly) these
+# base methods are absent; grab them defensively so the module still imports and
+# the core template path keeps working — the wrappers are only installed when the
+# base method exists.
+_orig_codegen_template_body = getattr(TritonTemplateKernel, "codegen_template_body", None)
+
+
+def _hopper_ws_fused_epilogue_stages(meta: dict[str, Any]) -> int:
+    """Ring depth for a Hopper WS template that has epilogue nodes fused in.
+
+    Autotuning sizes the ring for the bare GEMM, and the deepest configs use
+    nearly all SMEM. Fused epilogue inputs are loaded and converted to the
+    accumulator layout through SMEM scratch, one fp32 (BLOCK_M_SPLIT, slice_size)
+    tile, which pushes those configs over the limit; Inductor's fusion benchmark
+    then sees a compile failure and rejects the fusion. Shed ring stages until
+    that tile fits.
+    """
+    from triton.tlx.ops.kernels.mm import sm90
+
+    stages = meta["NUM_STAGES"]
+    reserve = meta["BLOCK_M_SPLIT"] * meta["slice_size"] * 4
+
+    def smem(num_stages: int) -> int:
+        return sm90._smem_bytes(meta["BLOCK_M"], meta["BLOCK_N"], meta["BLOCK_K"], num_stages, 1,
+                                swap_ab=bool(meta.get("SWAP_AB", False)))
+
+    while stages > 2 and smem(stages) + reserve > sm90._MAX_SMEM:
+        stages -= 1
+    return stages
+
+
+_HOPPER_WS_META_KEYS = frozenset({"NUM_STAGES", "BLOCK_M_SPLIT", "slice_size", "N_TAIL", "SWAP_AB"})
+
+
+def _maybe_shrink_ring_for_fused_epilogue(kernel, epilogue_nodes) -> None:  # type: ignore[no-untyped-def]
+    # Identified by its meta: the render callable may be wrapped by other
+    # patches, so the template object is not reachable from here.
+    meta = kernel.meta
+    if not epilogue_nodes or not _HOPPER_WS_META_KEYS <= meta.keys() or not current_target().is_hopper:
+        return
+    if meta.get("SPLIT_K", 1) != 1:
+        return
+    stages = _hopper_ws_fused_epilogue_stages(meta)
+    if stages == meta["NUM_STAGES"]:
+        return
+    # The ring depth reaches the kernel only through its constexpr define;
+    # meta is shared with the unfused renders of this choice, so copy it.
+    kernel.defines = re.sub(r"^NUM_STAGES : tl\.constexpr = \d+$", f"NUM_STAGES : tl.constexpr = {stages}",
+                            kernel.defines, flags=re.M)
+    kernel.meta = {**meta, "NUM_STAGES": stages}
+    log.debug("tlx_hopper_gemm_ws: NUM_STAGES %d -> %d to fit the fused epilogue", meta["NUM_STAGES"], stages)
+
+
+def _device_tma_for_epilogue_operands(kernel, epilogue_nodes) -> None:  # type: ignore[no-untyped-def]
+    """Build an operand's descriptor on the device when a fused epilogue reads it.
+
+    The template and the epilogue share one kernel arg per buffer, and a host
+    descriptor turns that arg into a tensordesc the epilogue's pointer loads
+    cannot use, so Inductor rejects the kernel at final codegen
+    (`_reject_if_template_host_tma`), after the fusion has been chosen.
+    """
+    meta = kernel.meta
+    if not epilogue_nodes or not any(meta.get(f"HOST_TMA_{name}") for name in ("A", "B")):
+        return
+    epilogue_reads = {dep.name for node in epilogue_nodes for dep in node.read_writes.reads}
+    named_inputs = kernel.input_nodes[kernel.prefix_args:len(kernel.input_nodes) - kernel.suffix_args]
+    overrides = {
+        f"HOST_TMA_{name}": False
+        for name, node in zip(("A", "B"), named_inputs)
+        if meta.get(f"HOST_TMA_{name}") and node.get_name() in epilogue_reads
+    }
+    if not overrides:
+        return
+    meta = {**meta, **overrides}
+    meta["HOST_SIDE_TMA"] = bool(meta.get("HOST_TMA_A") or meta.get("HOST_TMA_B"))
+    # render() is bound to the choice's shared meta dict, so _tlx_render
+    # applies these instead of the meta being mutated in place.
+    kernel._tlx_host_tma_overrides = {key: meta[key] for key in (*overrides, "HOST_SIDE_TMA")}
+    kernel.meta = meta
+    log.debug("tlx hopper template: device-side TMA for %s, read by the fused epilogue", sorted(overrides))
+
+
+def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
+    self,
+    scheduling,
+    template_node,
+    epilogue_nodes,
+    prologue_nodes,
+    buf_name_to_prologue_group,
+    prologue_preserves_zero_mask_fn,
+    render,
+):
+    split_k = getattr(self, "_tlx_split_k", 1)
+    _maybe_shrink_ring_for_fused_epilogue(self, epilogue_nodes)
+    _device_tma_for_epilogue_operands(self, epilogue_nodes)
+    # Set _final_output_name so output_ptr() resolves to the fused output.
+    if epilogue_nodes and getattr(self, "_tlx_reduction_epilogue_plan", None) is None:
+        last_names = epilogue_nodes[-1].get_buffer_names()
+        if len(last_names) == 1:
+            self._final_output_name = next(iter(last_names))
+
+    # Wrap the original render to also handle COMPUTE_EPILOGUE subgraphs.
+    orig_render = render
+
+    def _render_with_compute_epilogue():
+        result = orig_render()
+
+        reduce_epilogue_hook = None
+        if split_k > 1 and epilogue_nodes:
+            reduce_epilogue_hook = self.compute_reduce_epilogue()
+
+        # After render, codegen epilogue nodes into COMPUTE_EPILOGUE subgraphs,
+        # redirecting their stores to variable assignments.
+        num_ce = self._tlx_get_compute_epilogue_count()
+        compute_epilogue_nodes = (() if getattr(self, "_tlx_reduction_epilogue_plan", None) is not None else
+                                  epilogue_nodes)
+        for i in range(num_ce):
+            subgraph_name = self._get_compute_epilogue_subgraph_name(i)
+            result_name = getattr(self, "_tlx_compute_epilogue_result_name", "fused_result")
+            with self.set_subgraph_body(subgraph_name):
+                # Redirect epilogue stores to variable assignments
+                orig_store = self.store
+
+                def _redirect_store(name, index, value, mode=None):  # type: ignore[no-untyped-def]
+                    self.store_buffer_names.add(name)
+                    self.cse.store_cache[name] = value
+                    if name not in V.graph.removed_buffers:
+                        self.compute.writeline(f"{result_name} = {value}")
+
+                self.store = _redirect_store  # type: ignore[method-assign]
+                try:
+                    for node in compute_epilogue_nodes:
+                        node.codegen(self.split_and_set_ranges(node.get_ranges()))
+                finally:
+                    self.store = orig_store  # type: ignore[method-assign]
+                self.cse.invalidate(OrderedSet())
+
+        if reduce_epilogue_hook is not None:
+            hook = self.render_hooks.pop(reduce_epilogue_hook)
+            if hook is None:
+                raise AssertionError("missing split-K reduce epilogue hook")
+            self._tlx_reduce_epilogue_code = hook()
+
+        return result
+
+    return _orig_codegen_template_body(
+        self,
+        scheduling,
+        template_node,
+        epilogue_nodes,
+        prologue_nodes,
+        buf_name_to_prologue_group,
+        prologue_preserves_zero_mask_fn,
+        _render_with_compute_epilogue,
+    )
+
+
+if _orig_codegen_template_body is not None:
+    TritonTemplateKernel.codegen_template_body = _tlx_codegen_template_body  # type: ignore[method-assign]
+
+# -- render: add compute_epilogue and output_ptr to template env --
+_orig_render = TritonTemplateKernel.render
+
+
+def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=False):  # type: ignore[no-untyped-def]
+    kwargs = {
+        **kwargs,
+        **getattr(self, "_tlx_host_tma_overrides", {}),
+        "TLX_REDUCTION_EPILOGUE":
+        getattr(self, "_tlx_reduction_epilogue_plan", None) is not None,
+    }
+    # Register the paired prefetch hook for templates that expose a drain
+    # boundary. It remains a no-op unless the config knob and eligibility both
+    # permit moving a load.
+    if not any(fn.__name__ == "prefetch_epilogue" for fn in self.extra_template_env_fns):
+        self._register_extra_template_env_fns(self.prefetch_epilogue)
+    # Register compute_epilogue and output_ptr as extra template env functions
+    # so they're available in the jinja template.
+    if getattr(self, "async_tma_store", False):
+        self._register_extra_template_env_fns(self.compute_epilogue, self.output_ptr)
+    elif getattr(self, "_tlx_split_k", 1) > 1 or self.meta.get("MANUAL_OUTPUT", False):
+        # split-K writes partials to split_k_ws and never store_output()s, so the
+        # output arg would be pruned from the kernel signature -- but the autotuning
+        # harness still passes `out` positionally (arg-count mismatch). Expose
+        # output_ptr() so the template can reference it and keep it in the signature;
+        # the real output is written later by _reduce_k_kernel.
+        self._register_extra_template_env_fns(self.output_ptr)
+    return _orig_render(self, template, kwargs, record_input_dependent_tracked_event)
+
+
+TritonTemplateKernel.render = _tlx_render  # type: ignore[method-assign]
+
+# -- _emit_post_kernel_code: emit split-K reduction kernel after main GEMM --
+_orig_emit_post_kernel = getattr(TritonTemplateKernel, "_emit_post_kernel_code", None)
+
+
+def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-untyped-def]
+    split_k = getattr(self, "_tlx_split_k", 1)
+    if split_k > 1 and self.workspace_arg is not None:
+        from torch._inductor.codegen.triton import triton_type
+        from .reduce_k import emit_aoti_reduce_k_call, emit_reduce_k_call
+
+        # Determine output buffer name and dtype
+        out_name = self.output_node.get_name()
+        out_dtype = self.output_node.get_layout().dtype
+        output_triton_dtype = triton_type(out_dtype)
+
+        # M and N from call_sizes
+        from torch._inductor.codegen.wrapper import pexpr
+
+        M_expr = pexpr(self.call_sizes[0])
+        N_expr = pexpr(self.call_sizes[1])
+
+        # addmm bias is applied by store_output's epilogue in the non-split path, which
+        # split-K bypasses -> it must be re-added in the reduction. For addmm the bias is
+        # the prefix input node (input_nodes[0], prefix_args=1); plain mm has none.
+        bias_name = None
+        bias_node = None
+        stride_bias_m = 0
+        stride_bias_n = 1
+        if getattr(self, "prefix_args", 0) >= 1 and self.input_nodes:
+            bias_node = self.input_nodes[0]
+            bias_name = bias_node.get_name()
+            bsize = bias_node.get_size()
+            bstride = bias_node.get_layout().stride
+            sizevars = V.graph.sizevars
+
+            def _sh(expr):
+                return int(sizevars.optimization_hint(expr, fallback=1))
+
+            if len(bsize) == 1:
+                # [N] bias broadcast over M
+                stride_bias_m, stride_bias_n = 0, _sh(bstride[0])
+            elif len(bsize) == 2:
+                stride_bias_m = 0 if _sh(bsize[0]) == 1 else _sh(bstride[0])
+                stride_bias_n = 0 if _sh(bsize[1]) == 1 else _sh(bstride[1])
+            else:
+                bias_name = None  # unexpected rank; skip (should not happen for addmm)
+
+        # Split-K is handled entirely template-side: when there is a fusible epilogue
+        # the reducer is code-generated to replay it (backend-agnostic, works for the
+        # Python/JIT wrapper and the AOTI C++ wrapper alike); otherwise the generic
+        # sum+bias reducer is used. Nothing about split-K leaks to the Inductor compiler.
+        _reduce_epilogue_code = getattr(self, "_tlx_reduce_epilogue_code", None)
+        if config.cpp_wrapper or _reduce_epilogue_code is not None:
+            emit_aoti_reduce_k_call(
+                wrapper,
+                workspace_arg=self.workspace_arg,
+                output_node=self.output_node,
+                bias_node=bias_node if bias_name is not None else None,
+                M=self.call_sizes[0],
+                N=self.call_sizes[1],
+                M_kernel_expr=self.size("A", 0),
+                N_kernel_expr=self.size("B", 1),
+                split_k=split_k,
+                output_triton_dtype=output_triton_dtype,
+                stride_bias_m=stride_bias_m,
+                stride_bias_n=stride_bias_n,
+                template_kernel=self,
+                main_kernel_name=kernel_name,
+                epilogue_code=_reduce_epilogue_code,
+                final_output_ptr=self.output_ptr(),
+                bias_kernel_ptr=(self.args.input_buffers.get(bias_name) if bias_name is not None else None),
+            )
+        else:
+            emit_reduce_k_call(
+                wrapper,
+                ws_name=self.workspace_arg.outer_name,
+                output_name=out_name,
+                M_expr=M_expr,
+                N_expr=N_expr,
+                split_k=split_k,
+                output_triton_dtype=output_triton_dtype,
+                bias_name=bias_name,
+                stride_bias_m=stride_bias_m,
+                stride_bias_n=stride_bias_n,
+            )
+    _orig_emit_post_kernel(self, wrapper, kernel_name)
+
+
+if _orig_emit_post_kernel is not None:
+    TritonTemplateKernel._emit_post_kernel_code = _tlx_emit_post_kernel_code  # type: ignore[method-assign]
+
+# -- _compute_fusion_metadata: disable epilogue fusion for SPLIT_K > 1 ------
+#
+# Split-K bypasses store_output (writes partials to workspace via tl.store),
+# so scheduler-level epilogue fusion can't work — the fused ops would be
+# silently dropped.  Instead, mark all epilogue nodes as "unfused" so the
+# scheduler codegen's them as separate kernels after reduce_k.
+_orig_compute_fusion_metadata = getattr(TritonTemplateKernel, "_compute_fusion_metadata", None)
+
+
+def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
+        self, scheduling, epilogue_nodes, *args, **kwargs):
+    split_k = getattr(self, "_tlx_split_k", 1)
+    if split_k > 1 and epilogue_nodes:
+        from collections import defaultdict
+
+        self._epilogue_nodes_by_subgraph = defaultdict(list)
+        self._unfused_epilogues = []
+        self._prologue_sources = {}
+        self._scheduling_ref = scheduling
+    elif _orig_compute_fusion_metadata is not None:
+        _orig_compute_fusion_metadata(self, scheduling, epilogue_nodes, *args, **kwargs)
+
+
+if _orig_compute_fusion_metadata is not None:
+    TritonTemplateKernel._compute_fusion_metadata = _tlx_compute_fusion_metadata  # type: ignore[method-assign]
+
+# -- get_unfused_epilogues: return split-K unfused epilogues -----------------
+_orig_get_unfused_epilogues = getattr(TritonTemplateKernel, "get_unfused_epilogues", None)
+
+
+def _tlx_get_unfused_epilogues(self):  # type: ignore[no-untyped-def]
+    unfused = getattr(self, "_unfused_epilogues", None)
+    if unfused:
+        return unfused
+    return _orig_get_unfused_epilogues(self)
+
+
+if _orig_get_unfused_epilogues is not None:
+    TritonTemplateKernel.get_unfused_epilogues = _tlx_get_unfused_epilogues  # type: ignore[method-assign]
+
+# -- call_kernel: codegen unfused epilogues after split-K reduce_k -----------
+_orig_call_kernel = TritonTemplateKernel.call_kernel
+
+
+def _tlx_call_kernel(self, name, node=None, deallocate_ws=True):  # type: ignore[no-untyped-def]
+    _orig_call_kernel(self, name, node=node, deallocate_ws=deallocate_ws)
+    # Codegen unfused epilogues after reduce_k (emitted in _emit_post_kernel_code)
+    unfused = getattr(self, "_unfused_epilogues", [])
+    scheduling = getattr(self, "_scheduling_ref", None)
+    if unfused and scheduling is not None:
+        for epi_node in unfused:
+            scheduling.codegen_node(epi_node)
+
+
+TritonTemplateKernel.call_kernel = _tlx_call_kernel  # type: ignore[method-assign]
+
+# ---------------------------------------------------------------------------
+# Override TritonScheduling.create_kernel_choices to offer the cross-phase
+# local-retention kernel as an extra MultiKernel candidate.
+#
+# Same monkeypatch mechanism as the TritonTemplateKernel overrides above, so
+# the retention prototype needs no hook inside torch._inductor.  The
+# replacement is a no-op unless triton.multi_kernel is on and the schedule
+# clears the retention legality envelope.
+# ---------------------------------------------------------------------------
+
+
+def _tlx_create_kernel_choices(self, kernel_features, kernel_args, kernel_kwargs):
+    return _tlx_create_kernel_choices_impl(self, kernel_features, kernel_args, kernel_kwargs)
+
+
+TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ignore[method-assign]
+
+# ---------------------------------------------------------------------------
+# Fusion-aware selection without max_autotune.
+#
+# Inductor defers a template choice to the scheduler (MultiTemplateBuffer),
+# which times each template with its epilogue fused against the unfused best,
+# only under max_autotune. Without it a vendor GEMM can win on GEMM-only time
+# and leave the epilogue as a separate pass. TorchTLX does not depend on
+# max_autotune, so take the deferred path whenever TLX is on (allow or force)
+# on an arch with TLX GEMM templates.
+# ---------------------------------------------------------------------------
+
+_orig_algorithm_selector_call = AlgorithmSelectorCache.__call__
+
+
+def _tlx_defers_selection() -> bool:
+    if config.triton.tlx_mode is None:
+        return False
+    target = current_target()
+    return target.is_blackwell or target.is_hopper or target.is_gfx942 or target.is_gfx950
+
+
+def _tlx_algorithm_selector_call(self, name, choices, *args, **kwargs):
+    if (kwargs.get("return_multi_template") and not (config.max_autotune or config.max_autotune_gemm)
+            and _tlx_defers_selection()):
+        with config.patch(max_autotune_gemm=True):
+            return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
+    return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
+
+
+AlgorithmSelectorCache.__call__ = _tlx_algorithm_selector_call  # type: ignore[method-assign]
+
+# ---------------------------------------------------------------------------
+# Unfused near-ties on gfx942 keep the vendor GEMM.
+#
+# A MultiTemplateBuffer with no fused epilogue is finalized on its GEMM-only
+# autotune timing. On gfx942 the TLX template can win that timing by <1% and
+# then run 3-7% slower than hipBLASLt in steady state. Fused picks are made in
+# speedup_by_fusion and are not affected.
+# ---------------------------------------------------------------------------
+
+_GFX942_UNFUSED_MIN_SPEEDUP = 1.05
+_orig_get_min_choice = MultiTemplateBuffer.get_min_choice
+_orig_finalize_multi_template_buffers = Scheduler.finalize_multi_template_buffers
+
+# Autotune times each candidate alone with a cleared cache, which can misrank
+# a TLX template against hipBLASLt by more than their gap. The two finalists
+# are re-timed warm and back to back, the way they run inside a graph.
+_GFX942_STEADY_MIN_SPEEDUP = 1.03
+_STEADY_BATCH = 10
+_STEADY_ROUNDS = 7
+
+_RETIME_ERRORS = (AttributeError, AssertionError, RuntimeError, TypeError)
+_RETIME_FAILED = "tlx_gfx942_steady_retime_failed"
+
+
+def _warm_interleaved_ms(fns):
+    """Median per-call time of each fn, timed warm and back to back, fns interleaved."""
+    for fn in fns:
+        for _ in range(_STEADY_BATCH):
+            fn()
+    torch.cuda.synchronize()
+    events = [[] for _ in fns]
+    for _ in range(_STEADY_ROUNDS):
+        for fn, per_fn in zip(fns, events):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(_STEADY_BATCH):
+                fn()
+            end.record()
+            per_fn.append((start, end))
+    torch.cuda.synchronize()
+    return [sorted(s.elapsed_time(e) / _STEADY_BATCH for s, e in per_fn)[_STEADY_ROUNDS // 2] for per_fn in events]
+
+
+# The 8 XCD L2s of MI300X total 32 MB; the 256 MB Infinity Cache stays warm.
+_L2_FLUSH_BYTES = 64 * 1024 * 1024
+
+
+def _producer_warm_ms(fns):
+    """Median per-call time of each fn with L2 cleared before every call, fns interleaved.
+
+    Models a reduction reading data the previous kernel just wrote: evicted from
+    L2 by that kernel, still resident in the Infinity Cache.
+    """
+    flush = torch.empty(_L2_FLUSH_BYTES // 4, dtype=torch.int, device="cuda")
+    for fn in fns:
+        for _ in range(3):
+            fn()
+    torch.cuda.synchronize()
+    events = [[] for _ in fns]
+    for _ in range(_STEADY_BATCH * _STEADY_ROUNDS):
+        for fn, per_fn in zip(fns, events):
+            flush.zero_()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            per_fn.append((start, end))
+    torch.cuda.synchronize()
+    return [statistics.median(s.elapsed_time(e) for s, e in per_fn) for per_fn in events]
+
+
+def _steady_state_ms(choices, multi_node, hint_override):
+    """Median warm per-call ms per choice; None for a choice that fails to run."""
+    from torch._dynamo.utils import counters
+    from torch._inductor.select_algorithm import AlgorithmSelectorCache
+
+    args = AlgorithmSelectorCache.get_inputs(choices, list(multi_node.inputs), multi_node.layout, None,
+                                             hint_override=hint_override)
+    fns = {}
+    for i, choice in enumerate(choices):
+        try:
+            tensors = args.get_benchmark_tensors(AlgorithmSelectorCache._uses_layout_preserving_inputs(choice))
+            inputs, out = tensors.unpack()
+            fn = choice.bmreq.make_run_fn(*inputs, out=out)
+            fn()
+            torch.cuda.synchronize()
+        except _RETIME_ERRORS as e:
+            log.warning("gfx942 steady-state re-timing of %s failed: %r", choice.name, e)
+            counters["inductor"][_RETIME_FAILED] += 1
+            continue
+        fns[i] = fn
+    ms = dict(zip(fns, _warm_interleaved_ms(list(fns.values())))) if fns else {}
+    return [ms.get(i) for i in range(len(choices))]
+
+
+def _valid_ms(ms) -> bool:
+    return ms is not None and _math.isfinite(ms) and ms > 0
+
+
+def _keep_unfused_tlx(steady, tlx_autotune_ms, extern_autotune_ms) -> bool:
+    from torch._dynamo.utils import counters
+
+    if steady is not None:
+        tlx_ms, extern_ms = steady
+        if tlx_ms is None:
+            return False
+        if extern_ms is None:
+            return True
+        if _valid_ms(tlx_ms) and _valid_ms(extern_ms):
+            return extern_ms >= tlx_ms * _GFX942_STEADY_MIN_SPEEDUP
+        log.warning("gfx942 steady-state re-timing gave invalid times %r, using autotune timings", steady)
+        counters["inductor"][_RETIME_FAILED] += 1
+    if _valid_ms(tlx_autotune_ms) and _valid_ms(extern_autotune_ms):
+        return extern_autotune_ms >= tlx_autotune_ms * _GFX942_UNFUSED_MIN_SPEEDUP
+    return False
+
+
+def _unfused_min_choice(self, hint_override=None):
+    from torch._dynamo.utils import counters
+
+    choice, ms = _orig_get_min_choice(self, hint_override)
+    if not _is_tlx_choice(choice):
+        return choice, ms
+    timings = self.choice_timings(hint_override)
+    externs = [c for c in timings if isinstance(c, ExternKernelCaller)]
+    if not externs:
+        return choice, ms
+    extern = min(externs, key=timings.__getitem__)
+    start = time.perf_counter()
+    try:
+        steady = _steady_state_ms((choice, extern), self, hint_override)
+    except _RETIME_ERRORS as e:
+        log.warning("gfx942 steady-state re-timing of %s failed, using autotune timings: %r", self.get_name(), e)
+        counters["inductor"][_RETIME_FAILED] += 1
+        steady = None
+    keep_tlx = _keep_unfused_tlx(steady, ms, timings[extern])
+    log.info(
+        "gfx942 unfused GEMM %s: autotune tlx=%.4f extern=%.4f ms, steady tlx/extern=%s ms -> %s (%.1f ms)",
+        self.get_name(),
+        ms,
+        timings[extern],
+        steady,
+        "tlx" if keep_tlx else "extern",
+        (time.perf_counter() - start) * 1e3,
+    )
+    if keep_tlx:
+        return choice, ms
+    return extern, timings[extern]
+
+
+def _tlx_get_min_choice(self, hint_override=None):
+    # Benchmark fusion picks here, not through override_best_choice.
+    choice, ms = _orig_get_min_choice(self, hint_override)
+    if config.triton.tlx_mode != "force":
+        return choice, ms
+    from .choices import maybe_override_best_choice
+
+    timings = self.choice_timings(hint_override)
+    choice = maybe_override_best_choice(choice, timings)
+    return choice, timings[choice]
+
+
+def _margin_min_choice(self, hint_override=None):
+    """The deferred (MultiTemplateBuffer) pick with TLX's allow-mode margin over
+    cuBLAS, which select_algorithm's override_best_choice applies only to
+    non-deferred picks."""
+    from .choices import maybe_override_best_choice
+
+    choice, ms = _orig_get_min_choice(self, hint_override)
+    timings = self.choice_timings(hint_override)
+    picked = maybe_override_best_choice(choice, timings)
+    if picked is choice:
+        return choice, ms
+    log.info("TLX allow-mode margin for %s: %s -> %s", self.get_name(), choice.name, picked.name)
+    return picked, timings[picked]
+
+
+def _tlx_finalize_multi_template_buffers(self):
+    if config.triton.tlx_mode != "allow":
+        return _orig_finalize_multi_template_buffers(self)
+    MultiTemplateBuffer.get_min_choice = (  # type: ignore[method-assign]
+        _unfused_min_choice if _is_gfx942() else _margin_min_choice)
+    try:
+        return _orig_finalize_multi_template_buffers(self)
+    finally:
+        MultiTemplateBuffer.get_min_choice = _tlx_get_min_choice  # type: ignore[method-assign]
+
+
+MultiTemplateBuffer.get_min_choice = _tlx_get_min_choice  # type: ignore[method-assign]
+Scheduler.finalize_multi_template_buffers = _tlx_finalize_multi_template_buffers  # type: ignore[method-assign]
+
+# ---------------------------------------------------------------------------
+# Persistent vs looped choice for reductions the gfx942 override made persistent.
+#
+# TLX compiles both variants as a MultiKernel (scheduling/local_buffer_retention).
+# The stock pick times each variant with a cleared cache and cloned arguments,
+# which misranks these memory-bound kernels. Re-running a reduction back to back
+# keeps its input in L2 and favors the multi-pass looped kernel, so each call is
+# timed after clearing only L2. Picks are not reused from the on-disk cache.
+# ---------------------------------------------------------------------------
+
+_TLX_MULTI_KERNELS: set[tuple[str, ...]] = set()
+_TLX_MULTI_KERNEL_NAMES: set[str] = set()
+_orig_multi_kernel_init = MultiKernel.__init__
+_orig_multi_kernel_call_init = MultiKernelCall.__init__
+_orig_benchmark_sub_kernels = MultiKernelCall.benchmark_sub_kernels
+
+
+def _tlx_multi_kernel_init(self, kernels):
+    _orig_multi_kernel_init(self, kernels)
+    if any(getattr(k, "_tlx_retime", False) for k in kernels):
+        _TLX_MULTI_KERNELS.add(tuple(k.kernel_name for k in kernels))
+        _TLX_MULTI_KERNEL_NAMES.add(self.kernel_name)
+
+
+def _is_tlx_multi_kernel(call) -> bool:
+    return tuple(k.inductor_meta.get("kernel_name") for k in call.kernels) in _TLX_MULTI_KERNELS
+
+
+def _tlx_multi_kernel_call_init(self, multi_kernel_name, kernels, arg_index):
+    _orig_multi_kernel_call_init(self, multi_kernel_name, kernels, arg_index)
+    if multi_kernel_name in _TLX_MULTI_KERNEL_NAMES and config.triton.multi_kernel <= 1:
+        self.disable_cache = True
+        self.picked_kernel = None
+
+
+def _tlx_benchmark_sub_kernels(self, *args, **kwargs):
+    if not _is_tlx_multi_kernel(self):
+        return _orig_benchmark_sub_kernels(self, *args, **kwargs)
+    fns = []
+    for index, kernel in enumerate(self.kernels):
+        cloned_args, cloned_kwargs = kernel.clone_args(*self._get_filtered_args(args, index), **kwargs)
+        fns.append(lambda kernel=kernel, a=cloned_args, kw=cloned_kwargs: kernel.run(*a, **kw))
+    timings = _producer_warm_ms(fns)
+    log.info(
+        "gfx942 reduction choice %s: %s",
+        [k.inductor_meta.get("kernel_name") for k in self.kernels],
+        ["%.4f ms" % t for t in timings],
+    )
+    return timings
+
+
+MultiKernel.__init__ = _tlx_multi_kernel_init  # type: ignore[method-assign]
+MultiKernelCall.__init__ = _tlx_multi_kernel_call_init  # type: ignore[method-assign]
+MultiKernelCall.benchmark_sub_kernels = _tlx_benchmark_sub_kernels  # type: ignore[method-assign]
+
+install_reduction_epilogue()
+
+# Route eligible SDPA flash-attention calls through the flex lowering when
+# tlx_config.sdpa_to_flex is on (no-op otherwise).
+
+register_sdpa_to_flex()
+
+# Lower eligible (K, 1) convolutions to GEMMs when tlx_config.conv1d_to_mm is on.
+from .conv1d_to_mm import register_conv1d_to_mm  # noqa: E402
+
+register_conv1d_to_mm()

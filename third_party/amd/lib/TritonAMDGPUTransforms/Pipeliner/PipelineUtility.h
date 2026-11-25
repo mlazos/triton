@@ -3,13 +3,15 @@
 
 #include "mlir/IR/Operation.h"
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
+#include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 
 namespace mlir {
 
 namespace triton::AMD {
 constexpr char AttrBypassLDS[] = "amdg.bypass_lds_load";
-}
+constexpr char AttrTwoDotSchedule[] = "amdg.two_dot_schedule";
+} // namespace triton::AMD
 
 // This function will
 // - deserialize schedule and numStages from IR.
@@ -20,6 +22,12 @@ constexpr char AttrBypassLDS[] = "amdg.bypass_lds_load";
 // - schedule these new ops.
 // - serialize schedule to IR for the next expandLoops function.
 void lowerLoops(ModuleOp moduleOp, bool useAsyncCopy, bool usePingpong);
+
+// Run the general pipeline expander on every loop carrying a serialized
+// CoarseSchedule (loop.stage / loop.cluster). Exposed so the decompose+modulo
+// pipeline (change #4) can reuse the expander after it re-buffers + serializes
+// its own modulo-derived schedule, without going through lowerLoops.
+void expandLoops(ModuleOp moduleOp);
 
 // Pipeline the TDM stores and scatter in the loop.
 bool pipelineTDMStores(scf::ForOp forOp);
@@ -81,6 +89,11 @@ using Stages = std::array<int, SCHED_SIZE>;
 } // namespace SingleDotSchedule
 
 namespace ChainedDotSchedule {
+// The two-dot schedule only supports dot-like operations directly in the loop
+// body. BlockPingpong uses the same collector so both passes agree on which
+// operations the schedule contains.
+SmallVector<triton::DotOpInterface> collectDotLikeOps(scf::ForOp forOp);
+
 // Defines the order of scheduling clusters. The suffix numbers for memory
 // operations define which dot the operations belongs to. So *_LOAD_1 loads a
 // tensor consumed by the first dot. If a memory operation is used by both dots

@@ -234,133 +234,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 
 // -----
 
-// A partitioned allocation owns every physical base, not the interval starting
-// at its first base. Subviews select a physical partition and remain exact
-// through nested views and runtime selection.
+// Nested pipeline-prefix slices compose additively across CFG edges.
 #inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #inner}>
 #smem = #ttg.shared_memory
 
-// CHECK-LABEL: partition_a_parent vs partition_a_parent: alias=true, lhs_contains_rhs=true, rhs_contains_lhs=true
-// CHECK: partition_a_parent vs partition_b_first: alias=true, lhs_contains_rhs=true, rhs_contains_lhs=false
-// CHECK: partition_a_parent vs partition_c_second: alias=true, lhs_contains_rhs=true, rhs_contains_lhs=false
-// CHECK: partition_a_parent vs partition_d_first_base: alias=true
-// CHECK: partition_a_parent vs partition_e_second_base: alias=true
-// CHECK: partition_a_parent vs partition_g_nested: alias=true
-// CHECK: partition_a_parent vs partition_h_nested_base: alias=true
-// CHECK: partition_b_first vs partition_c_second: alias=false
-// CHECK: partition_b_first vs partition_d_first_base: alias=true, lhs_contains_rhs=true, rhs_contains_lhs=true
-// CHECK: partition_b_first vs partition_e_second_base: alias=false
-// CHECK: partition_b_first vs partition_f_selected: alias=true
-// CHECK: partition_c_second vs partition_d_first_base: alias=false
-// CHECK: partition_c_second vs partition_e_second_base: alias=true, lhs_contains_rhs=true, rhs_contains_lhs=true
-// CHECK: partition_c_second vs partition_f_selected: alias=true
-// CHECK: partition_c_second vs partition_g_nested: alias=false
-// CHECK: partition_d_first_base vs partition_e_second_base: alias=false
-// CHECK: partition_g_nested vs partition_h_nested_base: alias=true, lhs_contains_rhs=true, rhs_contains_lhs=true
-// CHECK: partition_a_parent case [0, 512]: mask={0,1,2,3}
-// CHECK: partition_b_first case [0, 256]: mask={0}
-// CHECK: partition_c_second case [2048, 256]: mask={2}
-// CHECK: partition_d_first_base case [0, 128]: mask={0}
-// CHECK: partition_e_second_base case [2048, 128]: mask={2}
-// CHECK: partition_f_selected case [0, 256]: mask={0}
-// CHECK: partition_f_selected case [2048, 256]: mask={2}
-// CHECK: partition_g_nested case [2176, 256]: mask={3}
-// CHECK: partition_h_nested_base case [2176, 128]: mask={3}
-// CHECK: state-plan: lanes=4
-module attributes {test.print_state_plan, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.shared = 4096 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 2 : i32} {
-  tt.func public @partitioned_shared_physical_alias(%choose: i1) {
-    %parent = ttg.local_alloc {allocation.offset = [0 : i32, 2048 : i32]} : () -> !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable>
-    %first = ttg.memdesc_subslice %parent [0, 0] : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16>
-    %second = ttg.memdesc_subslice %parent [4, 0] : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16>
-    %outer = ttg.memdesc_subslice %parent [8, 0] : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<8x16xf16, #partitioned, #smem, mutable, 16x16>
-    %nested = ttg.memdesc_subslice %outer [4, 0] : !ttg.memdesc<8x16xf16, #partitioned, #smem, mutable, 16x16> -> !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16>
-    %selected = arith.select %choose, %first, %second : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16>
-    %first_base = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<4x16xf16, #inner, #smem, mutable>
-    %second_base = ttg.local_alloc {allocation.offset = 2048 : i32} : () -> !ttg.memdesc<4x16xf16, #inner, #smem, mutable>
-    %nested_base = ttg.local_alloc {allocation.offset = 2176 : i32} : () -> !ttg.memdesc<4x16xf16, #inner, #smem, mutable>
-    %0 = ttg.local_load %parent {test.region_name = "partition_a_parent"} : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> tensor<16x16xf16>
-    %1 = ttg.local_load %first {test.region_name = "partition_b_first"} : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16> -> tensor<4x16xf16>
-    %2 = ttg.local_load %second {test.region_name = "partition_c_second"} : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16> -> tensor<4x16xf16>
-    %3 = ttg.local_load %first_base {test.region_name = "partition_d_first_base"} : !ttg.memdesc<4x16xf16, #inner, #smem, mutable> -> tensor<4x16xf16>
-    %4 = ttg.local_load %second_base {test.region_name = "partition_e_second_base"} : !ttg.memdesc<4x16xf16, #inner, #smem, mutable> -> tensor<4x16xf16>
-    %5 = ttg.local_load %selected {test.region_name = "partition_f_selected"} : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16> -> tensor<4x16xf16>
-    %6 = ttg.local_load %nested {test.region_name = "partition_g_nested"} : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16> -> tensor<4x16xf16>
-    %7 = ttg.local_load %nested_base {test.region_name = "partition_h_nested_base"} : !ttg.memdesc<4x16xf16, #inner, #smem, mutable> -> tensor<4x16xf16>
-    tt.return
-  }
-}
-
-// -----
-
-// Padding is local to each physical partition; a gap between partition bases
-// cannot be mistaken for part of either padded piece.
-#piece_padded = #ttg.padded_shared<[128:+4] {order = [1, 0], shape = [4, 16]}>
-#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #piece_padded}>
-#smem = #ttg.shared_memory
-
-// CHECK-LABEL: padded_partition_a_parent vs padded_partition_a_parent: alias=true
-// CHECK: padded_partition_a_parent vs padded_partition_b_first: alias=true
-// CHECK: padded_partition_a_parent vs padded_partition_c_second: alias=true
-// CHECK: padded_partition_b_first vs padded_partition_c_second: alias=false
-// CHECK: padded_partition_b_first vs padded_partition_d_first_base: alias=true
-// CHECK: padded_partition_b_first vs padded_partition_e_second_base: alias=false
-// CHECK: padded_partition_c_second vs padded_partition_d_first_base: alias=false
-// CHECK: padded_partition_c_second vs padded_partition_e_second_base: alias=true
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.shared = 4096 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 2 : i32} {
-  tt.func public @partitioned_padded_physical_alias() {
-    %parent = ttg.local_alloc {allocation.offset = [0 : i32, 2048 : i32]} : () -> !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable>
-    %first = ttg.memdesc_subslice %parent [0, 0] : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16>
-    %second = ttg.memdesc_subslice %parent [4, 0] : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16>
-    %first_base = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<4x16xf16, #piece_padded, #smem, mutable>
-    %second_base = ttg.local_alloc {allocation.offset = 2048 : i32} : () -> !ttg.memdesc<4x16xf16, #piece_padded, #smem, mutable>
-    %0 = ttg.local_load %parent {test.region_name = "padded_partition_a_parent"} : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> tensor<16x16xf16>
-    %1 = ttg.local_load %first {test.region_name = "padded_partition_b_first"} : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16> -> tensor<4x16xf16>
-    %2 = ttg.local_load %second {test.region_name = "padded_partition_c_second"} : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16> -> tensor<4x16xf16>
-    %3 = ttg.local_load %first_base {test.region_name = "padded_partition_d_first_base"} : !ttg.memdesc<4x16xf16, #piece_padded, #smem, mutable> -> tensor<4x16xf16>
-    %4 = ttg.local_load %second_base {test.region_name = "padded_partition_e_second_base"} : !ttg.memdesc<4x16xf16, #piece_padded, #smem, mutable> -> tensor<4x16xf16>
-    tt.return
-  }
-}
-
-// -----
-
-// Advancing a pipeline stage advances every physical partition base. A dynamic
-// stage aliases each possible static stage without making the stages overlap.
-#inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
-#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #inner}>
-#smem = #ttg.shared_memory
-
-// CHECK-LABEL: stage_partition_a_first vs stage_partition_a_first: alias=true
-// CHECK: stage_partition_a_first vs stage_partition_b_second: alias=false
-// CHECK: stage_partition_a_first vs stage_partition_c_dynamic: alias=true
-// CHECK: stage_partition_a_first vs stage_partition_d_second_first: alias=false
-// CHECK: stage_partition_b_second vs stage_partition_c_dynamic: alias=true
-// CHECK: stage_partition_b_second vs stage_partition_d_second_first: alias=true
-// CHECK: stage_partition_b_second vs stage_partition_e_second_peer: alias=true
-// CHECK: stage_partition_d_second_first vs stage_partition_e_second_peer: alias=false
+// CHECK-LABEL: stage_partition_f_prefix_first vs stage_partition_f_prefix_first: alias=true
 // CHECK: stage_partition_f_prefix_first vs stage_partition_g_prefix_nested: alias=false
 // CHECK: stage_partition_f_prefix_first vs stage_partition_i_prefix_merged: alias=true, lhs_contains_rhs=false, rhs_contains_lhs=true
 // CHECK: stage_partition_g_prefix_nested vs stage_partition_h_prefix_direct: alias=true, lhs_contains_rhs=true, rhs_contains_lhs=true
 // CHECK: stage_partition_g_prefix_nested vs stage_partition_i_prefix_merged: alias=true, lhs_contains_rhs=false, rhs_contains_lhs=true
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.shared = 4096 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 2 : i32} {
-  tt.func public @partitioned_multibuffer_physical_alias(%index: i32) {
-    %c0 = arith.constant 0 : i32
-    %c1 = arith.constant 1 : i32
-    %parent = ttg.local_alloc {allocation.offset = [0 : i32, 2048 : i32]} : () -> !ttg.memdesc<3x16x16xf16, #partitioned, #smem, mutable>
-    %first = ttg.memdesc_index %parent[%c0] : !ttg.memdesc<3x16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable>
-    %second = ttg.memdesc_index %parent[%c1] : !ttg.memdesc<3x16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable>
-    %dynamic = ttg.memdesc_index %parent[%index] : !ttg.memdesc<3x16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable>
-    %second_first = ttg.memdesc_subslice %second [0, 0] : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16>
-    %second_peer = ttg.memdesc_subslice %second [4, 0] : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16>
-    %0 = ttg.local_load %first {test.region_name = "stage_partition_a_first"} : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> tensor<16x16xf16>
-    %1 = ttg.local_load %second {test.region_name = "stage_partition_b_second"} : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> tensor<16x16xf16>
-    %2 = ttg.local_load %dynamic {test.region_name = "stage_partition_c_dynamic"} : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> tensor<16x16xf16>
-    %3 = ttg.local_load %second_first {test.region_name = "stage_partition_d_second_first"} : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16> -> tensor<4x16xf16>
-    %4 = ttg.local_load %second_peer {test.region_name = "stage_partition_e_second_peer"} : !ttg.memdesc<4x16xf16, #partitioned, #smem, mutable, 16x16> -> tensor<4x16xf16>
-    tt.return
-  }
-
   // Prefix slices add to every partition base, even across a CFG edge. Two
   // offsets of one stage must become stage two, not XOR back to stage zero;
   // merging those distinct origins must retain both physical footprints.
@@ -571,79 +455,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
     %returned = tt.call @return_argument(%direct) : (!ttg.memdesc<16xi32, #shared, #smem, mutable>) -> !ttg.memdesc<16xi32, #shared, #smem, mutable>
     %0 = ttg.local_load %direct {test.region_name = "return_frame_a_direct"} : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
     %1 = ttg.local_load %returned {test.region_name = "return_frame_a_returned"} : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
-    tt.return
-  }
-}
-
-// -----
-
-// An externally supplied descriptor is unknown, not an empty physical region.
-// It may alias an in-function allocation and certainly aliases itself.
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-
-// CHECK-LABEL: unknown_a_known vs unknown_a_known: alias=true
-// CHECK: unknown_a_known vs unknown_b_external: alias=true
-// CHECK: unknown_b_external vs unknown_b_external: alias=true
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 64 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
-  tt.func public @external_memdesc_is_unknown(%incoming: !ttg.memdesc<16xi32, #shared, #smem, mutable>) {
-    %known = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16xi32, #shared, #smem, mutable>
-    %0 = ttg.local_load %known {test.region_name = "unknown_a_known"} : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
-    %1 = ttg.local_load %incoming {test.region_name = "unknown_b_external"} : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
-    tt.return
-  }
-}
-
-// -----
-
-// Extracting a runtime descriptor address is pure and must not be rejected as
-// an unaccounted-for memory access.
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-
-// CHECK-LABEL: pure_a_descriptor vs pure_a_descriptor: alias=true
-// CHECK: pure_a_descriptor vs pure_b_load: alias=true
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 64 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
-  tt.func public @pure_memdesc_address_is_supported() {
-    %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16xi32, #shared, #smem, mutable>
-    %address = tti.experimental_memdesc_to_i32 %buffer {test.region_name = "pure_a_descriptor"} : !ttg.memdesc<16xi32, #shared, #smem, mutable>
-    %value = ttg.local_load %buffer {test.region_name = "pure_b_load"} : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
-    tt.return
-  }
-}
-
-// -----
-
-// Deallocation consumes a descriptor but is a free, not an unsupported read
-// or write.
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-
-// CHECK-LABEL: deallocation_a_load vs deallocation_a_load: alias=true
-// CHECK: deallocation_a_load vs deallocation_b_free: alias=true
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 64 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
-  tt.func public @local_deallocation_is_supported() {
-    %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16xi32, #shared, #smem, mutable>
-    %value = ttg.local_load %buffer {test.region_name = "deallocation_a_load"} : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
-    ttg.local_dealloc %buffer {test.region_name = "deallocation_b_free"} : !ttg.memdesc<16xi32, #shared, #smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-// AMD direct-to-LDS buffer loads have an explicit shared-memory write effect.
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
-#smem = #ttg.shared_memory
-
-// CHECK-LABEL: amd_direct_a_buffer_load vs amd_direct_a_buffer_load: alias=true
-// CHECK: amd_direct_a_buffer_load vs amd_direct_b_local_load: alias=true
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 8192 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32, "ttg.total-num-warps" = 4 : i32} {
-  tt.func public @amd_buffer_load_to_local_alias(%ptr: !tt.ptr<f32>, %offsets: tensor<32x64xi32, #blocked>) {
-    %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<32x64xf32, #shared, #smem, mutable>
-    %token = amdg.buffer_load_to_local %ptr[%offsets] into %buffer {test.region_name = "amd_direct_a_buffer_load"} : !tt.ptr<f32>[tensor<32x64xi32, #blocked>] -> <32x64xf32, #shared, #smem, mutable>
-    %value = ttg.local_load %buffer {test.region_name = "amd_direct_b_local_load"} : !ttg.memdesc<32x64xf32, #shared, #smem, mutable> -> tensor<32x64xf32, #blocked>
     tt.return
   }
 }
@@ -878,10 +689,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 131072 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
   tt.func public @amd_tdm_gather_scatter_shared_alias(%desc: !tt.tensordesc<64x128xf16>, %rows: tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>) {
     %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>
-    %tdm_view = ttg.memdesc_subslice %buffer [0, 0] : !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 256x128>
     %other = ttg.local_alloc {allocation.offset = 65536 : i32} : () -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>
-    %gather = amdg.async_tdm_gather %desc[%rows] to %tdm_view {test.region_name = "amd_tdm_a_gather"} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 256x128> -> !tt.tensordesc<64x128xf16>
-    %scatter = amdg.async_tdm_scatter %desc[%rows] from %tdm_view {test.region_name = "amd_tdm_b_scatter"} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable, 256x128> -> !tt.tensordesc<64x128xf16>
+    %gather = amdg.async_tdm_gather %desc[%rows] to %buffer {test.region_name = "amd_tdm_a_gather"} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    %scatter = amdg.async_tdm_scatter %desc[%rows] from %buffer {test.region_name = "amd_tdm_b_scatter"} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
     %value = ttg.local_load %other {test.region_name = "amd_tdm_c_other"} : !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> tensor<256x128xf16, #blocked>
     tt.return
   }

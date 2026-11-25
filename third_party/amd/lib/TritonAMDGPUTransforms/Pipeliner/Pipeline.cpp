@@ -33,7 +33,7 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
     scf::YieldOp::create(ifOpBuilder, loc, dotOp->getOperand(2));
     return ifOp;
   }
-  if (isa<tt::DescriptorLoadLikeOpInterface>(op)) {
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
     auto loc = op->getLoc();
     auto ifOp = scf::IfOp::create(rewriter, loc, op->getResultTypes(), pred,
                                   /*withElseRegion=*/true);
@@ -78,19 +78,22 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
         /*pred=*/predI32);
     gatherOp.getDescMutable().assign(updated.getResult());
     return op;
-  }
-  if (isa<triton::amdgpu::AsyncTDMWait>(op))
-    return op;
-  if (isa<tt::DescriptorStoreLikeOpInterface>(op)) {
+  } else if (isa<tt::DescriptorStoreLikeOpInterface>(op)) {
     auto loc = op->getLoc();
     auto ifOp = scf::IfOp::create(rewriter, loc, pred,
                                   /*withElseRegion=*/false);
     op->moveBefore(ifOp.thenYield());
     return ifOp;
   }
+  if (isa<triton::amdgpu::AsyncTDMWait>(op))
+    return op;
   return tt::wrapInMaskOp(rewriter, op, pred);
 }
+} // namespace
 
+// Exposed for reuse by the decompose+modulo pipeline (change #4): deserialize
+// the CoarseSchedule the caller serialized and run the general pipeline
+// expander.
 void expandLoops(ModuleOp moduleOp) {
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
@@ -153,7 +156,6 @@ void expandLoops(ModuleOp moduleOp) {
 
   tt::resolveMaskOp(moduleOp);
 }
-
 // Fold consecutive waits of the same kind into a single wait.
 void combineWaitOps(ModuleOp moduleOp, bool useAsyncCopy) {
   llvm::SmallSetVector<Operation *, 8> asyncWaitOps;
@@ -188,7 +190,6 @@ void combineWaitOps(ModuleOp moduleOp, bool useAsyncCopy) {
         return triton::amdgpu::AsyncTDMWait::create(b, loc, operands, num);
       });
 }
-} // namespace
 
 struct TritonAMDGPUPipelinePass
     : impl::TritonAMDGPUPipelineBase<TritonAMDGPUPipelinePass> {
@@ -196,6 +197,9 @@ struct TritonAMDGPUPipelinePass
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+    if (moduleOp->hasAttr(tt::kSkipGenericPipelineAttrName))
+      return;
+
     lowerLoops(moduleOp, useAsyncCopy, usePingpong);
     expandLoops(moduleOp);
 

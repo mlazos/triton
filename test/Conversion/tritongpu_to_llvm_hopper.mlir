@@ -213,10 +213,10 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     %out0 = tt.fp_to_fp %in0 : tensor<128xf8E5M2, #blocked> -> tensor<128xf16, #blocked>
     // CHECK-COUNT-2: nvvm.convert.f8x2.to.f16x2 {{.*}} : vector<2xi8>(f8E4M3FN) -> vector<2xf16>
     %out1 = tt.fp_to_fp %in1 : tensor<128xf8E4M3FN, #blocked> -> tensor<128xf16, #blocked>
-    // CHECK: nvvm.convert.f8x2.to.f16x2 {{.*}} : vector<2xi8>(f8E5M2) -> vector<2xf16>
-    // CHECK-COUNT-2: llvm.call_intrinsic "llvm.fptrunc.round"
-    // CHECK: nvvm.convert.f8x2.to.f16x2 {{.*}} : vector<2xi8>(f8E5M2) -> vector<2xf16>
-    // CHECK-COUNT-2: llvm.call_intrinsic "llvm.fptrunc.round"
+    // CHECK-COUNT-2: cvt.rn.f16x2.e5m2x2 a, $1;
+    // CHECK-SAME: cvt.bf16.f16 b0, a0;
+    // CHECK-SAME: cvt.bf16.f16 b1, a1;
+    // CHECK-SAME: "=r,h"
     %out2 = tt.fp_to_fp %in0 : tensor<128xf8E5M2, #blocked> -> tensor<128xbf16, #blocked>
 
     // CHECK-COUNT-2: nvvm.convert.f16x2.to.f8x2 {{.*}} : vector<2xf16> -> vector<2xi8>(f8E5M2)
@@ -686,7 +686,7 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
 
     %3 = ttg.local_load %1 : !ttg.memdesc<16x16xf64, #shared1, #smem, mutable> -> tensor<16x16xf64, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
 
-    // CHECK-COUNT-2: nvvm.mma.sync {{.*}}shape = <m = 8, n = 8, k = 4>{{.*}}layout_a = row{{.*}}layout_b = col : (f64, f64, f64)
+    // CHECK-COUNT-2: nvvm.mma.sync {{.*}}shape = <m = 8, n = 8, k = 4>, layout_a = row, layout_b = col : (f64, f64, f64)
 
     %out = tt.dot %2, %3, %cst, inputPrecision = tf32 : tensor<16x16xf64, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 1}>> * tensor<16x16xf64, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>> -> tensor<16x16xf64, #mma>
 
@@ -717,4 +717,58 @@ tt.func @warpgroup_dot_wait_2_inputs(%arg0: tensor<128xf32, #blocked>, %arg1: te
   tt.return
 }
 
+}
+
+// -----
+
+// Test that local_store from #mma to a memdesc_index'd #nvmma_shared works
+// when the shared encoding has rank 2 but the source memdesc is 3D (from
+// local_alloc with num_buffers=1). The memdesc_index result is 2D. This
+// triggered a "Dimensions must match" crash in nvmmaSharedToLinearLayout
+// because combineCtaCgaWithShape received a rank-2 CGALayout for a rank-3
+// shape.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 128, 16]}>
+#smem = #ttg.shared_memory
+// CHECK-LABEL: local_store_mma_to_indexed_nvmma_shared
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @local_store_mma_to_indexed_nvmma_shared(%a: tensor<128x128xf16, #mma>) {
+    // Verify the pass doesn't crash with a dimension mismatch.
+    // CHECK-COUNT-16: nvvm.stmatrix
+    //          CHECK: llvm.return
+    %c0 = arith.constant 0 : i32
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    %view = ttg.memdesc_index %buf[%c0] : !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    ttg.local_store %a, %view : tensor<128x128xf16, #mma> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @bf16_to_fp16
+  // CHECK: llvm.fpext {{.*}} : bf16 to f32
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
+  // CHECK: llvm.fpext {{.*}} : bf16 to f32
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
+  // CHECK: llvm.return
+  tt.func private @bf16_to_fp16(%arg: tensor<128xbf16, #blocked>) -> (tensor<128xf16, #blocked>, tensor<128xf16, #blocked>) {
+    %rn = tt.fp_to_fp %arg : tensor<128xbf16, #blocked> -> tensor<128xf16, #blocked>
+    %rz = tt.fp_to_fp %arg, rounding = rtz : tensor<128xbf16, #blocked> -> tensor<128xf16, #blocked>
+    tt.return %rn, %rz : tensor<128xf16, #blocked>, tensor<128xf16, #blocked>
+  }
+
+  // CHECK-LABEL: @fp16_to_bf16
+  // CHECK: llvm.fpext {{.*}} : f16 to f32
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
+  // CHECK: llvm.fpext {{.*}} : f16 to f32
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
+  // CHECK: llvm.return
+  tt.func private @fp16_to_bf16(%arg: tensor<128xf16, #blocked>) -> (tensor<128xbf16, #blocked>, tensor<128xbf16, #blocked>) {
+    %rn = tt.fp_to_fp %arg : tensor<128xf16, #blocked> -> tensor<128xbf16, #blocked>
+    %rz = tt.fp_to_fp %arg, rounding = rtz : tensor<128xf16, #blocked> -> tensor<128xbf16, #blocked>
+    tt.return %rn, %rz : tensor<128xbf16, #blocked>, tensor<128xbf16, #blocked>
+  }
 }

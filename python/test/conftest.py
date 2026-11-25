@@ -1,4 +1,11 @@
+import gc
+import importlib.util
+import os
+from pathlib import Path
+
 import pytest
+import tempfile
+import torch
 
 
 def pytest_configure(config):
@@ -6,6 +13,123 @@ def pytest_configure(config):
     # If pytest-sugar is not active, enable instafail
     if not config.pluginmanager.hasplugin("sugar"):
         config.option.instafail = True
+
+
+# Set once a test leaves this process's GPU context unusable (see _gpu_cleanup).
+_gpu_context_broken = False
+
+
+@pytest.fixture(autouse=True)
+def _gpu_cleanup():
+    """Clean up GPU memory between tests to prevent accumulation in bundle mode.
+
+    In bundle mode, all tests in a shard run in a single process. Without
+    cleanup, GPU memory from compiled Triton kernels and torch tensors
+    accumulates across tests, leading to OOM. This fixture ensures each test
+    starts with a clean GPU state.
+
+    It also checks that the GPU context still works. A sticky device error,
+    such as an illegal memory access or a device-side assertion, makes every
+    later GPU call in the process fail, so later tests would fail with it too.
+    """
+    global _gpu_context_broken
+    yield
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.ones(1, device="cuda").sum().item()
+        except torch.AcceleratorError:
+            _gpu_context_broken = True
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    yield
+    if _gpu_context_broken and os.environ.get("PYTEST_XDIST_WORKER"):
+        # The context cannot recover in this process. Exiting now, before the
+        # worker reports this test complete, makes pytest-xdist report it as
+        # having crashed the worker and run the remaining tests in a new one.
+        os._exit(1)
+
+
+def pytest_addoption(parser):
+    # An installed pytest plugin may already provide --device. Reuse that
+    # option instead of registering it twice (pytest has no public lookup API).
+    for group in (parser._anonymous, *parser._groups):
+        if any("--device" in option.names() for option in group.options):
+            return
+    parser.addoption("--device", action="store", default="cuda")
+
+
+@pytest.fixture
+def device(request):
+    # --device is unpassable under buck; cpu backend implies cpu tensors.
+    if os.environ.get("TRITON_DEFAULT_BACKEND") == "cpu":
+        return "cpu"
+    selected = request.config.getoption("--device")
+    # The shared option may come from a plugin whose default is None.
+    return "cuda" if selected is None else selected
+
+
+@pytest.fixture(scope="module")
+def process_pool(request):
+    from triton._internal_testing import is_hopper_or_newer, use_process_pool
+
+    if request.config.getoption("--warmup-only", default=False) or os.environ.get("DISABLE_SUBPROCESS"):
+        yield
+        return
+    if not is_hopper_or_newer():
+        yield
+        return
+    with use_process_pool(request.module.__name__) as pool:
+        yield pool
+
+
+@pytest.fixture
+def fresh_triton_cache():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        from triton import knobs
+
+        with knobs.cache.scope(), knobs.runtime.scope():
+            knobs.cache.dir = tmpdir
+            yield tmpdir
+
+
+@pytest.fixture
+def fresh_knobs():
+    """
+    Resets all knobs except ``build``, ``nvidia``, and ``amd`` (preserves
+    library paths needed to compile kernels).
+    """
+    from triton._internal_testing import _fresh_knobs_impl
+    fresh_function, reset_function = _fresh_knobs_impl(skipped_attr={"build", "nvidia", "amd"})
+    try:
+        yield fresh_function()
+    finally:
+        reset_function()
+
+
+@pytest.fixture
+def fresh_compilation_knobs():
+    from triton import knobs
+
+    with knobs.compilation.scope():
+        yield knobs
+
+
+@pytest.fixture
+def fresh_knobs_including_libraries():
+    """
+    Resets ALL knobs including ``build``, ``nvidia``, and ``amd``.
+    Use for tests that verify initial values of these knobs.
+    """
+    from triton._internal_testing import _fresh_knobs_impl
+    fresh_function, reset_function = _fresh_knobs_impl()
+    try:
+        yield fresh_function()
+    finally:
+        reset_function()
 
 
 # Exercise synchronization/ordering at the default granularity. Tests whose
@@ -29,3 +153,51 @@ def with_allocator():
         yield
     finally:
         triton.set_allocator(NullAllocator())
+
+
+def pytest_collection_modifyitems(config, items):
+    """On the CPU backend, run only the allowlisted subset of test_core.py.
+
+    Selection data lives in unit/cpu/test_core_cpu_allowlist.py so the shared
+    test_core.py needs no CPU-specific marks and stays identical to upstream.
+    """
+    if os.environ.get("TRITON_INTERPRET") == "1":
+        return
+    try:
+        device = config.getoption("--device")
+    except ValueError:
+        device = None
+    # Some CI jobs select the CPU backend implicitly (GPU-less runners) and
+    # only pass --device cpu, while others set TRITON_DEFAULT_BACKEND=cpu.
+    if os.environ.get("TRITON_DEFAULT_BACKEND") != "cpu" and device != "cpu":
+        return
+    allowlist_path = Path(__file__).parent / "unit" / "cpu" / "test_core_cpu_allowlist.py"
+    spec = importlib.util.spec_from_file_location("test_core_cpu_allowlist", allowlist_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    allowlisted = module.CPU_TEST_CORE_ALLOWLIST
+
+    kept, deselected, seen = [], [], set()
+    saw_test_core = False
+    for item in items:
+        parts = item.nodeid.split("::")
+        if not parts[0].endswith("test_core.py"):
+            kept.append(item)
+            continue
+        saw_test_core = True
+        func = parts[1].split("[")[0] if len(parts) > 1 else ""
+        if func in allowlisted:
+            seen.add(func)
+            kept.append(item)
+        else:
+            deselected.append(item)
+    # Under buck/testpilot (FB_TRITON_TESTING=1), shards collect only a
+    # subset of tests, so the strict coverage check below is skipped there.
+    # The allowlist filtering above still applies everywhere.
+    if saw_test_core and os.environ.get("FB_TRITON_TESTING") != "1":
+        missing = sorted(set(allowlisted) - seen)
+        if missing:
+            raise ValueError(f"CPU allowlist entries matched no collected test in test_core.py: {missing}")
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = kept
