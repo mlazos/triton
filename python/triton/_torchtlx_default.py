@@ -1,3 +1,3 @@
 from typing import Literal
 
-DEFAULT_MODE: Literal["allow", "force"] | None = "allow"
+DEFAULT_MODE: Literal["allow", "force"] | None = None
